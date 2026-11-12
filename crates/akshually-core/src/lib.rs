@@ -8,10 +8,12 @@ pub mod git;
 pub mod ipc;
 mod paths;
 mod service;
+mod settings;
 
-pub use changeset::{Changeset, FileChange};
+pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
 pub use paths::Paths;
-pub use service::{Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use settings::{Settings, SettingsError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +21,8 @@ pub enum Error {
     Git(#[from] git::GitError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidRequest(String),
     #[error("no Session {0}")]
     UnknownSession(SessionId),
 }

@@ -1,15 +1,16 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::changeset::{self, Changeset};
-use crate::{Error, git};
+use crate::changeset::{self, Changeset, LocalOptions};
+use crate::{Error, Settings, git};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,11 +48,31 @@ pub enum Outcome {
 pub struct ReviewRequest {
     /// Any directory inside the repository (or worktree) under Review.
     pub cwd: PathBuf,
+    /// Which local changes make up the Changeset.
+    pub local: LocalOptions,
 }
 
 impl ReviewRequest {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        ReviewRequest { cwd: cwd.into() }
+        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default() }
+    }
+
+    /// Shows the changes since HEAD's merge-base with `base` instead of the default branch.
+    pub fn base(mut self, base: impl Into<String>) -> Self {
+        self.local.base = Some(base.into());
+        self
+    }
+
+    /// Includes untracked, non-ignored files (`true`) or not, whatever the setting says.
+    pub fn untracked(mut self, untracked: bool) -> Self {
+        self.local.untracked = Some(untracked);
+        self
+    }
+
+    /// Shows exactly the commit range `<from>..<to>` or `<from>...<to>`.
+    pub fn range(mut self, range: impl Into<String>) -> Self {
+        self.local.range = Some(range.into());
+        self
     }
 }
 
@@ -62,7 +83,32 @@ pub struct SessionView {
     /// The working tree root: each worktree is its own Session.
     pub repo: PathBuf,
     pub branch: String,
+    /// The full Changeset.
     pub changeset: Changeset,
+    /// The agent's changes since the Session base, when it ran `start` first.
+    pub since_session_base: Option<Changeset>,
+    /// Which Changeset the human is looking at.
+    pub view: ChangesetView,
+}
+
+impl SessionView {
+    /// The Changeset the human is looking at.
+    pub fn shown(&self) -> &Changeset {
+        match (self.view, &self.since_session_base) {
+            (ChangesetView::SinceSessionBase, Some(since)) => since,
+            _ => &self.changeset,
+        }
+    }
+}
+
+/// Which of a Session's Changesets the human is looking at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangesetView {
+    /// Only the agent's changes since the Session base (the default after `start`).
+    SinceSessionBase,
+    /// The whole Changeset.
+    Full,
 }
 
 /// A `review` call waiting for the human. Dropping it stops waiting.
@@ -100,6 +146,9 @@ struct Session {
 struct Inner {
     next_id: u64,
     sessions: Vec<Session>,
+    settings: Settings,
+    /// Session bases from `start`, by repository and branch, kept until the Session ends.
+    session_bases: HashMap<(PathBuf, String), String>,
     subscribers: Vec<Subscriber>,
 }
 
@@ -144,6 +193,15 @@ impl Service {
         self.lock().subscribers.push(Box::new(f));
     }
 
+    pub fn settings(&self) -> Settings {
+        self.lock().settings.clone()
+    }
+
+    /// Human: changes the settings; they apply from the next agent call.
+    pub fn set_settings(&self, settings: Settings) {
+        self.lock().settings = settings;
+    }
+
     pub fn sessions(&self) -> Vec<SessionView> {
         self.lock().views()
     }
@@ -154,13 +212,38 @@ impl Service {
         Some(inner.sessions[at].view.clone())
     }
 
+    /// Agent: snapshots the working tree of the repository containing `cwd` as the Session
+    /// base, so the next `review` on this branch shows only the changes made after it.
+    pub fn start(&self, cwd: &Path) -> Result<(), Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let base = changeset::snapshot(&repo)?;
+        self.lock().session_bases.insert((repo, branch), base);
+        Ok(())
+    }
+
+    /// Human: switches the Session between its full Changeset and the changes since the
+    /// Session base.
+    pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        inner.sessions[at].view.view = view;
+        inner.notify();
+        Ok(())
+    }
+
     /// Agent: asks for review of the local work in `request.cwd`, opening the Session for that
     /// repository and branch, or attaching to it. Returns once the Session shows the Changeset;
     /// wait on the result for the human's answer.
     pub fn review(&self, request: ReviewRequest) -> Result<PendingReview, Error> {
         let repo = git::toplevel(&request.cwd)?;
         let branch = git::branch(&repo)?;
-        let changeset = changeset::local(&repo)?;
+        let (settings, session_base) = {
+            let inner = self.lock();
+            (inner.settings.clone(), inner.session_bases.get(&(repo.clone(), branch.clone())).cloned())
+        };
+        let local = changeset::local(&repo, &request.local, &settings, session_base.as_deref())?;
+        let (changeset, since_session_base) = (local.full, local.since_session_base);
         let (tx, rx) = mpsc::channel();
 
         let mut inner = self.lock();
@@ -169,13 +252,18 @@ impl Service {
             Some(at) => {
                 let session = &mut inner.sessions[at];
                 session.view.changeset = changeset;
+                session.view.since_session_base = since_session_base;
                 session.waiter = Some(tx);
                 session.view.id.clone()
             }
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = SessionView { id: id.clone(), repo, branch, changeset };
+                let view = match since_session_base {
+                    Some(_) => ChangesetView::SinceSessionBase,
+                    None => ChangesetView::Full,
+                };
+                let view = SessionView { id: id.clone(), repo, branch, changeset, since_session_base, view };
                 inner.sessions.push(Session { view, waiter: Some(tx) });
                 id
             }
@@ -198,6 +286,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = inner.sessions.remove(at);
+        inner.session_bases.remove(&(session.view.repo.clone(), session.view.branch.clone()));
         if let Some(waiter) = session.waiter {
             // The agent may have gone away; the Session ends regardless.
             let _ = waiter.send(outcome);
