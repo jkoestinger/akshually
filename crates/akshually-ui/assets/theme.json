@@ -1,0 +1,43 @@
+{
+  "name": "akshually",
+  "dark": {
+    "bg": "#16181d",
+    "surface": "#1e2128",
+    "surface-raised": "#262a33",
+    "border": "#2f3440",
+    "fg": "#e6e8ec",
+    "fg-muted": "#8b93a1",
+    "accent": "#7c9cff",
+    "on-accent": "#0e1220",
+    "diff-add-bg": "#1f3a2a",
+    "diff-add-fg": "#7ee2a0",
+    "diff-del-bg": "#3d2226",
+    "diff-del-fg": "#ff9aa5",
+    "state-attention": "#ffb347",
+    "state-draft": "#c9a7ff",
+    "state-agent": "#5fd4d0",
+    "state-resolved": "#6b7380"
+  },
+  "light": {
+    "bg": "#ffffff",
+    "surface": "#f6f7f9",
+    "surface-raised": "#ffffff",
+    "border": "#d9dde3",
+    "fg": "#1b1f24",
+    "fg-muted": "#5d6673",
+    "accent": "#3b5bdb",
+    "on-accent": "#ffffff",
+    "diff-add-bg": "#e6f6ea",
+    "diff-add-fg": "#1a7f37",
+    "diff-del-bg": "#fdecee",
+    "diff-del-fg": "#c02435",
+    "state-attention": "#d97706",
+    "state-draft": "#7c3aed",
+    "state-agent": "#0f8a86",
+    "state-resolved": "#8a929e"
+  },
+  "numbers": {
+    "radius-sm": 4,
+    "radius-md": 8
+  }
+}

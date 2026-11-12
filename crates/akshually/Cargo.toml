@@ -1,0 +1,20 @@
+[package]
+name = "akshually"
+description = "A human-in-the-loop code review app for agents and humans"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+akshually-core.workspace = true
+akshually-ui.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+akshually-testkit.workspace = true
+png.workspace = true
