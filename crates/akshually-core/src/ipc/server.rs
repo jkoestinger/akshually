@@ -125,6 +125,10 @@ impl Server {
             Request::Review { .. } | Request::Ack => {
                 Err(ErrorReply::new(ErrorCode::BadRequest, "`review` and `ack` need a connection of their own"))
             }
+            Request::Show { activation_token } => {
+                self.service.show_window(activation_token);
+                Ok(serde_json::json!({}))
+            }
             Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
             Request::Reply { cwd, pr, thread, body } => {
                 self.service.reply(source(cwd, pr), &thread, body).map(|()| serde_json::json!({})).map_err(failed)

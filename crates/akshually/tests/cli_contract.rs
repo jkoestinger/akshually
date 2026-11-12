@@ -378,6 +378,21 @@ fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
 }
 
 #[test]
+fn opening_the_app_again_shows_the_running_ones_window_with_the_activation_token() {
+    let app = HostedApp::start();
+    let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = shown.clone();
+    app.service.on_show_window(move |token| sink.lock().unwrap().push(token));
+
+    let out = app.akshually(&std::env::temp_dir(), &[]).env("XDG_ACTIVATION_TOKEN", "launcher-token").output().unwrap();
+    let again = app.akshually(&std::env::temp_dir(), &[]).env_remove("XDG_ACTIVATION_TOKEN").output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(again.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&again.stderr));
+    assert_eq!(*shown.lock().unwrap(), vec![Some("launcher-token".to_owned()), None]);
+}
+
+#[test]
 fn a_second_review_while_one_waits_exits_1_with_a_clear_message() {
     let app = HostedApp::start();
     let repo = repo_with_work();

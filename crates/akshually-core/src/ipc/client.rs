@@ -103,6 +103,11 @@ impl Connection {
         self.call::<IgnoredAny>(Request::Resolve { cwd, pr, thread }).map(drop)
     }
 
+    /// Brings the running app's window up, activated with `activation_token` if given.
+    pub fn show(self, activation_token: Option<String>) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::Show { activation_token }).map(drop)
+    }
+
     /// Test control: the app's pid and Sessions.
     pub fn test_state(self) -> Result<AppState, ClientError> {
         self.call(Request::TestState)

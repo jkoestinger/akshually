@@ -102,3 +102,33 @@ fn the_config_file_can_turn_notifications_off() {
 
     assert!(!Settings::load(&file).unwrap().notifications);
 }
+
+/// Records each time the service asks for the window, instead of showing one.
+fn window_shows(svc: &Service) -> Arc<Mutex<u32>> {
+    let shown = Arc::new(Mutex::new(0));
+    let sink = shown.clone();
+    svc.on_show_window(move |_| *sink.lock().unwrap() += 1);
+    shown
+}
+
+#[test]
+fn the_window_shows_when_a_session_becomes_the_humans_turn_and_not_for_other_changes() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let shown = window_shows(&svc);
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    assert_eq!(*shown.lock().unwrap(), 1, "a new Session in the human's Turn");
+
+    let id = pending.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
+    repo.write("lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    svc.check_disk();
+    assert!(!svc.session(&id).unwrap().changed_on_disk.is_empty());
+    assert_eq!(*shown.lock().unwrap(), 1, "Drafts and changes on disk don't take the screen");
+
+    svc.hand_over_round(&id).unwrap();
+    pending.wait().unwrap();
+    let _next = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    assert_eq!(*shown.lock().unwrap(), 2, "the human's Turn again");
+}

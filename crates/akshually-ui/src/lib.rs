@@ -65,11 +65,15 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
     handle.update(move |s: &mut State, _| s.handle = Some(own));
     service.subscribe(move |sessions| {
         let sessions = sessions.to_vec();
-        let any = !sessions.is_empty();
         handle.update(move |s: &mut State, _| s.apply(sessions));
-        if any && !handle.is_visible() {
-            handle.show();
-        }
+    });
+    // A Session that becomes the human's Turn, or the human launching akshually again, brings
+    // the window back after it was closed.
+    let handle = app.handle();
+    service.on_show_window(move |token| match token {
+        Some(token) => handle.activate(token),
+        None if !handle.is_visible() => handle.show(),
+        None => {}
     });
     let handle = app.handle();
     service.subscribe_inbox(move |inbox| {

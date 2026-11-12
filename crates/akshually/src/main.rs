@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use akshually_core::ipc::{BindError, Connection, Server};
+use akshually_core::ipc::{self, BindError, Connection, Server};
 use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -303,8 +303,18 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     service.set_settings(settings);
     let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
-        // Another instance serves the CLI already; leave it to that one.
-        Err(BindError::AlreadyRunning) => return Ok(ExitCode::SUCCESS),
+        // Another instance serves the CLI already; leave it to that one, and bring its window
+        // up, which may have been closed: this is the human opening akshually again.
+        Err(BindError::AlreadyRunning) => {
+            if !headless {
+                let token = std::env::var("XDG_ACTIVATION_TOKEN").ok().filter(|t| !t.is_empty());
+                ipc::connect(&paths)
+                    .context("can't reach the running akshually app")?
+                    .show(token)
+                    .context("can't show the running akshually app")?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         Err(error) => return Err(error.into()),
     };
     if headless {

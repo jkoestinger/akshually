@@ -563,6 +563,8 @@ struct Inner {
     /// Whether the human is looking at akshually's window.
     window_focused: bool,
     notifier: Option<Box<dyn Notifier>>,
+    /// Brings the app's window up, with an XDG activation token when there is one.
+    show_window: Option<Box<dyn Fn(Option<String>) + Send>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
     inbox: inbox::InboxState,
@@ -580,6 +582,10 @@ impl Inner {
             None if self.inbox.displayed => view.attention = true,
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
+        }
+        // The window may have been closed (the app keeps running): bring it back.
+        if let Some(show) = &self.show_window {
+            show(None);
         }
         if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
             let repo = view.repo().map(|r| r.file_name().unwrap_or(r.as_os_str()).to_string_lossy());
@@ -695,6 +701,22 @@ impl Service {
     pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
         self.lock().notifier = Some(Box::new(notifier));
         self
+    }
+
+    /// The UI: `f` brings its window up, given the XDG activation token of the launch that
+    /// asked, if any. The service asks whenever a Session becomes the human's Turn, and
+    /// `show_window` on behalf of a second launch. Like `subscribe`, `f` runs while the service
+    /// is locked: hand off, don't call back.
+    pub fn on_show_window(&self, f: impl Fn(Option<String>) + Send + 'static) {
+        self.lock().show_window = Some(Box::new(f));
+    }
+
+    /// Brings the window up, as launching the app again does; `token` is that launch's XDG
+    /// activation token.
+    pub fn show_window(&self, token: Option<String>) {
+        if let Some(show) = &self.lock().show_window {
+            show(token);
+        }
     }
 
     /// The UI: tells the service whether the human is looking at the window (unfocused until

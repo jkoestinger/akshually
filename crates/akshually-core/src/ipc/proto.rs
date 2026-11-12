@@ -64,6 +64,12 @@ pub enum Request {
         pr: Option<String>,
         thread: ThreadId,
     },
+    /// Launching the app again while it runs: bring its window up, activated with the launch's
+    /// XDG activation token if it has one. Replies `{}` at once.
+    Show {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_token: Option<String>,
+    },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
