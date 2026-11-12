@@ -121,9 +121,16 @@ fn review(local: LocalOptions) -> Result<ExitCode> {
 }
 
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
-    let service = Arc::new(Service::new());
+    let render_only = !headless && akshually_ui::is_headless_run(&rune_args);
+    // No window means nothing to notify about, and tests never show real notifications.
+    let service = if headless || render_only {
+        Service::new()
+    } else {
+        Service::new().with_notifier(akshually_ui::DesktopNotifier)
+    };
+    let service = Arc::new(service);
     service.set_settings(Settings::load(&Settings::file_from_env())?);
-    if !headless && akshually_ui::is_headless_run(&rune_args) {
+    if render_only {
         // A headless render (`--snap`, ...) of the UI alone: no socket, no state.
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
         return Ok(ExitCode::SUCCESS);

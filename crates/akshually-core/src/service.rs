@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, Settings, git};
+use crate::{Error, Notification, Notifier, Settings, git};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -177,6 +177,9 @@ struct Inner {
     subscribers: Vec<Subscriber>,
     /// The Session whose tab the human has open.
     displayed: Option<SessionId>,
+    /// Whether the human is looking at akshually's window.
+    window_focused: bool,
+    notifier: Option<Box<dyn Notifier>>,
 }
 
 impl Inner {
@@ -189,6 +192,14 @@ impl Inner {
         match &self.displayed {
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
+        }
+        if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
+            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            notifier.notify(Notification {
+                session: view.id.clone(),
+                title: "Your Turn to review".into(),
+                body: format!("{repo} ({})", view.branch),
+            });
         }
     }
 
@@ -220,6 +231,19 @@ pub struct Service {
 impl Service {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
+    /// Turn while the window is unfocused. Without one, the service notifies no one.
+    pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
+        self.lock().notifier = Some(Box::new(notifier));
+        self
+    }
+
+    /// The UI: tells the service whether the human is looking at the window (unfocused until
+    /// told otherwise).
+    pub fn set_window_focused(&self, focused: bool) {
+        self.lock().window_focused = focused;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

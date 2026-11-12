@@ -405,7 +405,7 @@ fn untracked_non_ignored_files_are_included_by_default() {
 fn the_untracked_setting_excludes_untracked_files() {
     let repo = repo_with_untracked_and_ignored_files();
     let svc = Service::new();
-    svc.set_settings(Settings { untracked: false });
+    svc.set_settings(Settings { untracked: false, ..Settings::default() });
 
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
@@ -416,7 +416,7 @@ fn the_untracked_setting_excludes_untracked_files() {
 fn a_review_call_overrides_the_untracked_setting() {
     let (repo, other) = (repo_with_untracked_and_ignored_files(), repo_with_untracked_and_ignored_files());
     let excluding = Service::new();
-    excluding.set_settings(Settings { untracked: false });
+    excluding.set_settings(Settings { untracked: false, ..Settings::default() });
     let including = Service::new();
 
     let included = excluding.review(ReviewRequest::new(repo.path()).untracked(true)).unwrap();
