@@ -110,6 +110,10 @@ pub struct Thread {
     /// Its Anchor no longer exists in the current Changeset; `anchor` is where it last was.
     #[serde(default)]
     pub outdated: bool,
+    /// The human reopened it since the last Round, so the next Round tells the agent, even
+    /// without a new Comment.
+    #[serde(default)]
+    pub reopened: bool,
 }
 
 /// Who wrote a Comment.

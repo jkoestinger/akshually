@@ -122,6 +122,7 @@ fn review_format_json_prints_the_round_as_json() {
                 "comments": [{"author": "human", "body": "Why two?", "round": 1}],
                 "resolved": "human",
                 "outdated": false,
+                "reopened": false,
             }],
         })
     );

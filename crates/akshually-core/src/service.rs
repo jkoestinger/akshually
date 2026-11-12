@@ -445,6 +445,7 @@ impl Service {
             comments: vec![comment],
             resolved: None,
             outdated: false,
+            reopened: false,
         });
         inner.notify();
         Ok(thread)
@@ -468,8 +469,9 @@ impl Service {
                     c.clone()
                 })
                 .collect();
-            if !drafts.is_empty() {
+            if !drafts.is_empty() || thread.reopened {
                 threads.push(Thread { comments: drafts, ..thread.clone() });
+                thread.reopened = false;
             }
         }
         if threads.is_empty() {
@@ -508,17 +510,33 @@ impl Service {
 
     /// Agent: marks `thread` Resolved in the Session for the repository and branch at `cwd`.
     pub fn resolve(&self, cwd: &Path, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_thread(cwd, thread, |_, thread| thread.resolved = Some(Party::Agent))
+        self.agent_thread(cwd, thread, |_, thread| resolve(thread, Party::Agent))
+    }
+
+    /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
+    /// next Round under that Thread.
+    pub fn reply_in_thread(&self, id: &SessionId, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.human_thread(id, thread, |t| {
+            t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
+        })
     }
 
     /// Human: marks `thread` Resolved, whoever opened it.
     pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| t.resolved = Some(Party::Human))
+        self.human_thread(id, thread, |t| resolve(t, Party::Human))
     }
 
-    /// Human: reopens a Resolved `thread`, whoever resolved it.
+    /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
     pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| t.resolved = None)
+        self.human_thread(id, thread, |t| {
+            if t.resolved.take().is_some() {
+                t.reopened = true;
+            }
+        })
     }
 
     fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
@@ -590,4 +608,10 @@ impl Service {
         inner.notify();
         Ok(())
     }
+}
+
+/// Marks `thread` Resolved by `by`; a reopening not yet handed over no longer needs telling.
+fn resolve(thread: &mut Thread, by: Party) {
+    thread.resolved = Some(by);
+    thread.reopened = false;
 }

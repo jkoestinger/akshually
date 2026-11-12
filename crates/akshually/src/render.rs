@@ -33,7 +33,11 @@ fn round_markdown(round: &Round) -> String {
 
 fn thread_markdown(out: &mut String, thread: &Thread) {
     let outdated = if thread.outdated { " · Outdated" } else { "" };
-    let _ = writeln!(out, "\n## {} · {}{outdated}", thread.id, anchor_markdown(&thread.anchor));
+    let reopened = if thread.reopened { " · Reopened" } else { "" };
+    let _ = writeln!(out, "\n## {} · {}{outdated}{reopened}", thread.id, anchor_markdown(&thread.anchor));
+    if thread.reopened {
+        out.push_str("\nThe human reopened this Thread: it isn't dealt with yet.\n");
+    }
     if thread.outdated {
         out.push_str("\nThis code is no longer in the Changeset; the Thread was written against it:\n");
     }

@@ -862,6 +862,92 @@ fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_any_thread() {
 }
 
 #[test]
+fn a_human_reply_in_a_thread_is_a_draft_that_goes_out_with_the_next_round() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    let t1 = ThreadId::new("T1");
+    svc.reply(repo.path(), &t1, "Renamed for clarity.").unwrap();
+    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    svc.reply_in_thread(&id, &t1, "Clearer how?").unwrap();
+
+    let thread = svc.session(&id).unwrap().threads.remove(0);
+    let last = thread.comments.last().unwrap();
+    assert_eq!((last.author, last.body.as_str(), last.is_draft()), (Party::Human, "Clearer how?", true));
+    assert_eq!(second.wait_timeout(Duration::from_millis(50)), None, "a Draft doesn't reach the agent");
+
+    svc.hand_over_round(&id).unwrap();
+
+    let round2 = round(second.wait_timeout(Duration::from_secs(1)));
+    assert_eq!(round2.threads.len(), 1);
+    assert_eq!(round2.threads[0].id, t1);
+    let sent: Vec<_> = round2.threads[0].comments.iter().map(|c| (c.author, c.body.as_str(), c.round)).collect();
+    assert_eq!(sent, vec![(Party::Human, "Clearer how?", Some(2))], "only what this Round carries");
+}
+
+#[test]
+fn a_human_reply_needs_text_and_a_known_thread() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+
+    assert!(svc.reply_in_thread(&id, &ThreadId::new("T1"), " \n").is_err());
+    assert_eq!(
+        svc.reply_in_thread(&id, &ThreadId::new("T9"), "?").unwrap_err().to_string(),
+        "no Thread T9 in this Session"
+    );
+    assert_eq!(svc.session(&id).unwrap().threads[0].comments.len(), 1);
+}
+
+#[test]
+fn a_thread_the_human_reopened_goes_out_with_the_next_round_marked_reopened() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    let t1 = ThreadId::new("T1");
+    svc.resolve(repo.path(), &t1).unwrap();
+    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    svc.reopen_thread(&id, &t1).unwrap();
+    assert!(svc.session(&id).unwrap().threads[0].reopened);
+    svc.hand_over_round(&id).unwrap();
+
+    let round2 = round(second.wait_timeout(Duration::from_secs(1)));
+    assert_eq!(round2.threads.iter().map(|t| (t.id.as_str(), t.reopened)).collect::<Vec<_>>(), vec![("T1", true)]);
+    assert!(round2.threads[0].comments.is_empty(), "no new Comment");
+    let thread = svc.session(&id).unwrap().threads.remove(0);
+    assert!(!thread.reopened, "handed over");
+    assert_eq!(thread.resolved, None);
+}
+
+#[test]
+fn a_thread_reopened_then_resolved_again_before_handover_does_not_go_out() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    let t1 = ThreadId::new("T1");
+    svc.resolve(repo.path(), &t1).unwrap();
+
+    svc.reopen_thread(&id, &t1).unwrap();
+    svc.resolve_thread(&id, &t1).unwrap();
+
+    assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
+}
+
+#[test]
+fn reopening_an_open_thread_changes_nothing() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+
+    svc.reopen_thread(&id, &ThreadId::new("T1")).unwrap();
+
+    assert!(!svc.session(&id).unwrap().threads[0].reopened);
+    assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
+}
+
+#[test]
 fn an_outdated_thread_can_be_resolved_by_either_party_and_reopened() {
     let repo = agent_branch();
     let svc = Service::new();

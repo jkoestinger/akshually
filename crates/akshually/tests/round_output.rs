@@ -2,7 +2,9 @@
 
 mod support;
 
-use akshually_core::{Anchor, NewComment, Side};
+use std::process::Child;
+
+use akshually_core::{Anchor, NewComment, SessionId, Side, ThreadId, Turn};
 use akshually_testkit::{TestRepo, wait_until};
 use support::{HostedApp, TIMEOUT, finish};
 
@@ -127,4 +129,71 @@ fn an_outdated_thread_is_marked_and_shows_the_code_it_was_written_against() {
         ),
         "{stdout}"
     );
+}
+
+/// Round 1 handed the agent T1 (new line 3) and T2 (new line 2); the agent resolved T1, and
+/// its next `review` call, with `args`, is waiting.
+fn after_the_agent_resolved_t1(app: &HostedApp, repo: &TestRepo, args: &[&str]) -> (SessionId, Child) {
+    let first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Rename b").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+    app.service.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+    let second = app.akshually(repo.path(), args).spawn().unwrap();
+    wait_until(TIMEOUT, "the next review call", || app.service.session(&session.id).filter(|s| s.turn == Turn::Human));
+    (session.id, second)
+}
+
+#[test]
+fn a_reopened_thread_and_a_reply_in_a_thread_go_out_under_their_threads() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let (session, second) = after_the_agent_resolved_t1(&app, &repo, &["review"]);
+    app.service.reopen_thread(&session, &ThreadId::new("T1")).unwrap();
+    app.service.reply_in_thread(&session, &ThreadId::new("T2"), "To what?").unwrap();
+
+    app.service.hand_over_round(&session).unwrap();
+
+    let out = finish(second);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.ends_with(
+            "## T1 · lib.rs, new line 3 · Reopened\n\
+             \n\
+             The human reopened this Thread: it isn't dealt with yet.\n\
+             \n\
+             ```\n\
+             fn c() {}\n\
+             ```\n\
+             \n\
+             ## T2 · lib.rs, new line 2\n\
+             \n\
+             ```\n\
+             fn b() {}\n\
+             ```\n\
+             \n\
+             To what?\n"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_reopened_thread_is_flagged_in_json() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let (session, second) = after_the_agent_resolved_t1(&app, &repo, &["review", "--format", "json"]);
+    app.service.reopen_thread(&session, &ThreadId::new("T1")).unwrap();
+
+    app.service.hand_over_round(&session).unwrap();
+
+    let out = finish(second);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let round: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(round["threads"][0]["id"], "T1");
+    assert_eq!(round["threads"][0]["reopened"], true);
+    assert_eq!(round["threads"][0]["comments"], serde_json::json!([]));
 }
