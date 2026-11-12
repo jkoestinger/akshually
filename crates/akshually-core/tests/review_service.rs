@@ -2,11 +2,14 @@
 
 use std::time::Duration;
 
-use akshually_core::{Anchor, FileChange, Outcome, Party, ReviewRequest, Round, Service, Side};
+use akshually_core::{
+    Anchor, BinarySizes, ChangesetView, Collapsed, FileChange, Outcome, Party, ReviewRequest, Round, Service, Settings,
+    Side,
+};
 use akshually_testkit::{TestDirs, TestRepo};
 
 fn change(path: &str, old: Option<&str>, new: Option<&str>) -> FileChange {
-    FileChange { path: path.into(), old: old.map(Into::into), new: new.map(Into::into) }
+    FileChange::text(path, old, new)
 }
 
 /// A repository on branch `feature`, which has one commit of its own, while `main` moved on
@@ -305,6 +308,301 @@ fn a_round_handed_over_while_no_review_waits_goes_to_the_next_call() {
     assert_eq!(round(second.wait_timeout(Duration::from_secs(1))).number, 2);
 }
 
+#[test]
+fn review_with_a_base_shows_the_changes_since_its_merge_base() {
+    let repo = TestRepo::new();
+    repo.write("a.txt", "a\n").commit_all("base");
+    repo.branch("topic").write("a.txt", "topic\n").commit_all("topic work");
+    repo.branch("feature").write("b.txt", "feature\n").commit_all("feature work");
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path()).base("topic")).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.changeset.files, vec![change("b.txt", None, Some("feature\n"))]);
+}
+
+#[test]
+fn review_with_an_unknown_base_fails() {
+    let repo = feature_branch_with_uncommitted_work();
+    let svc = Service::new();
+
+    assert!(svc.review(ReviewRequest::new(repo.path()).base("no-such-ref")).is_err());
+}
+
+/// `main` with three commits (one, two, three), each adding the file named after it, plus an
+/// uncommitted edit.
+fn three_commits_and_uncommitted_work() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("one.txt", "1\n").commit_all("one");
+    repo.write("two.txt", "2\n").commit_all("two");
+    repo.write("three.txt", "3\n").commit_all("three");
+    repo.write("one.txt", "uncommitted\n");
+    repo
+}
+
+#[test]
+fn review_of_a_commit_range_shows_exactly_those_commits() {
+    let repo = three_commits_and_uncommitted_work();
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path()).range("HEAD~2..HEAD~1")).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.changeset.base, repo.git(&["rev-parse", "HEAD~2"]));
+    assert_eq!(session.changeset.files, vec![change("two.txt", None, Some("2\n"))]);
+}
+
+#[test]
+fn review_of_a_three_dot_range_shows_the_changes_since_the_merge_base() {
+    let repo = TestRepo::new();
+    repo.write("a.txt", "a\n").commit_all("base");
+    repo.branch("feature").write("b.txt", "feature\n").commit_all("feature work");
+    repo.switch("main").write("a.txt", "main moved\n").commit_all("main moves on");
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path()).range("main...feature")).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.changeset.files, vec![change("b.txt", None, Some("feature\n"))]);
+}
+
+#[test]
+fn review_with_both_a_base_and_a_range_fails() {
+    let repo = three_commits_and_uncommitted_work();
+    let svc = Service::new();
+
+    assert!(svc.review(ReviewRequest::new(repo.path()).base("main").range("HEAD~1..HEAD")).is_err());
+    assert!(svc.review(ReviewRequest::new(repo.path()).range("HEAD~1")).is_err(), "a range needs `..`");
+}
+
+/// A committed `.gitignore` and `tracked.txt`, then an edit to `tracked.txt`, a file the agent
+/// forgot to `git add`, and an ignored build output.
+fn repo_with_untracked_and_ignored_files() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write(".gitignore", "target/\n").write("tracked.txt", "a\n").commit_all("base");
+    repo.write("tracked.txt", "b\n").write("forgot.txt", "new\n").write("target/out.bin", "build\n");
+    repo
+}
+
+fn paths(svc: &Service, pending: &akshually_core::PendingReview) -> Vec<String> {
+    svc.session(pending.session()).unwrap().changeset.files.into_iter().map(|f| f.path).collect()
+}
+
+#[test]
+fn untracked_non_ignored_files_are_included_by_default() {
+    let repo = repo_with_untracked_and_ignored_files();
+    let status_before = repo.git(&["status", "--porcelain"]);
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(paths(&svc, &pending), ["forgot.txt", "tracked.txt"]);
+    assert_eq!(repo.git(&["status", "--porcelain"]), status_before, "the repository's index is untouched");
+}
+
+#[test]
+fn the_untracked_setting_excludes_untracked_files() {
+    let repo = repo_with_untracked_and_ignored_files();
+    let svc = Service::new();
+    svc.set_settings(Settings { untracked: false });
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(paths(&svc, &pending), ["tracked.txt"]);
+}
+
+#[test]
+fn a_review_call_overrides_the_untracked_setting() {
+    let (repo, other) = (repo_with_untracked_and_ignored_files(), repo_with_untracked_and_ignored_files());
+    let excluding = Service::new();
+    excluding.set_settings(Settings { untracked: false });
+    let including = Service::new();
+
+    let included = excluding.review(ReviewRequest::new(repo.path()).untracked(true)).unwrap();
+    let excluded = including.review(ReviewRequest::new(other.path()).untracked(false)).unwrap();
+
+    assert_eq!(paths(&excluding, &included), ["forgot.txt", "tracked.txt"]);
+    assert_eq!(paths(&including, &excluded), ["tracked.txt"]);
+}
+
+/// A repository on `feature` where the human has uncommitted work in progress (an edit to
+/// `shared.txt` and an untracked `notes.txt`) when the agent runs `start`.
+fn human_work_in_progress() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("shared.txt", "1\n2\n").commit_all("base");
+    repo.branch("feature");
+    repo.write("shared.txt", "1 (human)\n2\n").write("notes.txt", "human notes\n");
+    repo
+}
+
+#[test]
+fn after_start_the_session_shows_only_the_agents_changes_since_the_session_base() {
+    let repo = human_work_in_progress();
+    let svc = Service::new();
+
+    svc.start(repo.path()).unwrap();
+    repo.write("shared.txt", "1 (human)\n2 (agent)\n").write("agent.txt", "agent\n");
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.view, ChangesetView::SinceSessionBase);
+    assert_eq!(
+        session.shown().files,
+        vec![
+            change("agent.txt", None, Some("agent\n")),
+            change("shared.txt", Some("1 (human)\n2\n"), Some("1 (human)\n2 (agent)\n")),
+        ]
+    );
+}
+
+#[test]
+fn the_human_can_toggle_to_the_full_changeset_and_back() {
+    let repo = human_work_in_progress();
+    let svc = Service::new();
+    svc.start(repo.path()).unwrap();
+    repo.write("agent.txt", "agent\n");
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+
+    svc.show(&id, ChangesetView::Full).unwrap();
+
+    let full = svc.session(&id).unwrap();
+    assert_eq!(full.view, ChangesetView::Full);
+    assert_eq!(
+        full.shown().files,
+        vec![
+            change("agent.txt", None, Some("agent\n")),
+            change("notes.txt", None, Some("human notes\n")),
+            change("shared.txt", Some("1\n2\n"), Some("1 (human)\n2\n")),
+        ]
+    );
+    svc.show(&id, ChangesetView::SinceSessionBase).unwrap();
+    assert_eq!(svc.session(&id).unwrap().shown().files.len(), 1);
+}
+
+#[test]
+fn without_start_the_session_shows_the_full_changeset() {
+    let repo = human_work_in_progress();
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.view, ChangesetView::Full);
+    assert_eq!(session.since_session_base, None);
+    assert_eq!(session.shown().files.len(), 2);
+}
+
+#[test]
+fn a_comment_anchors_to_the_changeset_the_human_is_looking_at() {
+    let repo = human_work_in_progress();
+    let svc = Service::new();
+    svc.start(repo.path()).unwrap();
+    repo.write("shared.txt", "1 (human)\n2 (agent)\n");
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+
+    let old_line_1 = || Anchor::lines(Side::Old, "shared.txt", 1..=1);
+    svc.comment(&id, old_line_1(), "since the Session base").unwrap();
+    svc.show(&id, ChangesetView::Full).unwrap();
+    svc.comment(&id, old_line_1(), "in the full Changeset").unwrap();
+
+    let excerpts: Vec<String> = svc.session(&id).unwrap().threads.into_iter().map(|t| t.excerpt).collect();
+    assert_eq!(excerpts, ["1 (human)\n", "1\n"]);
+}
+
+#[test]
+fn excluded_untracked_files_stay_out_of_the_view_since_the_session_base() {
+    let repo = human_work_in_progress();
+    let svc = Service::new();
+    svc.start(repo.path()).unwrap();
+    repo.write("agent.txt", "agent\n").write("notes.txt", "human notes, edited\n");
+
+    let pending = svc.review(ReviewRequest::new(repo.path()).untracked(false)).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.shown().files, vec![]);
+    assert_eq!(paths(&svc, &pending), ["shared.txt"]);
+}
+
+#[test]
+fn start_outside_a_repository_fails() {
+    let dir = TestDirs::new();
+
+    assert!(Service::new().start(dir.path()).is_err());
+}
+
+#[test]
+fn binary_files_are_summarised_by_their_sizes() {
+    let repo = TestRepo::new();
+    repo.write_bytes("image.png", &[0x89, b'P', b'N', b'G', 0, 1, 2]).commit_all("base");
+    repo.write_bytes("image.png", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3, 4, 5]).write_bytes("new.bin", &[0; 4]);
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let files = svc.session(pending.session()).unwrap().changeset.files;
+    let binary = |path: &str, old: Option<&str>, new: Option<&str>, sizes: (Option<u64>, Option<u64>)| FileChange {
+        binary: Some(BinarySizes { old: sizes.0, new: sizes.1 }),
+        ..change(path, old, new)
+    };
+    assert_eq!(
+        files,
+        vec![
+            binary("image.png", Some(""), Some(""), (Some(7), Some(10))),
+            binary("new.bin", None, Some(""), (None, Some(4)))
+        ]
+    );
+}
+
+fn collapsed(svc: &Service, pending: &akshually_core::PendingReview) -> Vec<(String, Option<Collapsed>)> {
+    let files = svc.session(pending.session()).unwrap().changeset.files;
+    files.into_iter().map(|f| (f.path, f.collapsed)).collect()
+}
+
+#[test]
+fn generated_files_are_collapsed_with_their_text_kept_for_expanding() {
+    let repo = TestRepo::new();
+    repo.write(".gitattributes", "api/*.json linguist-generated\nyarn.lock linguist-generated=false\n");
+    repo.write("Cargo.lock", "# old\n").write("yarn.lock", "old\n").write("api/schema.json", "{}\n");
+    repo.write("gen.rs", "// @generated by a tool\nold\n").write("main.rs", "old\n").commit_all("base");
+    for file in ["Cargo.lock", "yarn.lock", "api/schema.json", "main.rs"] {
+        repo.write(file, "new\n");
+    }
+    repo.write("gen.rs", "// @generated by a tool\nnew\n");
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let generated = Some(Collapsed::Generated);
+    assert_eq!(
+        collapsed(&svc, &pending),
+        [
+            ("Cargo.lock".to_owned(), generated),
+            ("api/schema.json".to_owned(), generated),
+            ("gen.rs".to_owned(), generated),
+            ("main.rs".to_owned(), None),
+            ("yarn.lock".to_owned(), None),
+        ]
+    );
+    let lockfile = svc.session(pending.session()).unwrap().changeset.files.remove(0);
+    assert_eq!((lockfile.old.as_deref(), lockfile.new.as_deref()), (Some("# old\n"), Some("new\n")));
+}
+
+#[test]
+fn huge_files_are_collapsed() {
+    let repo = TestRepo::new();
+    repo.write("small.txt", "a\n").write("huge.txt", "a\n").commit_all("base");
+    repo.write("small.txt", &"b\n".repeat(100)).write("huge.txt", &"b\n".repeat(5000));
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(
+        collapsed(&svc, &pending),
+        [("huge.txt".to_owned(), Some(Collapsed::Large)), ("small.txt".to_owned(), None)]
+    );
+}
+
 /// A Session in its second Round: the agent changed `lib.rs` and `other.rs` for Round 1, then,
 /// in response, changed `lib.rs` again and added `extra.rs` before calling `review` again.
 fn second_round(svc: &Service) -> (TestRepo, akshually_core::PendingReview) {
@@ -367,7 +665,7 @@ fn from_round_2_the_default_view_shows_only_the_changes_since_the_last_round() {
     let (_repo, second) = second_round(&svc);
 
     let session = svc.session(second.session()).unwrap();
-    assert!(session.since_last_round);
+    assert_eq!(session.view, ChangesetView::SinceLastRound);
     assert_eq!(
         session.shown().files,
         vec![
@@ -385,14 +683,15 @@ fn round_1_shows_the_full_changeset() {
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
     let session = svc.session(pending.session()).unwrap();
-    assert!(!session.since_last_round);
-    assert_eq!(session.shown(), session.changeset);
+    assert_eq!(session.view, ChangesetView::Full);
+    assert_eq!(session.shown(), &session.changeset);
 
-    svc.show_since_last_round(pending.session(), true).unwrap();
-    assert!(!svc.session(pending.session()).unwrap().since_last_round, "there's no last Round yet");
+    svc.show(pending.session(), ChangesetView::SinceLastRound).unwrap();
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.shown(), &session.changeset, "there's no last Round yet");
 }
 
-fn paths(changeset: &akshually_core::Changeset) -> Vec<&str> {
+fn shown_paths(changeset: &akshually_core::Changeset) -> Vec<&str> {
     changeset.files.iter().map(|f| f.path.as_str()).collect()
 }
 
@@ -402,14 +701,13 @@ fn the_toggle_switches_to_the_full_changeset_and_back() {
     let (_repo, second) = second_round(&svc);
     let id = second.session();
 
-    svc.show_since_last_round(id, false).unwrap();
+    svc.show(id, ChangesetView::Full).unwrap();
     let full = svc.session(id).unwrap();
-    assert!(!full.since_last_round);
-    assert_eq!(paths(&full.shown()), ["extra.rs", "lib.rs", "other.rs"]);
+    assert_eq!(shown_paths(full.shown()), ["extra.rs", "lib.rs", "other.rs"]);
     assert_eq!(full.shown().files[1].old.as_deref(), Some("fn a() {}\n"), "against the base again");
 
-    svc.show_since_last_round(id, true).unwrap();
-    assert_eq!(paths(&svc.session(id).unwrap().shown()), ["extra.rs", "lib.rs"]);
+    svc.show(id, ChangesetView::SinceLastRound).unwrap();
+    assert_eq!(shown_paths(svc.session(id).unwrap().shown()), ["extra.rs", "lib.rs"]);
 }
 
 #[test]
@@ -421,6 +719,6 @@ fn a_file_the_agent_reverted_since_the_last_round_shows_as_changed_back() {
     repo.write("other.rs", "fn o() {}\n");
     let third = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    let shown = svc.session(third.session()).unwrap().shown();
-    assert!(shown.files.contains(&change("other.rs", Some("fn o2() {}\n"), Some("fn o() {}\n"))));
+    let session = svc.session(third.session()).unwrap();
+    assert!(session.shown().files.contains(&change("other.rs", Some("fn o2() {}\n"), Some("fn o() {}\n"))));
 }

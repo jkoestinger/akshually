@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 
-use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread};
+use akshually_core::{
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, Party, Service, SessionId, SessionView, Side, Thread,
+};
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
-use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, SegmentedControl, TextArea};
+use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -72,32 +74,29 @@ struct Composer {
 
 struct SessionTab {
     session: SessionView,
-    /// What the diff shows: the full Changeset or the changes since the last Round.
-    shown: Changeset,
     diff: DiffState,
 }
 
 impl SessionTab {
     fn new(session: SessionView) -> Self {
-        let shown = session.shown();
-        let diff = DiffState::new(file_diffs(&shown));
-        let mut tab = SessionTab { session, shown, diff };
+        let mut diff = DiffState::new(Vec::new());
+        show_files(&mut diff, session.shown());
+        let mut tab = SessionTab { session, diff };
         tab.annotate(None);
         tab
     }
 
     /// Puts each Thread, and the composer when it's on this Session, under its last line.
     fn annotate(&mut self, composer: Option<&Composer>) {
-        let changeset = &self.shown;
-        // Since the last Round, the old side is the last Round's code, not the base's.
-        let old_side_shown = !self.session.since_last_round;
+        let changeset = self.session.shown();
         let mut notes: Vec<Annotation> = self
             .session
             .threads
             .iter()
             .filter_map(|t| {
                 let Anchor::Lines { path, side, end, .. } = &t.anchor;
-                if *side == Side::Old && !old_side_shown {
+                if *side == Side::Old && self.session.view == ChangesetView::SinceLastRound {
+                    // That old side is the last Round's code, not the code the Thread is on.
                     return None;
                 }
                 let file = changeset.files.iter().position(|f| &f.path == path)?;
@@ -151,14 +150,50 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
         .iter()
         .map(|f| {
             let path = |side: &Option<String>| side.as_ref().map(|_| f.path.clone());
-            FileDiff::between(
+            let mut diff = FileDiff::between(
                 path(&f.old),
                 path(&f.new),
                 f.old.as_deref().unwrap_or(""),
                 f.new.as_deref().unwrap_or(""),
-            )
+            );
+            diff.binary = f.binary.is_some();
+            diff
         })
         .collect()
+}
+
+/// Shows `changeset` in `diff`, with generated and large files collapsed.
+fn show_files(diff: &mut DiffState, changeset: &Changeset) {
+    diff.set_files(file_diffs(changeset));
+    for (at, file) in changeset.files.iter().enumerate() {
+        if file.collapsed.is_some() {
+            diff.set_collapsed(at, true);
+        }
+    }
+}
+
+/// What a file's header says about it beyond the diff: "binary changed (size)", or why it is
+/// collapsed.
+fn file_note(file: &FileChange) -> Option<String> {
+    if let Some(sizes) = file.binary {
+        let size = match (sizes.old, sizes.new) {
+            (Some(old), Some(new)) => format!("{} → {}", bytes(old), bytes(new)),
+            (old, new) => bytes(old.or(new).unwrap_or(0)),
+        };
+        return Some(format!("binary changed ({size})"));
+    }
+    file.collapsed.map(|why| match why {
+        Collapsed::Generated => "Generated file".to_owned(),
+        Collapsed::Large => "Large file".to_owned(),
+    })
+}
+
+fn bytes(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{:.1} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
 }
 
 impl State {
@@ -179,10 +214,8 @@ impl State {
             .map(|session| match old.iter().position(|t| t.session.id == session.id) {
                 Some(at) => {
                     let mut tab = old.swap_remove(at);
-                    let shown = session.shown();
-                    if tab.shown != shown {
-                        tab.diff.set_files(file_diffs(&shown));
-                        tab.shown = shown;
+                    if tab.session.shown() != session.shown() {
+                        show_files(&mut tab.diff, session.shown());
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -203,6 +236,12 @@ impl State {
         }
     }
 
+    fn show(&self, id: &SessionId, view: ChangesetView) {
+        if let Err(error) = self.service.show(id, view) {
+            eprintln!("akshually: {error}");
+        }
+    }
+
     fn annotate(&mut self) {
         for tab in &mut self.tabs {
             tab.annotate(self.composer.as_ref());
@@ -212,11 +251,11 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
-        if tab.session.since_last_round && range.end.side == diff::Side::Old {
+        if tab.session.view == ChangesetView::SinceLastRound && range.end.side == diff::Side::Old {
             // Those lines are the last Round's code, which a Thread can't anchor to.
             return;
         }
-        let Some(anchor) = anchor_for(&tab.shown, range) else { return };
+        let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
         self.composer_text = TextEdit::new("");
@@ -248,11 +287,7 @@ impl State {
 
     /// Runs a human action on the service; the service's update then refreshes the view.
     fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
-        self.act_with(|svc| action(svc, id));
-    }
-
-    fn act_with(&self, action: impl FnOnce(&Service) -> Result<(), akshually_core::Error>) {
-        if let Err(error) = action(&self.service) {
+        if let Err(error) = action(&self.service, id) {
             eprintln!("akshually: {error}");
         }
     }
@@ -293,9 +328,32 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
 
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
-    let base = &session.changeset.base[..session.changeset.base.len().min(8)];
+    let shown = session.shown();
+    let base = if shown == &session.changeset {
+        format!("→ {}", &shown.base[..shown.base.len().min(8)])
+    } else if session.view == ChangesetView::SinceLastRound {
+        "since last Round".to_owned()
+    } else {
+        "since Session base".to_owned()
+    };
     let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
     let drafts = tab.drafts();
+    let views = [
+        ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
+        ("Since Session base", ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
+    ];
+    let toggle = views.iter().any(|(_, _, available)| *available).then(|| {
+        let view_button = |label: &str, view: ChangesetView| {
+            let id = session.id.clone();
+            let variant = if session.view == view { ButtonVariant::Neutral } else { ButtonVariant::Ghost };
+            Button::new(label).variant(variant).on_press(move |s: &mut State| s.show(&id, view)).build(k)
+        };
+        views
+            .iter()
+            .filter(|(_, _, available)| *available)
+            .fold(row().gap(4.0), |toggle, (label, view, _)| toggle.child(view_button(label, *view)))
+            .child(view_button("Full Changeset", ChangesetView::Full))
+    });
     row()
         .key("session-header")
         .w_full()
@@ -305,10 +363,10 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .items_center()
         .fill(k.c.layer_01)
         .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
-        .child(text(format!("→ {base}")).font(k.ty.mono).color(k.c.text_muted))
+        .child(text(base).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(row().grow(1.0))
-        .child(view_toggle(k, session))
+        .children(toggle)
         .child(
             Button::new("Abandon")
                 .variant(ButtonVariant::Ghost)
@@ -334,44 +392,36 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         )
 }
 
-/// "Since last Round" or "Full Changeset", from Round 2 on.
-fn view_toggle(k: &Kit, session: &SessionView) -> El {
-    if session.last_round.is_none() {
-        return row();
-    }
-    let id = session.id.clone();
-    SegmentedControl::new(&["Since last Round", "Full Changeset"], Some(usize::from(!session.since_last_round)))
-        .fit()
-        .on_pick(move |s: &mut State, i, _| s.act_with(|svc| svc.show_since_last_round(&id, i == 0)))
-        .build(k)
-}
-
-fn viewed_tick(k: &Kit, s: &State, file: usize) -> El {
-    let Some(tab) = s.active_tab() else { return row() };
-    let Some(path) = tab.shown.files.get(file).map(|f| f.path.clone()) else { return row() };
-    let viewed = tab.session.viewed.contains(&path);
-    let id = tab.session.id.clone();
-    Checkbox::new(viewed)
-        .label("Viewed")
-        .on_toggle(move |s: &mut State| s.act_with(|svc| svc.mark_viewed(&id, &path, !viewed)))
-        .build(k)
-}
-
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
+    let id_header = id.clone();
+    let kc = k.clone();
     DiffView::new(
         move |s: &State| &s.tabs.iter().find(|t| t.session.id == id).expect("the active tab").diff,
         move |s: &mut State| &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the active tab").diff,
     )
     .key(format!("diff-{}", tab.session.id))
+    .header_actions(move |s: &State, file: usize| {
+        let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the active tab");
+        let Some(change) = tab.session.shown().files.get(file) else { return row() };
+        let note = file_note(change).unwrap_or_default();
+        let viewed = tab.session.viewed.contains(&change.path);
+        let (id, path) = (tab.session.id.clone(), change.path.clone());
+        row().gap(12.0).items_center().child(text(note).font(kc.ty.small).color(kc.c.text_muted)).child(
+            Checkbox::new(viewed)
+                .label("Viewed")
+                .on_toggle(move |s: &mut State| {
+                    if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
+                        eprintln!("akshually: {error}");
+                    }
+                })
+                .build(&kc),
+        )
+    })
     .annotation({
         let k = k.clone();
         move |s: &State, a: &Annotation| annotation(&k, s, a)
-    })
-    .header_actions({
-        let k = k.clone();
-        move |s: &State, file: usize| viewed_tick(&k, s, file)
     })
     .on_comment(|s: &mut State, range: LineRange, _: &mut Tx| s.compose(range))
     .build(s, k)
@@ -457,22 +507,21 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// `--scene session`: a sample Session, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
-    // Round 1 had `src/session.rs` as it was at the base, and `src/round.rs` already.
-    let mut last_round = changeset.clone();
-    last_round.files[0].new = last_round.files[0].old.clone();
     let session = SessionView {
         id: SessionId::new("sample"),
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
+        since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
+        last_round: None,
+        since_last_round: None,
+        view: ChangesetView::Full,
+        viewed: ["src/round.rs".to_owned()].into(),
         round: 2,
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
         ],
-        last_round: Some(last_round),
-        since_last_round: true,
-        viewed: ["src/round.rs".to_owned()].into(),
     };
     s.apply(vec![session]);
 }
@@ -488,16 +537,25 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
 }
 
 fn sample_changeset() -> Changeset {
-    use akshually_core::FileChange;
     Changeset {
         base: "3e61ed7c0ffee".into(),
         files: vec![
             FileChange {
+                binary: None,
+                collapsed: None,
                 path: "src/session.rs".into(),
                 old: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let round = Round::new(drafts);\n    Ok(round)\n}\n".into()),
                 new: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let snapshot = self.changeset.snapshot()?;\n    let round = Round::new(drafts, snapshot);\n    Ok(round)\n}\n".into()),
             },
-            FileChange { path: "src/round.rs".into(), old: None, new: Some("pub struct Round;\n".into()) },
+            FileChange::text("src/round.rs", None, Some("pub struct Round;\n")),
+            FileChange {
+                binary: Some(akshually_core::BinarySizes { old: Some(12_288), new: Some(14_745) }),
+                ..FileChange::text("docs/screenshot.png", Some(""), Some(""))
+            },
+            FileChange {
+                collapsed: Some(Collapsed::Generated),
+                ..FileChange::text("Cargo.lock", Some("# @generated\nold\n"), Some("# @generated\nnew\n"))
+            },
         ],
     }
 }
