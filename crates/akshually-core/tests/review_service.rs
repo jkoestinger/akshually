@@ -1102,6 +1102,28 @@ fn a_thread_the_human_reopened_goes_out_with_the_next_round_marked_reopened() {
 }
 
 #[test]
+fn taking_back_a_round_that_held_only_a_reopening_keeps_the_thread_reopened() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    let t1 = ThreadId::new("T1");
+    svc.resolve(repo.path(), &t1).unwrap();
+    // The agent's next call went away: Round 2 waits for one.
+    drop(svc.review(ReviewRequest::new(repo.path())).unwrap());
+    svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
+    svc.hand_over_round(&id).unwrap();
+
+    svc.take_turn_back(&id).unwrap();
+
+    assert!(svc.session(&id).unwrap().threads[0].reopened, "withdrawn: the agent still has to be told");
+    assert_eq!(svc.session(&id).unwrap().to_hand_over(), 1);
+    svc.hand_over_round(&id).unwrap();
+    let next = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let round2 = round(next.wait_timeout(Duration::from_secs(1)));
+    assert_eq!(round2.threads.iter().map(|t| (t.id.as_str(), t.reopened)).collect::<Vec<_>>(), vec![("T1", true)]);
+}
+
+#[test]
 fn a_thread_reopened_then_resolved_again_before_handover_does_not_go_out() {
     let repo = agent_branch();
     let svc = Service::new();

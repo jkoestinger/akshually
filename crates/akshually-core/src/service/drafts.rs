@@ -101,7 +101,17 @@ impl Service {
             _ => None,
         });
         if let Some(first) = first {
-            session.queued.clear();
+            // Threads the withdrawn Rounds told the agent were reopened still need telling,
+            // unless the human resolved them again meanwhile.
+            for withdrawn in std::mem::take(&mut session.queued) {
+                let Outcome::Round(round) = withdrawn else { continue };
+                for reopened in round.threads.iter().filter(|t| t.reopened) {
+                    let thread = session.view.threads.iter_mut().find(|t| t.id == reopened.id);
+                    if let Some(thread) = thread.filter(|t| t.resolved.is_none()) {
+                        thread.reopened = true;
+                    }
+                }
+            }
             for comment in session.view.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 if comment.author == Party::Human && comment.round.is_some_and(|n| n >= first) {
                     comment.round = None;
