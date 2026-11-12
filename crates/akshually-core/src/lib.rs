@@ -50,6 +50,10 @@ pub enum Error {
     Busy,
     #[error("this Session has ended; the agent's next `akshually review` collects its outcome")]
     Ended,
+    #[error("no Session for {} on branch {branch}; run `akshually review` first", repo.display())]
+    NoSessionHere { repo: std::path::PathBuf, branch: String },
+    #[error("no Thread {0} in this Session")]
+    UnknownThread(ThreadId),
     #[error("{0} isn't in the Changeset")]
     NotInChangeset(String),
 }

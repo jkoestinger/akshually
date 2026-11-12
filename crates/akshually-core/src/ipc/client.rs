@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{LocalOptions, Outcome, Paths};
+use crate::{LocalOptions, Outcome, Paths, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -49,6 +49,17 @@ impl Connection {
     /// Records the Session base for the local work in `cwd`.
     pub fn start(self, cwd: &Path) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Request::Start { cwd: cwd.to_owned() }).map(drop)
+    }
+
+    /// Replies to `thread` in the Session for `cwd`, as the agent.
+    pub fn reply(self, cwd: &Path, thread: &ThreadId, body: &str) -> Result<(), ClientError> {
+        let request = Request::Reply { cwd: cwd.to_owned(), thread: thread.clone(), body: body.to_owned() };
+        self.call::<IgnoredAny>(request).map(drop)
+    }
+
+    /// Resolves `thread` in the Session for `cwd`, as the agent.
+    pub fn resolve(self, cwd: &Path, thread: &ThreadId) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::Resolve { cwd: cwd.to_owned(), thread: thread.clone() }).map(drop)
     }
 
     /// Test control: the app's pid and Sessions.
