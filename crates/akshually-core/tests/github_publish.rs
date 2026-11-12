@@ -375,3 +375,68 @@ fn a_resolve_github_refuses_undoes_the_others_and_publishes_nothing() {
     [resolved, refused, undone, submit, deleted].iter().for_each(Mock::assert);
     assert!(matches!(&error, ForgeError::Api { message, .. } if message == "Could not resolve to a node"), "{error:?}");
 }
+
+// --- A submit whose answer is lost ---
+
+impl Harness {
+    /// Submitting the pending review fails with HTTP 502, as when GitHub's answer is lost.
+    fn submit_answer_lost(&mut self) -> Mock {
+        self.server
+            .mock("POST", "/graphql")
+            .match_body(Matcher::Regex(r"submitPullRequestReview\(".into()))
+            .with_status(502)
+            .with_body("Bad Gateway")
+            .create()
+    }
+
+    /// The review `PRRV_1` is in `state` on GitHub.
+    fn review_state(&mut self, state: &str) -> Mock {
+        let data = json!({ "node": { "state": state, "url": REVIEW_URL } });
+        self.graphql("node", json!({ "id": "PRRV_1" }), data)
+    }
+
+    /// Mutations that must not be sent: undoing the resolve, deleting the pending review.
+    fn never(&mut self, operation: &str) -> Mock {
+        self.server.mock("POST", "/graphql").match_body(Matcher::Regex(format!(r"\b{operation}\("))).expect(0).create()
+    }
+}
+
+#[test]
+fn a_submit_whose_answer_is_lost_but_went_through_is_published_and_not_undone() {
+    let mut h = Harness::new();
+    h.pull_request_id();
+    h.start_review();
+    h.resolution("resolveReviewThread", "PRRT_1");
+    h.submit_answer_lost();
+    let checked = h.review_state("APPROVED");
+    let untouched = [h.never("unresolveReviewThread"), h.never("deletePullRequestReview")];
+    let review = Review { verdict: Verdict::Approve, resolve: vec!["PRRT_1".into()], ..no_threads() };
+
+    let url = h.github().publish(&pull_request("maria"), &review).unwrap();
+
+    checked.assert();
+    untouched.iter().for_each(Mock::assert);
+    assert_eq!(url, REVIEW_URL);
+}
+
+#[test]
+fn a_submit_that_failed_with_the_review_still_pending_is_undone() {
+    let mut h = Harness::new();
+    h.pull_request_id();
+    h.start_review();
+    h.resolution("resolveReviewThread", "PRRT_1");
+    h.submit_answer_lost();
+    let checked = h.review_state("PENDING");
+    let undone = h.resolution("unresolveReviewThread", "PRRT_1");
+    let deleted = h.graphql(
+        "deletePullRequestReview",
+        json!({ "input": { "pullRequestReviewId": "PRRV_1" } }),
+        json!({ "deletePullRequestReview": { "pullRequestReview": { "id": "PRRV_1" } } }),
+    );
+    let review = Review { verdict: Verdict::Approve, resolve: vec!["PRRT_1".into()], ..no_threads() };
+
+    let error = h.github().publish(&pull_request("maria"), &review).unwrap_err();
+
+    [checked, undone, deleted].iter().for_each(Mock::assert);
+    assert!(matches!(error, ForgeError::Api { status: 502, .. }), "{error:?}");
+}

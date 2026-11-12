@@ -286,6 +286,18 @@ fn no_credentials(host: &str, kind: ForgeKind, config: &std::path::Path) -> Stri
     )
 }
 
+impl ForgeError {
+    /// Whether the request that failed so may still have done its work: its answer was lost
+    /// (no connection, a gateway error, an answer that makes no sense), rather than a refusal.
+    pub(crate) fn may_have_gone_through(&self) -> bool {
+        match self {
+            ForgeError::Http { .. } | ForgeError::Unexpected { .. } => true,
+            ForgeError::Api { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
+}
+
 /// The adapters for github.com and every configured host (`Settings::hosts`).
 pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
     config::with_github_com(hosts)

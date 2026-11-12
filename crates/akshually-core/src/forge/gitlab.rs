@@ -699,7 +699,19 @@ impl GitLab {
                 Some(state) => json!({ "reviewer_state": state }),
                 None => json!({}),
             };
-            self.post(&self.merge_request_url(pr, &["draft_notes", "bulk_publish"]), body)?;
+            if let Err(error) = self.post(&self.merge_request_url(pr, &["draft_notes", "bulk_publish"]), body) {
+                // Bulk publish may have gone through with its answer lost: undoing would
+                // unapprove a review that went out, and a retry would post it twice. Publish
+                // checked that no draft notes were left before; none now means they went out.
+                // One GitLab can't say about is taken to have failed, as before asking.
+                let published = error.may_have_gone_through()
+                    && self
+                        .get_json::<Vec<Value>>(&self.merge_request_url(pr, &["draft_notes"]))
+                        .is_ok_and(|left| left.is_empty());
+                if !published {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }

@@ -1036,6 +1036,55 @@ fn a_failure_part_way_deletes_the_draft_notes_and_undoes_resolves_and_the_approv
     assert!(matches!(&error, ForgeError::Api { status: 429, .. }), "{error:?}");
 }
 
+impl Harness {
+    /// A Publish of a summary and an approval whose bulk publish fails with HTTP 502, as when
+    /// GitLab's answer is lost.
+    fn publish_whose_answer_is_lost(&mut self) {
+        self.before_publish("19.2.0");
+        self.approvals(true, false);
+        self.draft_note(json!({ "note": "Ship it." }), 501);
+        self.approve();
+        self.server
+            .mock("POST", format!("{MR}/draft_notes/bulk_publish").as_str())
+            .with_status(502)
+            .with_body("Bad Gateway")
+            .create();
+    }
+}
+
+#[test]
+fn a_bulk_publish_whose_answer_is_lost_but_went_through_is_published_and_not_undone() {
+    let mut h = Harness::new();
+    // No draft notes left: they were published.
+    h.publish_whose_answer_is_lost();
+    let untouched = [
+        h.server.mock("DELETE", Matcher::Any).expect(0).create(),
+        h.server.mock("POST", format!("{MR}/unapprove").as_str()).expect(0).create(),
+    ];
+
+    let url = h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "Ship it.")).unwrap();
+
+    untouched.iter().for_each(Mock::assert);
+    assert_eq!(url, MR_URL);
+}
+
+#[test]
+fn a_bulk_publish_that_failed_with_the_draft_notes_still_there_is_undone() {
+    let mut h = Harness::new();
+    h.publish_whose_answer_is_lost();
+    // Read again after the failure, the draft note is still there.
+    h.get(&format!("{MR}/draft_notes"), TOKEN, r#"[{ "id": 501, "note": "Ship it." }]"#);
+    let undone = [
+        h.server.mock("DELETE", format!("{MR}/draft_notes/501").as_str()).with_status(204).create(),
+        h.server.mock("POST", format!("{MR}/unapprove").as_str()).with_status(201).with_body("{}").create(),
+    ];
+
+    let error = h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "Ship it.")).unwrap_err();
+
+    undone.iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::Api { status: 502, .. }), "{error:?}");
+}
+
 #[test]
 fn a_refused_draft_note_deletes_the_ones_before_it() {
     let mut h = Harness::new();
