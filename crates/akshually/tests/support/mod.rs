@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::ipc::{self, AppState, HumanCommand, Server};
-use akshually_core::{Changeset, FileChange, Paths, Service, SessionView, Verdict};
+use akshually_core::{Changeset, FileChange, Paths, Service, SessionId, SessionView, Turn, Verdict};
 use akshually_testkit::{TestDirs, wait_until};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +79,15 @@ impl HostedApp {
         wait_until(TIMEOUT, "the Session to open", || {
             self.service.sessions().into_iter().find(|s| s.repo() == Some(repo))
         })
+    }
+
+    /// Waits until a `review` call attached to Session `id` after the Round it last received,
+    /// so the Session took its Changeset and became the human's Turn again. `agent_waiting`
+    /// alone isn't enough: it can still be the call that received the Round, not yet seen gone.
+    pub(crate) fn wait_for_review(&self, id: &SessionId) {
+        wait_until(TIMEOUT, "the review to attach", || {
+            self.service.session(id).filter(|s| s.agent_waiting && s.turn == Turn::Human)
+        });
     }
 
     /// Waits until the co-Reviewer's `review` call waits on the Pull Request's Session.
