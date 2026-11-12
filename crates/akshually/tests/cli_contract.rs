@@ -118,3 +118,24 @@ fn test_control_is_refused_by_an_app_not_started_for_tests() {
 
     assert!(matches!(refused, Err(ClientError::App(e)) if e.code == ErrorCode::Forbidden));
 }
+
+#[test]
+fn version_prints_the_package_version() {
+    let app = HostedApp::start();
+
+    let out = app.akshually(&std::env::temp_dir(), &["--version"]).output().unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("akshually {}\n", env!("CARGO_PKG_VERSION")));
+}
+
+/// The `.desktop` entry and the macOS `.app` start the binary with no arguments. That opens the
+/// app, which leaves the CLI to the instance already running.
+#[test]
+fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
+    let app = HostedApp::start();
+
+    let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
