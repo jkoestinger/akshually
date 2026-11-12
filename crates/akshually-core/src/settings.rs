@@ -11,11 +11,14 @@ pub struct Settings {
     /// Whether a local Changeset includes untracked, non-ignored files. A `review` call can
     /// override it.
     pub untracked: bool,
+    /// Whether a Session that becomes the human's Turn while the window is unfocused shows an
+    /// OS desktop notification.
+    pub notifications: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { untracked: true }
+        Settings { untracked: true, notifications: true }
     }
 }
 

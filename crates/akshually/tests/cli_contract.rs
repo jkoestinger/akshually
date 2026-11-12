@@ -300,7 +300,7 @@ fn review_takes_a_base_and_the_untracked_override() {
 
     assert_eq!(reviewed_paths(&app, &repo, &[]), ["agent.txt", "forgot.txt", "topic.txt"]);
     assert_eq!(reviewed_paths(&app, &repo, &["--base", "topic", "--no-untracked"]), ["agent.txt"]);
-    app.service.set_settings(Settings { untracked: false });
+    app.service.set_settings(Settings { untracked: false, ..Settings::default() });
     assert_eq!(reviewed_paths(&app, &repo, &["--base", "topic", "--untracked"]), ["agent.txt", "forgot.txt"]);
 }
 

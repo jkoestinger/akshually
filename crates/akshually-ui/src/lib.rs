@@ -17,7 +17,10 @@ use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea};
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
 
+mod notifier;
 mod theme;
+
+pub use notifier::DesktopNotifier;
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
 /// a window. Such a run must not bind the socket or touch the state dir.
@@ -42,7 +45,9 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         .args(rune_args)
         .init(move || State::new(init_service))
         // The app outlives its window: agents keep calling in (ADR 0002).
-        .keep_running();
+        .keep_running()
+        // Notifications are for when the human looks elsewhere.
+        .on_focus(|s: &mut State, focused, _| s.service.set_window_focused(focused));
     let handle = app.handle();
     service.subscribe(move |sessions| {
         let sessions = sessions.to_vec();
