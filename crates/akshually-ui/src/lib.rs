@@ -3,7 +3,7 @@
 //! The view model is rebuilt from the service's plain-data Sessions; every human action goes
 //! straight back to the service. No review logic lives here.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread};
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
@@ -13,6 +13,8 @@ use rune_kit::{Badge, Button, ButtonVariant, Kit, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
+
+mod theme;
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
 /// a window. Such a run must not bind the socket or touch the state dir.
@@ -25,6 +27,9 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let spec = AppSpec {
         scenes: &[("session", scene_session)],
+        // The system monospace font. A family whose oblique face lacks the italic/oblique bit
+        // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
+        // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
         families: ("Inter", "ui-monospace, Inter"),
         on_key: Some(on_key),
         ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
@@ -235,15 +240,9 @@ impl State {
     }
 }
 
-fn kit(dark: bool) -> &'static Kit {
-    static DARK: OnceLock<Kit> = OnceLock::new();
-    static LIGHT: OnceLock<Kit> = OnceLock::new();
-    let cell = if dark { &DARK } else { &LIGHT };
-    cell.get_or_init(|| Kit::neutral(dark))
-}
-
 fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let k = kit(cx.system_dark());
+    // Rune keeps `system_dark` current with the OS setting and redraws when it changes.
+    let k = theme::kit(cx.system_dark());
     let mut layer = Vec::new();
     let body = match s.active_tab() {
         Some(tab) => {
