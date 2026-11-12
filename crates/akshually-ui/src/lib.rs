@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread};
+use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread, ThreadId};
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
@@ -238,6 +238,18 @@ impl State {
             eprintln!("akshually: {error}");
         }
     }
+
+    /// `act`, for a human action on one Thread.
+    fn act_on_thread(
+        &self,
+        id: &SessionId,
+        thread: &ThreadId,
+        action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>,
+    ) {
+        if let Err(error) = action(&self.service, id, thread) {
+            eprintln!("akshually: {error}");
+        }
+    }
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
@@ -336,17 +348,55 @@ fn annotation(k: &Kit, s: &State, a: &Annotation) -> El {
         return composer(k, s);
     }
     let thread = s.active_tab().and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id));
-    match thread {
-        Some(thread) => thread_card(k, thread),
-        None => col(),
+    let session = s.active.clone();
+    match (thread, session) {
+        (Some(thread), Some(session)) if thread.resolved.is_some() => resolved_row(k, thread, session),
+        (Some(thread), Some(session)) => thread_card(k, thread, session),
+        _ => col(),
     }
+}
+
+/// A Resolved Thread, collapsed to one line with a way to reopen it.
+fn resolved_row(k: &Kit, thread: &Thread, session: SessionId) -> El {
+    let by = match thread.resolved {
+        Some(Party::Agent) => "agent",
+        _ => "you",
+    };
+    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let count = thread.comments.len();
+    let id = thread.id.clone();
+    row()
+        .w_full()
+        .max_w(720.0)
+        .px(12.0)
+        .py(6.0)
+        .gap(8.0)
+        .items_center()
+        .radius(8.0)
+        .border(1.0, k.c.border_weak)
+        .child(
+            text(format!(
+                "✓ Resolved by {by} · {} · “{first}” · {count} Comment{}",
+                thread.id,
+                if count == 1 { "" } else { "s" }
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        )
+        .child(row().grow(1.0))
+        .child(
+            Button::new("Reopen")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.act_on_thread(&session, &id, Service::reopen_thread))
+                .build(k),
+        )
 }
 
 fn card(k: &Kit) -> El {
     col().w_full().max_w(720.0).padding(12.0).gap(8.0).radius(8.0).fill(k.c.layer_01).border(1.0, k.c.border_weak)
 }
 
-fn thread_card(k: &Kit, thread: &Thread) -> El {
+fn thread_card(k: &Kit, thread: &Thread, session: SessionId) -> El {
     let mut card = card(k);
     for comment in &thread.comments {
         let who = match comment.author {
@@ -366,6 +416,18 @@ fn thread_card(k: &Kit, thread: &Thread) -> El {
                     .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
             )
             .child(text(comment.body.clone()).font(k.ty.body).color(k.c.text_base).wrap());
+    }
+    // A Thread still all Drafts hasn't reached the agent yet: nothing to resolve.
+    if thread.comments.iter().any(|c| !c.is_draft()) {
+        let id = thread.id.clone();
+        card = card.child(
+            row().w_full().child(row().grow(1.0)).child(
+                Button::new("Resolve")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.act_on_thread(&session, &id, Service::resolve_thread))
+                    .build(k),
+            ),
+        );
     }
     card
 }
@@ -420,18 +482,25 @@ fn scene_session(s: &mut State) {
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
+            sample_thread("T3", 1..=1, "Rename `turn` to `whose_turn`?", Some(1)),
         ],
     };
+    let mut session = session;
+    let agent = |body: &str| akshually_core::Comment { author: Party::Agent, body: body.into(), round: Some(2) };
+    session.threads[0].comments.push(agent("Done: the snapshot is taken first."));
+    session.threads[2].comments.push(agent("Renamed."));
+    session.threads[2].resolved = Some(Party::Agent);
     s.apply(vec![session]);
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
-    use akshually_core::{Comment, ThreadId};
+    use akshually_core::Comment;
     Thread {
         id: ThreadId::new(id),
         anchor: Anchor::lines(Side::New, "src/session.rs", lines),
         excerpt: String::new(),
         comments: vec![Comment { author: Party::Human, body: body.into(), round }],
+        resolved: None,
     }
 }
 

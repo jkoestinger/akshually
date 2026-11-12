@@ -87,6 +87,9 @@ pub struct Thread {
     /// The anchored code when the Thread was opened.
     pub excerpt: String,
     pub comments: Vec<Comment>,
+    /// Who marked it Resolved, while it is; either party can, and the human can reopen it.
+    #[serde(default)]
+    pub resolved: Option<Party>,
 }
 
 /// Who wrote a Comment.
@@ -103,7 +106,8 @@ pub struct Comment {
     pub author: Party,
     /// Markdown.
     pub body: String,
-    /// The Round that carried it to the other side; `None` while it's a Draft.
+    /// The Round that carried it to the other side; `None` while it's a Draft. An agent's
+    /// reply, which the human sees at once, counts towards the Round being drafted.
     pub round: Option<u32>,
 }
 

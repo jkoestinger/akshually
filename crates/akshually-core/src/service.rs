@@ -1,7 +1,7 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -213,7 +213,13 @@ impl Service {
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            resolved: None,
+        });
         inner.notify();
         Ok(thread)
     }
@@ -256,6 +262,60 @@ impl Service {
         }
         inner.notify();
         Ok(number)
+    }
+
+    /// Agent: replies to `thread` in the Session for the repository and branch at `cwd`. The
+    /// human sees it at once; it counts towards the Round being drafted.
+    pub fn reply(&self, cwd: &Path, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.agent_thread(cwd, thread, |round, thread| {
+            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round) });
+        })
+    }
+
+    /// Agent: marks `thread` Resolved in the Session for the repository and branch at `cwd`.
+    pub fn resolve(&self, cwd: &Path, thread: &ThreadId) -> Result<(), Error> {
+        self.agent_thread(cwd, thread, |_, thread| thread.resolved = Some(Party::Agent))
+    }
+
+    /// Human: marks `thread` Resolved, whoever opened it.
+    pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| t.resolved = Some(Party::Human))
+    }
+
+    /// Human: reopens a Resolved `thread`, whoever resolved it.
+    pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| t.resolved = None)
+    }
+
+    fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);
+        f(found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Runs `f` on a Thread the agent has received, in the Session for `cwd`, with the number
+    /// of the Round being drafted.
+    fn agent_thread(&self, cwd: &Path, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let mut inner = self.lock();
+        let Some(session) = inner.sessions.iter_mut().find(|s| s.view.repo == repo && s.view.branch == branch) else {
+            return Err(Error::NoSessionHere { repo, branch });
+        };
+        let round = session.view.round;
+        // A Thread still all Drafts hasn't reached the agent, so it can't know its ID.
+        let found =
+            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| !c.is_draft()));
+        f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
     }
 
     /// Human: approves the Session, which ends it and returns the Verdict to the agent.

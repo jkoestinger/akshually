@@ -4,7 +4,7 @@
 mod support;
 
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Side};
+use akshually_core::{Anchor, Party, Side};
 use akshually_testkit::{TestDirs, TestRepo};
 use support::{HostedApp, LaunchedApp, finish, still_running};
 
@@ -71,7 +71,8 @@ fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code
         String::from_utf8_lossy(&out.stdout),
         "# Round 1\n\
          \n\
-         The human handed over 2 Threads. Address each one, then run `akshually review` again.\n\
+         The human handed over 2 Threads. Address each one, answer it with `akshually reply <thread> \"…\"` \
+         or `akshually resolve <thread>`, then run `akshually review` again.\n\
          \n\
          ## T1 · lib.rs, new lines 2-3\n\
          \n\
@@ -92,6 +93,50 @@ fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code
          \n\
          Keep `a`.\n"
     );
+}
+
+#[test]
+fn review_format_json_prints_the_round_as_json() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
+    app.service.resolve_thread(&session.id, &akshually_core::ThreadId::new("T1")).unwrap();
+
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(
+        printed,
+        serde_json::json!({
+            "outcome": "round",
+            "number": 1,
+            "threads": [{
+                "id": "T1",
+                "anchor": {"kind": "lines", "path": "lib.rs", "side": "new", "start": 2, "end": 3},
+                "excerpt": "fn b() {}\nfn c() {}\n",
+                "comments": [{"author": "human", "body": "Why two?", "round": 1}],
+                "resolved": "human",
+            }],
+        })
+    );
+}
+
+#[test]
+fn review_format_json_prints_the_verdict_as_json() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    app.service.approve(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"outcome\":\"approved\"}\n");
 }
 
 #[test]
@@ -116,6 +161,46 @@ fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
     assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
     app.service.approve(&session.id).unwrap();
     assert_eq!(finish(second).status.code(), Some(EXIT_APPROVED));
+}
+
+/// Hands the `review` call in `repo` a Round with Thread T1, on new line 3.
+fn round_1_handed_over(app: &HostedApp, repo: &TestRepo) -> akshually_core::SessionId {
+    let call = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(call).status.code(), Some(EXIT_ROUND));
+    session.id
+}
+
+#[test]
+fn reply_and_resolve_act_on_the_session_for_this_branch_and_return_at_once() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+
+    let replied = finish(app.akshually(repo.path(), &["reply", "T1", "Dropped it."]).spawn().unwrap());
+    let resolved = finish(app.akshually(repo.path(), &["resolve", "T1"]).spawn().unwrap());
+
+    assert_eq!(replied.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&replied.stderr));
+    assert_eq!(resolved.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&resolved.stderr));
+    let thread = &app.service.session(&session).unwrap().threads[0];
+    assert_eq!(thread.comments.last().map(|c| (c.author, c.body.as_str())), Some((Party::Agent, "Dropped it.")));
+    assert_eq!(thread.resolved, Some(Party::Agent));
+}
+
+#[test]
+fn reply_and_resolve_on_an_unknown_thread_exit_1_naming_it() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    round_1_handed_over(&app, &repo);
+
+    for args in [&["reply", "T7", "Done."][..], &["resolve", "T7"]] {
+        let out = finish(app.akshually(repo.path(), args).spawn().unwrap());
+
+        assert_eq!(out.status.code(), Some(EXIT_ERROR), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no Thread T7"), "{args:?}");
+    }
 }
 
 #[test]

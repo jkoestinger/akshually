@@ -80,6 +80,12 @@ impl Server {
     fn answer(&self, request: Request) -> Reply {
         let result = match request {
             Request::Review { cwd } => self.review(cwd),
+            Request::Reply { cwd, thread, body } => {
+                self.service.reply(&cwd, &thread, body).map(|()| serde_json::json!({})).map_err(failed)
+            }
+            Request::Resolve { cwd, thread } => {
+                self.service.resolve(&cwd, &thread).map(|()| serde_json::json!({})).map_err(failed)
+            }
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {
                 Err(ErrorReply::new(ErrorCode::Forbidden, "this app was not started for tests"))
             }

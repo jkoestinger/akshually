@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use akshually_core::{Anchor, FileChange, Outcome, Party, ReviewRequest, Round, Service, Side};
+use akshually_core::{Anchor, FileChange, Outcome, Party, ReviewRequest, Round, Service, SessionId, Side, ThreadId};
 use akshually_testkit::{TestDirs, TestRepo};
 
 fn change(path: &str, old: Option<&str>, new: Option<&str>) -> FileChange {
@@ -303,4 +303,108 @@ fn a_round_handed_over_while_no_review_waits_goes_to_the_next_call() {
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
     assert_eq!(round(second.wait_timeout(Duration::from_secs(1))).number, 2);
+}
+
+/// A Session on `agent_branch` whose Round 1 handed the agent Thread T1, on new lines 2-3.
+fn after_round_1(repo: &TestRepo, svc: &Service) -> SessionId {
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why rename?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+    id
+}
+
+#[test]
+fn an_agent_reply_shows_in_its_thread_attributed_to_the_agent() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+
+    svc.reply(repo.path(), &ThreadId::new("T1"), "Renamed for clarity.").unwrap();
+
+    let thread = &svc.session(&id).unwrap().threads[0];
+    let comments: Vec<_> = thread.comments.iter().map(|c| (c.author, c.body.as_str(), c.round)).collect();
+    assert_eq!(
+        comments,
+        vec![(Party::Human, "Why rename?", Some(1)), (Party::Agent, "Renamed for clarity.", Some(2))],
+        "the reply comes back with Round 2, and isn't a Draft"
+    );
+}
+
+#[test]
+fn the_agent_can_only_answer_threads_it_has_received() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "Still a Draft").unwrap();
+
+    let unknown = svc.reply(repo.path(), &ThreadId::new("T9"), "?").unwrap_err();
+    let draft = svc.resolve(repo.path(), &ThreadId::new("T2")).unwrap_err();
+
+    assert_eq!(unknown.to_string(), "no Thread T9 in this Session");
+    assert_eq!(draft.to_string(), "no Thread T2 in this Session");
+    assert!(svc.reply(repo.path(), &ThreadId::new("T1"), " \n").is_err(), "blank reply");
+    let threads = svc.session(&id).unwrap().threads;
+    assert_eq!(threads.iter().map(|t| t.comments.len()).collect::<Vec<_>>(), vec![1, 1]);
+    assert!(threads.iter().all(|t| t.resolved.is_none()));
+}
+
+#[test]
+fn replying_without_a_session_for_this_branch_fails() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    after_round_1(&repo, &svc);
+    repo.branch("other");
+
+    let error = svc.reply(repo.path(), &ThreadId::new("T1"), "Done.").unwrap_err();
+
+    assert!(error.to_string().contains("no Session"), "{error}");
+}
+
+#[test]
+fn the_agent_can_resolve_a_thread() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+
+    svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().threads[0].resolved, Some(Party::Agent));
+}
+
+#[test]
+fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_any_thread() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "A Draft").unwrap();
+    svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+
+    svc.reopen_thread(&id, &ThreadId::new("T1")).unwrap();
+    assert_eq!(svc.session(&id).unwrap().threads[0].resolved, None);
+
+    svc.resolve_thread(&id, &ThreadId::new("T1")).unwrap();
+    svc.resolve_thread(&id, &ThreadId::new("T2")).unwrap();
+    let resolved: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.resolved).collect();
+    assert_eq!(resolved, vec![Some(Party::Human), Some(Party::Human)]);
+    assert!(svc.resolve_thread(&id, &ThreadId::new("T9")).is_err());
+}
+
+#[test]
+fn a_handed_over_round_carries_whether_each_thread_is_resolved() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = after_round_1(&repo, &svc);
+    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "Add a test for d").unwrap();
+    svc.resolve_thread(&id, &ThreadId::new("T2")).unwrap();
+
+    svc.hand_over_round(&id).unwrap();
+
+    let round2 = round(second.wait_timeout(Duration::from_secs(1)));
+    assert_eq!(
+        round2.threads.iter().map(|t| (t.id.as_str(), t.resolved)).collect::<Vec<_>>(),
+        vec![("T2", Some(Party::Human))]
+    );
 }

@@ -29,4 +29,8 @@ pub enum Error {
     EmptyComment,
     #[error("there are no Drafts to hand over")]
     NoDrafts,
+    #[error("no Session for {} on branch {branch}; run `akshually review` first", repo.display())]
+    NoSessionHere { repo: std::path::PathBuf, branch: String },
+    #[error("no Thread {0} in this Session")]
+    UnknownThread(ThreadId),
 }

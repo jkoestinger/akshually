@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionId, SessionView};
+use crate::{SessionId, SessionView, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -21,6 +21,10 @@ pub const VERSION: u32 = 1;
 pub enum Request {
     /// Blocks until the human answers; replies with an `Outcome`.
     Review { cwd: PathBuf },
+    /// The agent replies to a Thread in the Session for `cwd`. Replies `{}` at once.
+    Reply { cwd: PathBuf, thread: ThreadId, body: String },
+    /// The agent resolves a Thread in the Session for `cwd`. Replies `{}` at once.
+    Resolve { cwd: PathBuf, thread: ThreadId },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
