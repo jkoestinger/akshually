@@ -20,6 +20,7 @@ use crate::{Anchor, LocalOptions, SessionId, SessionView, SourceRef, ThreadId};
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
 
+/// What a CLI call asks of the running app.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -95,12 +96,14 @@ pub fn source(cwd: PathBuf, pr: Option<String>) -> SourceRef {
     }
 }
 
+/// The running app's state, as `test.state` replies it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
     pub pid: u32,
     pub sessions: Vec<SessionView>,
 }
 
+/// The app's answer to a request: `ok` with what the request returns, or `err`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
@@ -108,6 +111,7 @@ pub enum Reply {
     Err(ErrorReply),
 }
 
+/// Why the app refused or failed a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{message}")]
 pub struct ErrorReply {
@@ -115,6 +119,7 @@ pub struct ErrorReply {
     pub message: String,
 }
 
+/// The kind of an [`ErrorReply`], for the CLI to act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {

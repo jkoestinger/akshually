@@ -2,7 +2,6 @@
 //! diffs and discussions.
 
 use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -16,7 +15,7 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment,
 };
-use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
+use super::{FileFetch, REQUEST_TIMEOUT, epoch_seconds, fetch_files, with_suggestion};
 use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitLab's maximum.
@@ -24,6 +23,7 @@ const PAGE: &str = "100";
 /// The most of a file read for its contents.
 const MAX_FILE: u64 = 100 * 1024 * 1024;
 
+/// The [`ForgeAdapter`] for one GitLab host.
 pub struct GitLab {
     host: HostConfig,
     /// The REST API's base URL, without a trailing `/`.
@@ -54,7 +54,7 @@ impl GitLab {
         let agent = ureq::Agent::config_builder()
             // Read 4xx/5xx bodies for GitLab's error messages.
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(120)))
+            .timeout_global(Some(REQUEST_TIMEOUT))
             .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
@@ -161,7 +161,7 @@ impl GitLab {
 
     /// The merge request's diff, file by file.
     fn diffs(&self, pr: &PullRequestRef) -> Result<Vec<Diff>, ForgeError> {
-        self.pages(self.merge_request_url(pr, &["diffs"])).map_err(|e| self.not_found_as(e, pr))
+        self.pages(&self.merge_request_url(pr, &["diffs"])).map_err(|e| self.not_found_as(e, pr))
     }
 
     /// Whether the human can approve `pr`, and whether they have.
@@ -171,7 +171,7 @@ impl GitLab {
 
     /// Every item of a paginated list at `url`, following GitLab's `x-next-page` header (on
     /// this API, so the token stays on this host).
-    fn pages<T: DeserializeOwned>(&self, url: Url) -> Result<Vec<T>, ForgeError> {
+    fn pages<T: DeserializeOwned>(&self, url: &Url) -> Result<Vec<T>, ForgeError> {
         let mut items = Vec::new();
         let mut page = "1".to_owned();
         loop {
@@ -436,7 +436,7 @@ impl ForgeAdapter for GitLab {
             }
         }
         fetches.sort_by(|a, b| a.path.cmp(&b.path));
-        let files = fetch_files(fetches, |path, side| {
+        let files = fetch_files(&fetches, |path, side| {
             self.file(id, path, if side == Side::Old { &pr.base_sha } else { &pr.head_sha })
         })?;
         Ok(Changeset { base: pr.base_sha.clone(), files })
@@ -444,7 +444,7 @@ impl ForgeAdapter for GitLab {
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
         let discussions: Vec<Discussion> =
-            self.pages(self.merge_request_url(&pr.id, &["discussions"])).map_err(|e| self.not_found_as(e, &pr.id))?;
+            self.pages(&self.merge_request_url(&pr.id, &["discussions"])).map_err(|e| self.not_found_as(e, &pr.id))?;
         Ok(discussions.into_iter().filter_map(|d| d.into_remote(&pr.head_sha)).collect())
     }
 

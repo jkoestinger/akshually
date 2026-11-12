@@ -3,6 +3,8 @@
 //! [`Service`] is the single entry point. The UI calls it in-process; agents reach it through
 //! the CLI, which talks to the running app over the local channel in [`ipc`] (ADR 0002).
 
+#![warn(clippy::unwrap_used)] // Tests may unwrap; production code may not (CODING_STANDARDS.md).
+
 mod changeset;
 pub mod forge;
 pub mod git;
@@ -26,6 +28,7 @@ pub use service::{
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
 
+/// Why a [`Service`] call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]

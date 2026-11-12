@@ -2,8 +2,8 @@
 //! repository under Review, plus one file for the Session bases recorded by `start`.
 //!
 //! The store mirrors the service's Sessions after every change: it rewrites the files whose
-//! content changed and deletes the files of Sessions that ended. Whatever a Session serializes
-//! is what survives a restart, so new Session state persists by being a serialized field.
+//! content changed and deletes the files of Sessions that ended. Whatever a Session serialises
+//! is what survives a restart, so new Session state persists by being a serialised field.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;

@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One Forge host, as a `[[hosts]]` entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -40,6 +41,7 @@ impl HostConfig {
     }
 }
 
+/// Which Forge a host runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForgeKind {
     #[serde(rename = "github")]

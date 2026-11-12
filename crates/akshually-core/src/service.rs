@@ -239,7 +239,7 @@ mod saved_source {
     use super::Source;
     use crate::forge::PullRequest;
 
-    pub fn serialize<S: Serializer>(source: &Source, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(source: &Source, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Saved<'a> {
             source: &'a Source,
@@ -247,7 +247,7 @@ mod saved_source {
         Saved { source }.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Source, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Source, D::Error> {
         #[derive(Default, Deserialize)]
         #[serde(default)]
         struct Saved {
@@ -660,6 +660,9 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
     inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The review service: holds every Session and the Inbox, and is the one way the UI and the
+/// CLI channel change them. Cheap calls lock briefly; the ones documented as blocking on `git`
+/// or a Forge do that work outside the lock.
 #[derive(Default)]
 pub struct Service {
     // One lock for Sessions and subscribers, so subscribers see changes in order. Shared with

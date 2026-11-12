@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -16,7 +15,7 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
+use super::{FileFetch, REQUEST_TIMEOUT, epoch_seconds, fetch_files, with_suggestion};
 use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
@@ -24,6 +23,7 @@ const PAGE: &str = "100";
 /// GitHub serves raw contents up to 100 MB.
 const MAX_FILE: u64 = 100 * 1024 * 1024;
 
+/// The [`ForgeAdapter`] for one GitHub host.
 pub struct GitHub {
     host: HostConfig,
     /// The REST API's base URL, without a trailing `/`.
@@ -64,7 +64,7 @@ impl GitHub {
         let agent = ureq::Agent::config_builder()
             // Read 4xx/5xx bodies for GitHub's error messages.
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(120)))
+            .timeout_global(Some(REQUEST_TIMEOUT))
             .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
@@ -129,7 +129,7 @@ impl GitHub {
         self.get(url, "application/vnd.github+json")?.body_mut().read_json().map_err(|e| self.unexpected(e))
     }
 
-    fn graphql<T: DeserializeOwned>(&self, query: &str, variables: serde_json::Value) -> Result<T, ForgeError> {
+    fn graphql<T: DeserializeOwned>(&self, query: &str, variables: &Value) -> Result<T, ForgeError> {
         #[derive(Deserialize)]
         struct Answer<T> {
             data: Option<T>,
@@ -158,7 +158,7 @@ impl GitHub {
     /// A file's contents at `sha`.
     fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
         let mut url = self.endpoint(&repo_segments(pr, &["contents"]));
-        url.path_segments_mut().expect("a path").extend(path.split('/'));
+        url.path_segments_mut().expect("the API base is a URL with a path").extend(path.split('/'));
         url.query_pairs_mut().append_pair("ref", sha);
         self.get(url.as_str(), "application/vnd.github.raw+json")?
             .body_mut()
@@ -354,7 +354,7 @@ impl ForgeAdapter for GitHub {
             }
         }
         fetches.sort_by(|a, b| a.path.cmp(&b.path));
-        let files = fetch_files(fetches, |path, side| {
+        let files = fetch_files(&fetches, |path, side| {
             self.file(id, path, if side == Side::Old { &base } else { &pr.head_sha })
         })?;
         Ok(Changeset { base, files })
@@ -403,7 +403,7 @@ impl ForgeAdapter for GitHub {
         let mut after: Option<String> = None;
         loop {
             let variables = serde_json::json!({ "owner": owner, "repo": repo, "number": pr.id.number, "after": after });
-            let data: ThreadsData = self.graphql(THREADS_QUERY, variables)?;
+            let data: ThreadsData = self.graphql(THREADS_QUERY, &variables)?;
             let page = data
                 .repository
                 .and_then(|r| r.pull_request)
@@ -446,7 +446,7 @@ impl ForgeAdapter for GitHub {
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
         let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
         let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
-        let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, variables)?;
+        let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, &variables)?;
         let pr_id =
             data.pointer("/repository/pullRequest/id").ok_or_else(|| ForgeError::NotFound(pr.id.to_string()))?;
         // GitHub would take the review against the old head, its Threads on lines that moved:
@@ -455,7 +455,7 @@ impl ForgeAdapter for GitHub {
             return Err(ForgeError::Moved(pr.id.to_string()));
         }
         let input = json!({ "pullRequestId": pr_id, "commitOID": pr.head_sha });
-        let data: Value = self.graphql(START_REVIEW, json!({ "input": input }))?;
+        let data: Value = self.graphql(START_REVIEW, &json!({ "input": input }))?;
         let review_id = self.string_at(&data, "/addPullRequestReview/pullRequestReview/id")?;
         let mut changed = Vec::new();
         let submitted = self.fill(&review_id, review, &mut changed).and_then(|()| {
@@ -475,7 +475,7 @@ impl ForgeAdapter for GitHub {
                 let _ = self.set_resolved(&thread, !resolved);
             }
             let input = json!({ "pullRequestReviewId": review_id });
-            let _ = self.graphql::<Value>(DELETE_REVIEW, json!({ "input": input }));
+            let _ = self.graphql::<Value>(DELETE_REVIEW, &json!({ "input": input }));
         }
         submitted
     }
@@ -559,7 +559,7 @@ impl GitHub {
                 Some(code) => with_suggestion(&comment.body, "suggestion", code),
                 None => comment.body.clone(),
             });
-            let data: Value = self.graphql(ADD_THREAD, json!({ "input": input }))?;
+            let data: Value = self.graphql(ADD_THREAD, &json!({ "input": input }))?;
             self.string_at(&data, "/addPullRequestReviewThread/thread/id")?;
         }
         for reply in &review.replies {
@@ -568,7 +568,7 @@ impl GitHub {
                 "pullRequestReviewThreadId": reply.thread,
                 "body": reply.body,
             });
-            let data: Value = self.graphql(ADD_REPLY, json!({ "input": input }))?;
+            let data: Value = self.graphql(ADD_REPLY, &json!({ "input": input }))?;
             self.string_at(&data, "/addPullRequestReviewThreadReply/comment/id")?;
         }
         // Before the submit, so a refusal still leaves nothing published.
@@ -590,13 +590,13 @@ impl GitHub {
             Verdict::Feedback => "COMMENT",
         };
         let input = json!({ "pullRequestReviewId": review_id, "event": event, "body": review.body });
-        let data: Value = self.graphql(SUBMIT_REVIEW, json!({ "input": input }))?;
+        let data: Value = self.graphql(SUBMIT_REVIEW, &json!({ "input": input }))?;
         self.string_at(&data, "/submitPullRequestReview/pullRequestReview/url")
     }
 
     /// The web page of the review `review_id` if it was submitted, `None` while it's pending.
     fn submitted_url(&self, review_id: &str) -> Result<Option<String>, ForgeError> {
-        let data: Value = self.graphql(REVIEW_STATE_QUERY, json!({ "id": review_id }))?;
+        let data: Value = self.graphql(REVIEW_STATE_QUERY, &json!({ "id": review_id }))?;
         let state = self.string_at(&data, "/node/state")?;
         if state == "PENDING" {
             return Ok(None);
@@ -611,7 +611,7 @@ impl GitHub {
         } else {
             (UNRESOLVE_THREAD, "unresolveReviewThread")
         };
-        let data: Value = self.graphql(mutation, json!({ "input": { "threadId": thread } }))?;
+        let data: Value = self.graphql(mutation, &json!({ "input": { "threadId": thread } }))?;
         self.string_at(&data, &format!("/{field}/thread/id")).map(drop)
     }
 

@@ -1,5 +1,7 @@
 //! The single `akshually` binary: the CLI agents call, and (`akshually app`) the app itself.
 
+#![warn(clippy::unwrap_used)] // Tests may unwrap; production code may not (CODING_STANDARDS.md).
+
 mod launch;
 mod render;
 
@@ -9,10 +11,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use akshually_core::ipc::{self, BindError, Connection, Server};
-use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+use akshually_core::ipc::{self, BindError, Connection, Server};
+use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
 
 /// The agent skill `agent-help` prints.
 const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
@@ -27,14 +30,20 @@ const PUSH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// within GitHub's 30 searches a minute.
 const INBOX_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
+/// How long a second app waits for the running one to listen: it may have only just taken the
+/// lock, and listens moments later.
+const RUNNING_APP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a second app tries to reach the running one meanwhile.
+const RUNNING_APP_RETRY: Duration = Duration::from_millis(50);
+
 /// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
 mod exit {
-    pub const APPROVED: u8 = 0;
-    pub const ERROR: u8 = 1;
-    pub const ABANDONED: u8 = 3;
-    pub const ROUND: u8 = 4;
-    pub const PUBLISHED: u8 = 5;
-    pub const CLOSED: u8 = 6;
+    pub(crate) const APPROVED: u8 = 0;
+    pub(crate) const ERROR: u8 = 1;
+    pub(crate) const ABANDONED: u8 = 3;
+    pub(crate) const ROUND: u8 = 4;
+    pub(crate) const PUBLISHED: u8 = 5;
+    pub(crate) const CLOSED: u8 = 6;
 }
 
 #[derive(Parser)]
@@ -288,11 +297,11 @@ fn agent_call(f: impl FnOnce(Connection, &Path) -> Result<()>) -> Result<ExitCod
 /// launches racing), so give it a moment to listen. One that never answers here listens
 /// elsewhere: it was started with another runtime dir.
 fn connect_to_running(paths: &Paths) -> Result<Connection> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + RUNNING_APP_TIMEOUT;
     loop {
         match ipc::connect(paths) {
             Ok(connection) => return Ok(connection),
-            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(RUNNING_APP_RETRY),
             Err(error) => anyhow::bail!(
                 "another akshually app is already running on {}, but it doesn't listen at {} ({error}): it was \
                  started with another XDG_RUNTIME_DIR or AKSHUALLY_RUNTIME_DIR. Run akshually with the same \
@@ -317,7 +326,9 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     // Only reads the saved Sessions: it writes nothing until a Session changes, which a
     // second instance never sees, since it quits below.
     let forges = forge::adapters(&settings.hosts, &forge::CredentialSources::from_env());
-    let service = Service::open(&paths.state)?.with_forges(forges);
+    let service = Service::open(&paths.state)
+        .with_context(|| format!("can't open the saved Sessions in {}", paths.state.display()))?
+        .with_forges(forges);
     // No window means nothing to notify about, and tests never show real notifications.
     let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);
@@ -338,7 +349,7 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     if headless {
         let server =
             if std::env::var_os("AKSHUALLY_TEST_CONTROL").is_some() { server.with_test_control() } else { server };
-        server.serve()?;
+        server.serve().context("can't serve the CLI")?;
     } else {
         std::thread::spawn(move || server.serve());
         // Offers changes on disk during the human's Turn as reloads (the banner).

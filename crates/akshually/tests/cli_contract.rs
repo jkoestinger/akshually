@@ -218,7 +218,8 @@ fn review_outside_a_repository_exits_1_with_an_error() {
 
     assert_eq!(out.status.code(), Some(EXIT_ERROR));
     assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not a git repository"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a git repository"), "stderr: {stderr}");
 }
 
 #[test]
@@ -232,7 +233,7 @@ fn review_fails_when_no_app_runs_and_launching_is_off() {
     );
 
     assert_eq!(out.status.code(), Some(EXIT_ERROR));
-    assert!(app.service.sessions().is_empty());
+    assert!(app.service.sessions().is_empty(), "the call reached an app on another runtime dir");
 }
 
 #[test]
@@ -262,7 +263,7 @@ fn a_second_app_exits_and_leaves_the_running_one_serving() {
 
     let second_app = finish(app.akshually(repo.path(), &["app", "--headless"]).spawn().unwrap());
 
-    assert!(second_app.status.success());
+    assert!(second_app.status.success(), "stderr: {}", String::from_utf8_lossy(&second_app.stderr));
     assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
     app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
     assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
@@ -295,7 +296,7 @@ fn test_control_is_refused_by_an_app_not_started_for_tests() {
 
     let refused = ipc::connect(&app.paths()).unwrap().test_state();
 
-    assert!(matches!(refused, Err(ClientError::App(e)) if e.code == ErrorCode::Forbidden));
+    assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::Forbidden), "{refused:?}");
 }
 
 /// `topic` forks from `main`, and `agent` from `topic`. Each branch adds the file named after
@@ -345,7 +346,7 @@ fn review_refuses_a_base_together_with_a_range() {
     let out = finish(app.akshually(repo.path(), &["review", "--base", "main", "main..topic"]).spawn().unwrap());
 
     assert_eq!(out.status.code(), Some(2), "a usage error");
-    assert!(app.service.sessions().is_empty());
+    assert!(app.service.sessions().is_empty(), "a refused review opened a Session");
 }
 
 #[test]
@@ -365,7 +366,7 @@ fn start_records_the_session_base_and_returns_at_once() {
 fn the_app_reads_the_untracked_setting_from_its_config_file() {
     let app = LaunchedApp::new();
     let repo = stacked_branches();
-    let config = app.dirs.path().join("config.toml");
+    let config = app.dirs.config();
     std::fs::write(&config, "untracked = false\n").unwrap();
 
     let call = app.akshually(repo.path(), &["review"]).env("AKSHUALLY_CONFIG", &config).spawn().unwrap();
@@ -447,8 +448,10 @@ fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+
     assert_eq!(out.status.code(), Some(EXIT_ROUND));
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("# Round 1\n"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("# Round 1\n"), "{stdout}");
     let mut third = app.akshually(repo.path(), &["review"]).spawn().unwrap();
     assert!(still_running(&mut third), "the Round was delivered twice");
     app.service.approve(&session.id).unwrap();

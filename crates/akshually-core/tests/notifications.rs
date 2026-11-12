@@ -124,7 +124,7 @@ fn the_window_shows_when_a_session_becomes_the_humans_turn_and_not_for_other_cha
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
     repo.write("lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
     svc.check_disk();
-    assert!(!svc.session(&id).unwrap().changed_on_disk.is_empty());
+    assert!(!svc.session(&id).unwrap().changed_on_disk.is_empty(), "the change on disk wasn't offered");
     assert_eq!(*shown.lock().unwrap(), 1, "Drafts and changes on disk don't take the screen");
 
     svc.hand_over_round(&id).unwrap();

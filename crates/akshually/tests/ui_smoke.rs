@@ -38,6 +38,8 @@ fn render_session(theme: &str) -> Snapshot {
         // A headless render must not bind the socket or write state.
         .env("AKSHUALLY_STATE_DIR", dirs.state())
         .env("AKSHUALLY_RUNTIME_DIR", dirs.runtime())
+        // Nor read the user's config.
+        .env("AKSHUALLY_CONFIG", dirs.config())
         .output()
         .unwrap();
 

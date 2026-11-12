@@ -120,7 +120,8 @@ impl Service {
             session.view.round = first;
             if let Some(at) = session.replaced_last_rounds.iter().position(|(n, _)| *n == first) {
                 // The withdrawn Rounds' entries go too.
-                let (_, last_round) = session.replaced_last_rounds.drain(at..).next().expect("found at `at`");
+                let (_, last_round) =
+                    session.replaced_last_rounds.drain(at..).next().expect("`at` is in `replaced_last_rounds`");
                 session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
                 session.view.last_round = last_round;
                 if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {

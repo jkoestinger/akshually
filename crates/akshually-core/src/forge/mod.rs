@@ -4,6 +4,8 @@
 //! whether it recognises a Pull Request URL. Adapters return plain core data (a [`Changeset`],
 //! [`RemoteThread`]s); the service turns those into a Session.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{BinarySizes, Changeset, FileChange, Side, Verdict};
@@ -236,6 +238,7 @@ pub enum RemoteAnchor {
     File { path: String },
 }
 
+/// A Comment in a Thread on the Forge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteComment {
     /// The writer's login.
@@ -244,6 +247,7 @@ pub struct RemoteComment {
     pub body: String,
 }
 
+/// Why a Forge request failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
     /// No token for `host` from its Forge's CLI, the environment or `config`.
@@ -322,6 +326,13 @@ pub(crate) fn with_suggestion(body: &str, info: &str, code: &str) -> String {
 /// How many requests for file contents run at once.
 const PARALLEL_FETCHES: usize = 8;
 
+/// How long one request to a Forge may take in all before it fails: generous, since one
+/// request may download a whole file's contents.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How much of a file is searched for a NUL to call it binary: the first 8 KB, as git does.
+const BINARY_CHECK_BYTES: usize = 8192;
+
 /// One changed file to fetch: its path in the Changeset, the paths to read on each side (`None`
 /// where it doesn't exist), and the hunks of the Forge's diff.
 pub(crate) struct FileFetch {
@@ -335,7 +346,7 @@ pub(crate) struct FileFetch {
 /// [`PARALLEL_FETCHES`] threads. The changes come back in the order of `files`; the first
 /// failure fails them all.
 pub(crate) fn fetch_files(
-    files: Vec<FileFetch>,
+    files: &[FileFetch],
     read: impl Fn(&str, Side) -> Result<Vec<u8>, ForgeError> + Sync,
 ) -> Result<Vec<FileChange>, ForgeError> {
     use std::sync::Mutex;
@@ -376,7 +387,8 @@ pub(crate) fn fetch_files(
 /// A changed file from its contents on each side: binary (a NUL in its first 8 KB, as git
 /// decides) is summarised by size, text is decoded lossily.
 pub(crate) fn file_change(path: String, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> FileChange {
-    let binary = |bytes: &Option<Vec<u8>>| bytes.as_ref().is_some_and(|b| b[..b.len().min(8192)].contains(&0));
+    let binary =
+        |bytes: &Option<Vec<u8>>| bytes.as_ref().is_some_and(|b| b[..b.len().min(BINARY_CHECK_BYTES)].contains(&0));
     if binary(&old) || binary(&new) {
         let size = |bytes: &Option<Vec<u8>>| bytes.as_ref().map(|b| b.len() as u64);
         let sizes = BinarySizes { old: size(&old), new: size(&new) };

@@ -1,3 +1,6 @@
+//! The app's end of the local channel: the single-instance lock, the socket, and serving each
+//! CLI request against the review service.
+
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -7,6 +10,7 @@ use std::sync::{Arc, mpsc};
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION, source};
 use crate::{NewComment, Paths, ReviewRequest, Service};
 
+/// Why the app couldn't start serving the local channel.
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
     #[error("another akshually app is already running")]
@@ -180,7 +184,7 @@ fn parse(line: &str) -> Result<Request, ErrorReply> {
 }
 
 fn send(stream: &UnixStream, reply: Reply) -> io::Result<()> {
-    let mut out = serde_json::to_string(&Envelope::new(reply)).expect("replies serialize");
+    let mut out = serde_json::to_string(&Envelope::new(reply)).expect("replies serialise");
     out.push('\n');
     (&*stream).write_all(out.as_bytes())
 }
@@ -194,5 +198,5 @@ fn failed(error: crate::Error) -> ErrorReply {
 }
 
 fn json(value: impl serde::Serialize) -> serde_json::Value {
-    serde_json::to_value(value).expect("replies serialize")
+    serde_json::to_value(value).expect("replies serialise")
 }

@@ -148,6 +148,7 @@ fn a_review_that_picks_up_a_queued_round_leaves_the_turn_with_the_agent() {
 
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    assert!(matches!(second.wait_timeout(Duration::from_secs(1)), Some(Outcome::Round(_))));
+    let outcome = second.wait_timeout(Duration::from_secs(1));
+    assert!(matches!(outcome, Some(Outcome::Round(_))), "the queued Round wasn't picked up: {outcome:?}");
     assert_eq!(svc.session(&id).unwrap().turn, Turn::Agent);
 }

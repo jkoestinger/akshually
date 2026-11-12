@@ -42,11 +42,13 @@ impl TestRepo {
     /// `write`, for contents that aren't text.
     pub fn write_bytes(&self, file: &str, contents: &[u8]) -> &Self {
         let path = self.path.join(file);
-        fs::create_dir_all(path.parent().unwrap()).expect("create parent dirs");
+        fs::create_dir_all(path.parent().expect("a file in the repository has a parent dir"))
+            .expect("create parent dirs");
         fs::write(path, contents).expect("write file");
         self
     }
 
+    /// Deletes `file` (relative to the repository root) from the working tree.
     pub fn remove(&self, file: &str) -> &Self {
         fs::remove_file(self.path.join(file)).expect("remove file");
         self
@@ -65,6 +67,7 @@ impl TestRepo {
         self
     }
 
+    /// Switches to the existing `branch`.
     pub fn switch(&self, branch: &str) -> &Self {
         self.git(&["switch", "--quiet", branch]);
         self
@@ -115,12 +118,20 @@ impl TestDirs {
         self.root.path()
     }
 
+    /// akshually's state dir (`AKSHUALLY_STATE_DIR`), not created up front.
     pub fn state(&self) -> PathBuf {
         self.root.path().join("state")
     }
 
+    /// akshually's runtime dir (`AKSHUALLY_RUNTIME_DIR`), holding the socket; not created up front.
     pub fn runtime(&self) -> PathBuf {
         self.root.path().join("run")
+    }
+
+    /// The config file to pass as `AKSHUALLY_CONFIG`, so akshually never reads the user's own.
+    /// Not created: akshually uses its defaults when there is no such file.
+    pub fn config(&self) -> PathBuf {
+        self.root.path().join("config.toml")
     }
 }
 
@@ -147,14 +158,14 @@ pub fn wait_until<T>(timeout: Duration, what: &str, mut check: impl FnMut() -> O
 /// same time. Returns its base URL.
 pub fn threaded_http_server(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> String {
     use std::io::{BufRead, BufReader, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+    let url = format!("http://{}", listener.local_addr().expect("the bound address"));
     let answer = std::sync::Arc::new(answer);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let (Ok(stream), answer) = (stream, answer.clone()) else { continue };
             std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut reader = BufReader::new(stream.try_clone().expect("clone the connection"));
                 // One request after another on a kept-alive connection; none has a body.
                 loop {
                     let mut request = String::new();

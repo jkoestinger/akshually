@@ -6,17 +6,24 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use akshually_core::Paths;
-use akshually_core::ipc::{self, Connection};
 use anyhow::{Context, Result, bail};
 
+use akshually_core::Paths;
+use akshually_core::ipc::{self, Connection};
+
+/// How long a CLI call waits for the app it launched to listen before giving up.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first wait between tries to reach a launched app, doubling up to [`MAX_RETRY`], so a
+/// quick start is noticed at once without spinning through a slow one.
+const FIRST_RETRY: Duration = Duration::from_millis(10);
+/// The longest wait between tries to reach a launched app.
+const MAX_RETRY: Duration = Duration::from_millis(200);
 
 /// Connects to the running app, launching it when none answers.
 ///
 /// Environment: `AKSHUALLY_NO_LAUNCH` fails instead of launching; `AKSHUALLY_HEADLESS` launches
 /// the app without UI (tests).
-pub fn connect_or_launch(paths: &Paths) -> Result<Connection> {
+pub(crate) fn connect_or_launch(paths: &Paths) -> Result<Connection> {
     match ipc::connect(paths) {
         Err(e) if no_app(&e) => {}
         other => return other.context("can't reach the akshually app"),
@@ -28,7 +35,7 @@ pub fn connect_or_launch(paths: &Paths) -> Result<Connection> {
 
     // Two racing CLI calls may both launch an app; the loser exits, and both connect to the winner.
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
-    let mut delay = Duration::from_millis(10);
+    let mut delay = FIRST_RETRY;
     loop {
         match ipc::connect(paths) {
             Err(e) if no_app(&e) && Instant::now() < deadline => {
@@ -41,7 +48,7 @@ pub fn connect_or_launch(paths: &Paths) -> Result<Connection> {
                     bail!("the akshually app didn't start: {why}");
                 }
                 std::thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_millis(200));
+                delay = (delay * 2).min(MAX_RETRY);
             }
             other => {
                 return other
@@ -72,7 +79,7 @@ fn launch(paths: &Paths) -> Result<Child> {
         cmd.arg("--headless");
     }
     cmd.stdin(Stdio::null())
-        .stdout(log.try_clone()?)
+        .stdout(log.try_clone().with_context(|| format!("can't open {}", paths.app_log().display()))?)
         .stderr(log)
         .process_group(0)
         .spawn()

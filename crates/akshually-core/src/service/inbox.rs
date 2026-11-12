@@ -22,6 +22,7 @@ pub struct InboxView {
     pub attention: bool,
 }
 
+/// One Pull Request in the Inbox, and what its row tells the human about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxRow {
     pub item: InboxItem,

@@ -6,7 +6,7 @@ use akshually_core::{Anchor, Outcome, Round, Side, Thread, fence_for};
 
 /// What `review --format markdown` prints for `outcome`; `pr` is the Pull Request the agent
 /// co-reviews, if any, which its commands must name.
-pub fn outcome_markdown(outcome: &Outcome, pr: Option<&str>) -> String {
+pub(crate) fn outcome_markdown(outcome: &Outcome, pr: Option<&str>) -> String {
     match outcome {
         Outcome::Round(round) => round_markdown(round, pr),
         Outcome::Approved => "Approved.\n".to_owned(),

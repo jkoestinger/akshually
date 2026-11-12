@@ -1,3 +1,5 @@
+//! The CLI's end of the local channel: one connection to the running app per request.
+
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -7,6 +9,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
 use crate::{Anchor, LocalOptions, NewComment, Outcome, Paths, ThreadId};
 
+/// Why a request to the running app failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("lost the connection to akshually: {0}")]
@@ -124,7 +127,7 @@ impl Connection {
     }
 
     fn send(&mut self, request: Request) -> io::Result<()> {
-        let mut line = serde_json::to_string(&Envelope::new(request)).expect("requests serialize");
+        let mut line = serde_json::to_string(&Envelope::new(request)).expect("requests serialise");
         line.push('\n');
         self.stream.write_all(line.as_bytes())
     }

@@ -26,6 +26,7 @@ impl Default for Settings {
     }
 }
 
+/// Why the config file couldn't be read.
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("can't read {path}: {source}")]

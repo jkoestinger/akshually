@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::{self, GitError};
 use crate::{Anchor, Error, Settings, Side};
 
+/// The set of changes under Review: each changed file's whole old and new text, against `base`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changeset {
     /// The commit (or, for a Session base, the tree) the Changeset is shown against.
@@ -337,9 +338,13 @@ fn changed_lines(numstat: &[u8]) -> Result<HashMap<String, Option<u64>>, Error> 
     Ok(lines)
 }
 
+/// How many lines at the top of a file are searched for an `@generated` marker: generators
+/// put it in a header comment.
+const GENERATED_MARKER_LINES: usize = 5;
+
 /// Whether `text` says it is generated, by an `@generated` marker in its first lines.
 fn marked_generated(text: &str) -> bool {
-    text.lines().take(5).any(|line| line.contains("@generated"))
+    text.lines().take(GENERATED_MARKER_LINES).any(|line| line.contains("@generated"))
 }
 
 fn text(bytes: Vec<u8>) -> String {

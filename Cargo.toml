@@ -41,6 +41,16 @@ toml = { version = "1", default-features = false, features = ["parse", "serde", 
 ureq = { version = "3.5", features = ["json"] }
 url = "2.5"
 
+# CODING_STANDARDS.md, "Enforced by tooling". CI denies every warning.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 # Cargo ignores a dependency's [patch], so Rune's are repeated here, all at the pinned rev.
 # Re-check `[patch.crates-io]` in Rune's root Cargo.toml whenever the rev is bumped.
 [patch.crates-io]

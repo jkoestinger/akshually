@@ -10,7 +10,7 @@ const THEME_JSON: &str = include_str!("../assets/theme.json");
 
 /// The tokens of one appearance. Colours are read through the theme, which resolves them for
 /// the current blend mode.
-pub fn tokens(dark: bool) -> &'static Theme {
+pub(crate) fn tokens(dark: bool) -> &'static Theme {
     static DARK: OnceLock<Theme> = OnceLock::new();
     static LIGHT: OnceLock<Theme> = OnceLock::new();
     let cell = if dark { &DARK } else { &LIGHT };
@@ -19,7 +19,7 @@ pub fn tokens(dark: bool) -> &'static Theme {
 
 /// The kit for one appearance, built from [`tokens`]. Cached per appearance and blend mode, as
 /// the kit resolves translucent tokens for the window's blend mode.
-pub fn kit(dark: bool) -> &'static Kit {
+pub(crate) fn kit(dark: bool) -> &'static Kit {
     static KITS: [[OnceLock<Kit>; 2]; 2] = [[OnceLock::new(), OnceLock::new()], [OnceLock::new(), OnceLock::new()]];
     KITS[usize::from(dark)][usize::from(rune::theme::blends_srgb())].get_or_init(|| build_kit(tokens(dark)))
 }

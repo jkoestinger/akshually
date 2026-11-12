@@ -186,7 +186,10 @@ fn after_publish_the_session_has_its_verdict_and_can_be_closed() {
     assert_eq!(url, format!("{URL}#pullrequestreview-1"));
     assert_eq!(session.ended, Some(Outcome::Published { verdict: Verdict::Approve, url }));
     assert!(session.threads.iter().flat_map(|t| &t.comments).all(|c| !c.is_draft()), "nothing left to publish");
-    assert!(matches!(svc.publish(&id, Verdict::Approve, ""), Err(Error::Ended)));
+    assert!(
+        matches!(svc.publish(&id, Verdict::Approve, ""), Err(Error::Ended)),
+        "an ended Session was Published again"
+    );
 
     svc.close(&id).unwrap();
 

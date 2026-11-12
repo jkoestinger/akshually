@@ -50,7 +50,7 @@ impl PendingReview {
         let waiter = self.call.waiter;
         self.call.with_session(|session| {
             if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                let (_, outcome) = session.in_flight.take().expect("checked");
+                let (_, outcome) = session.in_flight.take().expect("`in_flight` holds this call's outcome");
                 session.delivered(&outcome);
             }
         });
@@ -119,7 +119,7 @@ impl Drop for PendingReview {
             // Received but not acknowledged: the agent may never have seen it. It goes to the
             // call waiting now, if any, or the next one.
             if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                let (_, outcome) = session.in_flight.take().expect("checked");
+                let (_, outcome) = session.in_flight.take().expect("`in_flight` holds this call's outcome");
                 session.queued.insert(0, outcome);
                 session.deliver();
             }

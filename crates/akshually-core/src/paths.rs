@@ -1,3 +1,5 @@
+//! Where akshually keeps its state, socket and log on disk.
+
 use std::path::PathBuf;
 
 /// Where akshually keeps its files.

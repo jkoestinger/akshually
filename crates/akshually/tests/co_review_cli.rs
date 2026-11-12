@@ -44,7 +44,10 @@ fn draft_adds_agent_drafts_with_each_anchor_kind_and_prints_their_threads() {
     let first = &session.threads[0].comments[0];
     assert_eq!((first.author.clone(), first.body.as_str()), (Party::Agent, "Name it."));
     assert_eq!(first.suggestion.as_deref(), Some("    okta();\n"));
-    assert!(session.threads.iter().all(|t| t.comments[0].is_agent_draft()));
+    assert!(
+        session.threads.iter().all(|t| t.comments[0].is_agent_draft()),
+        "a Thread doesn't open with an agent Draft"
+    );
 }
 
 #[test]
@@ -128,8 +131,9 @@ fn a_second_review_pr_while_one_waits_fails_as_busy() {
     let second = run(&app, &["review", "--pr", PR_URL]);
 
     assert_eq!(second.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&second.stderr).contains("already waiting"));
-    assert!(still_running(&mut first));
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("already waiting"), "stderr: {stderr}");
+    assert!(still_running(&mut first), "the first review --pr stopped waiting");
     first.kill().unwrap();
 }
 
@@ -188,11 +192,12 @@ fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_
     app.service.hand_over_round(&session.id).unwrap();
     let round = finish(child);
     assert_eq!(round.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&round.stderr));
-    assert!(String::from_utf8_lossy(&round.stdout).ends_with("Name it what?\n"));
+    let round_stdout = String::from_utf8_lossy(&round.stdout);
+    assert!(round_stdout.ends_with("Name it what?\n"), "{round_stdout}");
 
     stdout(&app.akshually(repo.path(), &["reply", "T1", "`second`."]).output().unwrap());
     let mut child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
-    assert!(still_running(&mut child));
+    assert!(still_running(&mut child), "the second review returned before the human acted");
     app.service.close(&session.id).unwrap();
     let out = finish(child);
 

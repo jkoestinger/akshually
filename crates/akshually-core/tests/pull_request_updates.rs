@@ -105,6 +105,7 @@ impl ForgeAdapter for FakeForge {
         let now = self.current();
         Ok((now.head_sha != pr.head_sha).then_some(PullRequestUpdate { pull_request: now, commits }))
     }
+
     fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
         Ok(Verdict::ALL.to_vec())
     }

@@ -155,6 +155,7 @@ pub struct Comment {
 }
 
 impl Comment {
+    /// A Draft: not yet carried by a Round, and not a Comment that was on the Forge already.
     pub fn is_draft(&self) -> bool {
         self.round.is_none() && !matches!(self.author, Party::Other(_))
     }

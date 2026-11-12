@@ -23,7 +23,7 @@ fn agents_in_two_worktrees_get_two_sessions_in_one_app_and_each_waits_for_its_ow
     assert_ne!(a.id, b.id);
     assert_eq!((a.branch(), b.branch()), ("agent-one", "agent-two"));
     assert_eq!(app.service.displayed(), Some(a.id.clone()), "the second Session doesn't take the view");
-    assert!(app.service.session(&b.id).unwrap().attention);
+    assert!(app.service.session(&b.id).unwrap().attention, "the second Session doesn't ask for attention");
 
     app.service.approve(&a.id).unwrap();
     assert_eq!(finish(first).status.code(), Some(0));

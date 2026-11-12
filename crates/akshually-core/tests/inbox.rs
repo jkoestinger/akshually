@@ -111,7 +111,7 @@ fn the_inbox_lists_pull_requests_from_every_host_most_recently_updated_first() {
     assert_eq!(rows, vec![("github.com".into(), 2), ("github.example.com".into(), 9), ("github.com".into(), 1)]);
     let inbox = svc.inbox();
     assert!(inbox.refreshed_at.is_some());
-    assert!(inbox.errors.is_empty());
+    assert!(inbox.errors.is_empty(), "{:?}", inbox.errors);
 }
 
 #[test]

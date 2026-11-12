@@ -3,14 +3,10 @@
 //! The view model is rebuilt from the service's plain-data Sessions; every human action goes
 //! straight back to the service. No review logic lives here.
 
+#![warn(clippy::unwrap_used)] // Tests may unwrap; production code may not (CODING_STANDARDS.md).
+
 use std::sync::Arc;
 
-use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
-use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
-    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, ThreadRef,
-    Turn, Verdict, fence_for,
-};
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
@@ -18,10 +14,19 @@ use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, TextArea, TextInput,
 };
 
+use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
+use akshually_core::{
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
+    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, ThreadRef,
+    Turn, Verdict, fence_for,
+};
+
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
 /// The Inbox tab's id in the tab strip (Session ids are `s1`, `s2`, …).
 const INBOX_TAB: &str = "inbox";
+/// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
+const SHORT_HASH: usize = 8;
 
 mod notifier;
 mod theme;
@@ -139,6 +144,7 @@ struct Composer {
     error: Option<String>,
 }
 
+/// One Session's tab: the service's view of it, and the diff and folds that are the UI's own.
 struct SessionTab {
     session: SessionView,
     diff: DiffState,
@@ -397,6 +403,8 @@ impl State {
         );
     }
 
+    /// Closes the Publish dialog, except while Publishing, whose result the dialog shows. Asking
+    /// the Forge which Verdicts it takes can be cancelled.
     fn close_publish(&mut self) {
         if self.publish.as_ref().is_some_and(|p| !p.busy || p.plan.is_none()) {
             self.publish = None;
@@ -570,9 +578,9 @@ impl State {
         report(action(&self.service, id));
     }
 
-    /// Reloads a Pull Request Session from its Forge off the UI thread (the Forge may be slow);
-    /// the service's update then refreshes the view.
-    fn reload_pull_request(&self, id: &SessionId) {
+    /// Reloads a Session off the UI thread, as a Pull Request reloads from its Forge and local
+    /// work through `git`, either of which may be slow; the service's update then refreshes the view.
+    fn reload(&self, id: &SessionId) {
         let (service, id) = (self.service.clone(), id.clone());
         let reload = move || report(service.reload(&id));
         match self.handle {
@@ -603,6 +611,7 @@ fn first_line(thread: &Thread) -> &str {
     thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""))
 }
 
+/// The window: the tab strip, then the open Session or the Inbox, and any dialog above them.
 fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Rune keeps `system_dark` current with the OS setting and redraws when it changes.
     let k = theme::kit(cx.system_dark());
@@ -803,7 +812,7 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
 /// A Pull Request Session's header. Its Drafts stay in the Session until Publish.
 fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
     let session = &tab.session;
-    let base = &session.changeset.base[..session.changeset.base.len().min(8)];
+    let base = &session.changeset.base[..session.changeset.base.len().min(SHORT_HASH)];
     let (close_id, publish_id) = (session.id.clone(), session.id.clone());
     let published = session.ended.is_some();
     row()
@@ -921,7 +930,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
     let label = match publish.verdict {
         _ if publish.busy && publish.plan.is_some() => "Publishing…".to_owned(),
         Some(v) if sent > 0 => {
-            format!("Publish {sent} comment{} · {}", if sent == 1 { "" } else { "s" }, verdict_label(v))
+            format!("Publish {sent} Comment{} · {}", if sent == 1 { "" } else { "s" }, verdict_label(v))
         }
         Some(v) => format!("Publish · {}", verdict_label(v)),
         None => "Publish".to_owned(),
@@ -1021,6 +1030,8 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
     }
 }
 
+/// A Session's header: its branch and base, Round and Turn, the Changeset views it offers, and
+/// the actions that end it or hand the Turn over. A Pull Request Session has its own header.
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
@@ -1028,7 +1039,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
     }
     let shown = session.shown();
     let base = if shown == &session.changeset {
-        format!("→ {}", &shown.base[..shown.base.len().min(8)])
+        format!("→ {}", &shown.base[..shown.base.len().min(SHORT_HASH)])
     } else if session.view == ChangesetView::SinceLastRound {
         "since last Round".to_owned()
     } else {
@@ -1226,7 +1237,7 @@ fn disk_banner(k: &Kit, tab: &SessionTab) -> El {
             .child(
                 Button::new("Reload")
                     .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.act(&id, Service::reload))
+                    .on_press(move |s: &mut State| s.reload(&id))
                     .build(k),
             ),
     )
@@ -1264,24 +1275,28 @@ fn push_banner(k: &Kit, tab: &SessionTab) -> El {
             .child(
                 Button::new("Reload")
                     .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.reload_pull_request(&id))
+                    .on_press(move |s: &mut State| s.reload(&id))
                     .build(k),
             ),
     )
 }
 
+/// The Session's diff, with each file's Comment and Viewed controls and its Threads under their
+/// lines. The diff view finds its state by Session id, as it outlives this call.
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
     let id_header = id.clone();
     let kc = k.clone();
     DiffView::new(
-        move |s: &State| &s.tabs.iter().find(|t| t.session.id == id).expect("the active tab").diff,
-        move |s: &mut State| &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the active tab").diff,
+        move |s: &State| &s.tabs.iter().find(|t| t.session.id == id).expect("the diff view's Session has a tab").diff,
+        move |s: &mut State| {
+            &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the diff view's Session has a tab").diff
+        },
     )
     .key(format!("diff-{}", tab.session.id))
     .header_actions(move |s: &State, file: usize| {
-        let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the active tab");
+        let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the diff view's Session has a tab");
         let Some(change) = tab.session.shown().files.get(file) else { return row() };
         let note = file_note(change).unwrap_or_default();
         let viewed = tab.session.viewed.contains(&change.path);
@@ -1323,7 +1338,7 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     }
     let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
     for thread in threads {
-        list = list.child(thread_view(k, s, thread, tab.session.id.clone(), agent));
+        list = list.child(thread_view(k, s, thread, &tab.session.id, agent));
     }
     if composing {
         list = list.child(composer(k, s));
@@ -1331,20 +1346,21 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list)
 }
 
+/// What shows under a line of the active Session's diff: the composer, or the Thread `a` names.
 fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
     if a.id == COMPOSER {
         return composer(k, s);
     }
     let tab = s.active_tab();
     match tab.and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id).map(|th| (t, th))) {
-        Some((tab, thread)) => thread_view(k, s, thread, tab.session.id.clone(), agent),
+        Some((tab, thread)) => thread_view(k, s, thread, &tab.session.id, agent),
         None => col(),
     }
 }
 
 /// A Thread of `session`: its card, or one line while it's Resolved. A co-Reviewer's Draft the
 /// human hasn't kept shows in the `agent` colour.
-fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
+fn thread_view(k: &Kit, s: &State, thread: &Thread, session: &SessionId, agent: Color) -> El {
     if thread.resolved.is_some() {
         resolved_row(k, thread, session)
     } else if thread.comments.first().is_some_and(Comment::is_agent_draft) {
@@ -1357,7 +1373,7 @@ fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: C
 /// A co-Reviewer's Draft, dashed in the `agent` colour until the human keeps it, with Discard,
 /// Question, Edit and Keep, and below it the questions about it and their answers. Nothing
 /// reaches the Forge until it is kept.
-fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
+fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: &SessionId, agent: Color) -> El {
     let draft = &thread.comments[0];
     let mut card = card(k).border(1.0, agent).border_dash(4.0, 3.0).key(format!("agent-draft-{}", thread.id));
     card = card.child(
@@ -1370,7 +1386,7 @@ fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, age
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    let at = ThreadRef::new(&session, &thread.id);
+    let at = ThreadRef::new(session, &thread.id);
     if s.editing.as_ref() == Some(&at) {
         return card.child(edit_composer(k, s));
     }
@@ -1456,8 +1472,8 @@ fn draft_markdown(body: &str, suggestion: Option<&str>) -> String {
 
 /// Reopen for a Resolved Thread, Resolve for one that has reached the agent; nothing for a
 /// Thread still all Drafts.
-fn resolve_button(k: &Kit, thread: &Thread, session: SessionId) -> Option<El> {
-    let at = ThreadRef::new(&session, &thread.id);
+fn resolve_button(k: &Kit, thread: &Thread, session: &SessionId) -> Option<El> {
+    let at = ThreadRef::new(session, &thread.id);
     if thread.resolved.is_some() {
         let reopen = move |s: &mut State| s.act_on_thread(&at, Service::reopen_thread);
         Some(Button::new("Reopen").variant(ButtonVariant::Ghost).on_press(reopen).build(k))
@@ -1480,7 +1496,7 @@ fn resolved_by(thread: &Thread) -> String {
 }
 
 /// A Resolved Thread, collapsed to one line with a way to reopen it.
-fn resolved_row(k: &Kit, thread: &Thread, session: SessionId) -> El {
+fn resolved_row(k: &Kit, thread: &Thread, session: &SessionId) -> El {
     let first = first_line(thread);
     let count = thread.comments.len();
     row()
@@ -1511,7 +1527,7 @@ fn card(k: &Kit) -> El {
 }
 
 /// A Thread's Comments, with its Reply and Resolve controls when `actions` gives the Session.
-fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -> El {
+fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId)>) -> El {
     let mut card = card(k);
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
@@ -1523,7 +1539,7 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
     // A Thread still all Drafts goes out whole with the next Round: nothing to reply to yet.
     let sent = thread.comments.iter().any(|c| !c.is_draft());
     if let Some((s, session)) = actions.filter(|_| sent) {
-        let at = ThreadRef::new(&session, &thread.id);
+        let at = ThreadRef::new(session, &thread.id);
         card = if s.reply.as_ref() == Some(&at) {
             card.child(reply_composer(k, s))
         } else {
@@ -1659,7 +1675,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
                     .color(k.c.text_muted),
             )
             .child(row().grow(1.0))
-            .children(resolve_button(k, thread, tab.session.id.clone()))
+            .children(resolve_button(k, thread, &tab.session.id))
             .child(
                 Button::new(if expanded { "Hide" } else { "Show" })
                     .variant(ButtonVariant::Ghost)
@@ -1685,6 +1701,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
     list
 }
 
+/// The composer of a new Thread, with the Forge's refusal when its lines can't take a Comment.
 fn composer(k: &Kit, s: &State) -> El {
     let error = s.composer.as_ref().and_then(|c| c.error.clone());
     // Lines the Forge refuses can still go on their file.
@@ -1800,7 +1817,6 @@ fn scene_session(s: &mut State) {
 /// reply, a human reply Draft and a Thread the agent resolved, under the banner offering files
 /// changed on disk.
 fn scene_threads(s: &mut State) {
-    use akshually_core::Comment;
     let comment = |body: &str, suggestion: Option<&str>| Comment {
         author: Party::Human,
         body: body.into(),
@@ -1922,8 +1938,7 @@ fn scene_inbox(s: &mut State) {
 
 /// `--scene publish`: a Pull Request Session with its Publish dialog open.
 fn scene_publish(s: &mut State) {
-    use akshually_core::forge::{PullRequest, PullRequestRef};
-    let pr = PullRequest {
+    let pr = akshually_core::forge::PullRequest {
         id: PullRequestRef { host: "github.com".into(), repo: "acme/web".into(), number: 482 },
         url: "https://github.com/acme/web/pull/482".into(),
         title: "Add SSO login".into(),
@@ -1988,7 +2003,6 @@ fn scene_co_review(s: &mut State) {
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
-    use akshually_core::Comment;
     Thread {
         id: ThreadId::new(id),
         anchor: Anchor::lines(Side::New, "src/session.rs", lines),

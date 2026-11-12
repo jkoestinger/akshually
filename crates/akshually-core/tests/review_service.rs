@@ -356,7 +356,7 @@ fn taking_the_turn_back_lets_the_human_go_on_while_the_agent_is_quiet() {
     let svc = Service::new();
     let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
     let id = first.session().clone();
-    assert!(matches!(svc.take_turn_back(&id), Err(Error::AlreadyYourTurn)));
+    assert!(matches!(svc.take_turn_back(&id), Err(Error::AlreadyYourTurn)), "a new Session is the human's Turn");
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
     svc.hand_over_round(&id).unwrap();
     round(first.wait_timeout(Duration::from_secs(1)));
@@ -1401,7 +1401,10 @@ fn a_new_service_on_the_same_state_dir_restores_every_open_session() {
     svc.mark_viewed(&id, "lib.rs", true).unwrap();
     let _waiting = svc.review(ReviewRequest::new(other.path())).unwrap();
     let mut before = svc.sessions();
-    assert!(before[0].last_round.is_some() && !before[0].viewed.is_empty() && before[1].attention);
+    assert!(
+        before[0].last_round.is_some() && !before[0].viewed.is_empty() && before[1].attention,
+        "the Sessions to restore lack a Round, a tick or attention: {before:?}"
+    );
     drop(svc);
 
     let restored = Service::open(dirs.state()).unwrap();
@@ -1639,12 +1642,15 @@ fn the_human_can_close_a_session_abandoned_while_no_review_waited() {
 }
 
 #[test]
-fn local_work_without_a_verdict_is_still_ended_by_approving_or_abandoning() {
+fn closing_local_work_without_a_verdict_is_refused() {
     let repo = agent_branch();
     let svc = Service::new();
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    assert!(matches!(svc.close(pending.session()), Err(Error::InvalidRequest(_))));
+    assert!(
+        matches!(svc.close(pending.session()), Err(Error::InvalidRequest(_))),
+        "closing local work without a Verdict wasn't refused"
+    );
 }
 
 #[test]
@@ -1690,8 +1696,8 @@ fn approving_during_the_agents_turn_is_refused_but_abandoning_is_not() {
     svc.hand_over_round(&id).unwrap();
     round(first.wait_timeout(Duration::from_secs(1)));
 
-    assert!(matches!(svc.approve(&id), Err(Error::NotYourTurn)));
-    assert!(svc.session(&id).is_some());
+    assert!(matches!(svc.approve(&id), Err(Error::NotYourTurn)), "approving in the agent's Turn wasn't refused");
+    assert!(svc.session(&id).is_some(), "the refused approval ended the Session");
 
     svc.abandon(&id).unwrap();
 }
