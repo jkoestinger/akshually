@@ -121,6 +121,7 @@ fn review_format_json_prints_the_round_as_json() {
                 "excerpt": "fn b() {}\nfn c() {}\n",
                 "comments": [{"author": "human", "body": "Why two?", "round": 1}],
                 "resolved": "human",
+                "outdated": false,
             }],
         })
     );

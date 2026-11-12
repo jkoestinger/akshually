@@ -32,7 +32,11 @@ fn round_markdown(round: &Round) -> String {
 }
 
 fn thread_markdown(out: &mut String, thread: &Thread) {
-    let _ = writeln!(out, "\n## {} · {}", thread.id, anchor_markdown(&thread.anchor));
+    let outdated = if thread.outdated { " · Outdated" } else { "" };
+    let _ = writeln!(out, "\n## {} · {}{outdated}", thread.id, anchor_markdown(&thread.anchor));
+    if thread.outdated {
+        out.push_str("\nThis code is no longer in the Changeset; the Thread was written against it:\n");
+    }
     if let Anchor::Lines { .. } = thread.anchor {
         out.push('\n');
         code_block(out, &thread.excerpt);

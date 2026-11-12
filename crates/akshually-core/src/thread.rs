@@ -100,12 +100,16 @@ impl fmt::Display for ThreadId {
 pub struct Thread {
     pub id: ThreadId,
     pub anchor: Anchor,
-    /// The anchored code when the Thread was opened.
+    /// The anchored code when the Thread was opened. Re-anchoring looks for it, and an
+    /// Outdated Thread shows it.
     pub excerpt: String,
     pub comments: Vec<Comment>,
     /// Who marked it Resolved, while it is; either party can, and the human can reopen it.
     #[serde(default)]
     pub resolved: Option<Party>,
+    /// Its Anchor no longer exists in the current Changeset; `anchor` is where it last was.
+    #[serde(default)]
+    pub outdated: bool,
 }
 
 /// Who wrote a Comment.

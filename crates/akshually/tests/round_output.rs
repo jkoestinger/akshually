@@ -3,8 +3,8 @@
 mod support;
 
 use akshually_core::{Anchor, NewComment, Side};
-use akshually_testkit::TestRepo;
-use support::{HostedApp, finish};
+use akshually_testkit::{TestRepo, wait_until};
+use support::{HostedApp, TIMEOUT, finish};
 
 const EXIT_ROUND: i32 = 4;
 
@@ -89,4 +89,42 @@ fn a_review_thread_is_headed_as_the_whole_review() {
     assert_eq!(out.status.code(), Some(EXIT_ROUND));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.ends_with("\n## T1 · whole Review\n\nAdd a changelog entry.\n"), "{stdout}");
+}
+
+#[test]
+fn an_outdated_thread_is_marked_and_shows_the_code_it_was_written_against() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
+    // The agent stops waiting and rewrites the code before the human hands the Round over.
+    first.kill().unwrap();
+    finish(first);
+    repo.write("lib.rs", "fn a() {}\nfn everything_else() {}\n");
+    let second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    wait_until(TIMEOUT, "the Thread to go Outdated", || {
+        app.service.session(&session.id).filter(|s| s.threads[0].outdated)
+    });
+
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(second);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.ends_with(
+            "## T1 · lib.rs, new lines 2-3 · Outdated\n\
+             \n\
+             This code is no longer in the Changeset; the Thread was written against it:\n\
+             \n\
+             ```\n\
+             fn b() {}\n\
+             fn c() {}\n\
+             ```\n\
+             \n\
+             Why two?\n"
+        ),
+        "{stdout}"
+    );
 }
