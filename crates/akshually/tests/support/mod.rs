@@ -74,13 +74,15 @@ impl HostedApp {
 
     /// Waits until a Session for the repository at `repo` is open.
     pub fn wait_for_session(&self, repo: &Path) -> SessionView {
-        wait_until(TIMEOUT, "the Session to open", || self.service.sessions().into_iter().find(|s| s.repo == repo))
+        wait_until(TIMEOUT, "the Session to open", || {
+            self.service.sessions().into_iter().find(|s| s.repo() == Some(repo))
+        })
     }
 
     /// Waits until the co-Reviewer's `review` call waits on the Pull Request's Session.
     pub fn wait_for_co_reviewer(&self) -> SessionView {
         wait_until(TIMEOUT, "the co-Reviewer to wait", || {
-            self.service.sessions().into_iter().find(|s| s.pull_request.is_some() && s.agent_waiting)
+            self.service.sessions().into_iter().find(|s| s.pull_request().is_some() && s.agent_waiting)
         })
     }
 }

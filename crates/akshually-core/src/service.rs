@@ -3,23 +3,30 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, PullRequestUpdate};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
+mod co_review;
+mod disk;
+mod drafts;
+mod handoff;
 mod inbox;
 mod pull_request;
+mod threads;
 
+pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
+
+use handoff::{Call, Waiter};
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +46,19 @@ impl SessionId {
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Names one Thread across Sessions: the Session it's in, and its id there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadRef {
+    pub session: SessionId,
+    pub thread: ThreadId,
+}
+
+impl ThreadRef {
+    pub fn new(session: &SessionId, thread: &ThreadId) -> Self {
+        ThreadRef { session: session.clone(), thread: thread.clone() }
     }
 }
 
@@ -167,29 +187,80 @@ impl ReviewRequest {
     }
 }
 
-/// Where an agent call finds its Session: the local work in the repository (and branch) at a
-/// directory, or a Pull Request by URL. A path converts into the first, a URL into the second.
+/// Where an agent call finds its Session's [`Source`]: the local work in the repository (and
+/// branch) at a directory, or a Pull Request by URL. A path converts into the first, a URL into
+/// the second.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Source {
+pub enum SourceRef {
     Local(PathBuf),
     PullRequest(String),
 }
 
-impl From<&Path> for Source {
+impl From<&Path> for SourceRef {
     fn from(cwd: &Path) -> Self {
-        Source::Local(cwd.to_owned())
+        SourceRef::Local(cwd.to_owned())
     }
 }
 
-impl From<&PathBuf> for Source {
+impl From<&PathBuf> for SourceRef {
     fn from(cwd: &PathBuf) -> Self {
-        Source::Local(cwd.clone())
+        SourceRef::Local(cwd.clone())
     }
 }
 
-impl From<&str> for Source {
+impl From<&str> for SourceRef {
     fn from(url: &str) -> Self {
-        Source::PullRequest(url.to_owned())
+        SourceRef::PullRequest(url.to_owned())
+    }
+}
+
+/// Where a Session's Changeset comes from, which is the Session's identity: the local work on
+/// a branch of a working tree (each worktree is its own), or a Pull Request on a Forge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    Local { repo: PathBuf, branch: String },
+    PullRequest(PullRequest),
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source::Local { repo: PathBuf::new(), branch: String::new() }
+    }
+}
+
+/// A `SessionView`'s Source as saved: `"source": {...}`. Sessions saved before it had one gave
+/// `repo`, `branch` and `pull_request` (with an empty `repo`) instead, which still load.
+mod saved_source {
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Source;
+    use crate::forge::PullRequest;
+
+    pub fn serialize<S: Serializer>(source: &Source, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Saved<'a> {
+            source: &'a Source,
+        }
+        Saved { source }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Source, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Saved {
+            source: Option<Source>,
+            repo: PathBuf,
+            branch: String,
+            pull_request: Option<PullRequest>,
+        }
+        Ok(match Saved::deserialize(deserializer)? {
+            Saved { source: Some(source), .. } => source,
+            Saved { pull_request: Some(pr), .. } => Source::PullRequest(pr),
+            Saved { repo, branch, .. } => Source::Local { repo, branch },
+        })
     }
 }
 
@@ -199,12 +270,9 @@ impl From<&str> for Source {
 #[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
-    /// The working tree root: each worktree is its own Session. Empty for a Pull Request.
-    pub repo: PathBuf,
-    /// The branch under Review; a Pull Request's head branch.
-    pub branch: String,
-    /// The Pull Request under Review, which is the Session's identity; `None` for local work.
-    pub pull_request: Option<PullRequest>,
+    /// Where the Changeset comes from, which is the Session's identity.
+    #[serde(flatten, with = "saved_source")]
+    pub source: Source,
     /// The Session's agent, in its one role; `None` while only the human is in it.
     pub agent: Option<Role>,
     /// The full Changeset.
@@ -244,18 +312,39 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// The Pull Request under Review; `None` for local work.
+    pub fn pull_request(&self) -> Option<&PullRequest> {
+        match &self.source {
+            Source::PullRequest(pr) => Some(pr),
+            Source::Local { .. } => None,
+        }
+    }
+
+    /// The working tree root of the local work under Review; `None` for a Pull Request.
+    pub fn repo(&self) -> Option<&Path> {
+        match &self.source {
+            Source::Local { repo, .. } => Some(repo),
+            Source::PullRequest(_) => None,
+        }
+    }
+
+    /// The branch under Review: for a Pull Request, its head branch.
+    pub fn branch(&self) -> &str {
+        match &self.source {
+            Source::Local { branch, .. } => branch,
+            Source::PullRequest(pr) => &pr.head_branch,
+        }
+    }
+
+    /// Whether this is the Session of the local work in `repo` on `branch`.
+    pub(crate) fn is_local(&self, repo: &Path, branch: &str) -> bool {
+        matches!(&self.source, Source::Local { repo: r, branch: b } if r == repo && b == branch)
+    }
+
     /// Whether the agent is a co-Reviewer (a Pull Request takes no other): Rounds then carry
     /// only the human's questions on its Drafts, with the roles reversed.
     pub fn is_co_review(&self) -> bool {
-        self.pull_request.is_some() || self.agent == Some(Role::CoReviewer)
-    }
-
-    /// How many Comments and reopened Threads the next Round would carry.
-    pub fn to_hand_over(&self) -> usize {
-        let co_review = self.is_co_review();
-        let comments: usize =
-            self.threads.iter().map(|t| (0..t.comments.len()).filter(|&at| goes_out(co_review, t, at)).count()).sum();
-        comments + self.threads.iter().filter(|t| t.reopened && !co_review).count()
+        self.pull_request().is_some() || self.agent == Some(Role::CoReviewer)
     }
 
     /// The Changeset the human is looking at.
@@ -276,6 +365,73 @@ impl SessionView {
             _ => self.shown(),
         }
     }
+
+    /// Since the last Round, the old side is that Round's code, not a base: no Thread is on it.
+    fn old_side_shown(&self) -> bool {
+        self.view != ChangesetView::SinceLastRound
+    }
+
+    /// Where each current line Thread sits in the shown Changeset: under its last line. Outdated
+    /// Threads, and Threads on lines not shown, have no place.
+    pub fn placed_threads(&self) -> Vec<PlacedThread> {
+        let shown = self.shown();
+        let placed = self.threads.iter().filter(|t| !t.outdated).filter_map(|t| {
+            let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
+            if *side == Side::Old && !self.old_side_shown() {
+                return None;
+            }
+            let file = shown.files.iter().position(|f| &f.path == path)?;
+            Some(PlacedThread { file, side: *side, line: *end, thread: t.id.clone() })
+        });
+        placed.collect()
+    }
+
+    /// The Anchor for the lines selected from `start` to `end` (each a side and a 1-based line)
+    /// in the shown Changeset's file at `file`. A selection running across sides anchors to its
+    /// last line alone. `None` where no Thread can go.
+    pub fn anchor_for_selection(&self, file: usize, start: (Side, u32), end: (Side, u32)) -> Option<Anchor> {
+        let path = self.shown().files.get(file)?.path.clone();
+        let side = end.0;
+        if side == Side::Old && !self.old_side_shown() {
+            return None;
+        }
+        let (first, last) = if start.0 == side { (start.1.min(end.1), start.1.max(end.1)) } else { (end.1, end.1) };
+        Some(Anchor::lines(side, path, first..=last))
+    }
+
+    /// The Round the agent is working on during its Turn: the last one handed over. `None` in
+    /// the human's Turn, and while a co-Reviewer that opened the Session is still drafting,
+    /// before any Round.
+    pub fn answering_round(&self) -> Option<u32> {
+        (self.turn == Turn::Agent && self.round > 1).then(|| self.round - 1)
+    }
+
+    /// How many Drafts the Session holds: the human's, and the co-Reviewer's not kept yet.
+    pub fn drafts(&self) -> usize {
+        self.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
+    }
+
+    /// The Session's name, as its tab shows it: `repo · branch` for local work, `acme/web #482`
+    /// for a Pull Request.
+    pub fn title(&self) -> String {
+        match &self.source {
+            Source::Local { repo, branch } => {
+                let name = repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into());
+                format!("{name} · {branch}")
+            }
+            Source::PullRequest(pr) => pr.reference(),
+        }
+    }
+}
+
+/// A line Thread's place in the shown Changeset: `file` is its index there, and the Thread
+/// sits under `line` on `side`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedThread {
+    pub file: usize,
+    pub side: Side,
+    pub line: u32,
+    pub thread: ThreadId,
 }
 
 /// Which of a Session's Changesets the human is looking at.
@@ -291,135 +447,7 @@ pub enum ChangesetView {
     Full,
 }
 
-/// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
-/// the next `review` call.
-pub struct PendingReview {
-    call: Call,
-    outcome: Receiver<Outcome>,
-}
-
-impl PendingReview {
-    pub fn session(&self) -> &SessionId {
-        &self.call.session
-    }
-
-    /// Blocks until the human acts, and acknowledges what it receives. `None` if the Session
-    /// stopped waiting for this call without an outcome.
-    pub fn wait(self) -> Option<Outcome> {
-        let outcome = self.receive();
-        if outcome.is_some() {
-            self.ack();
-        }
-        outcome
-    }
-
-    /// `wait`, giving up after `timeout`.
-    pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome> {
-        let outcome = self.outcome.recv_timeout(timeout).ok();
-        if outcome.is_some() {
-            self.ack();
-        }
-        outcome
-    }
-
-    /// Blocks until the human acts, without acknowledging what it receives. For a call made
-    /// `with_ack`, dropping it before `ack` gives the Round or Verdict to the next call.
-    pub fn receive(&self) -> Option<Outcome> {
-        self.outcome.recv().ok()
-    }
-
-    /// Confirms the agent got what this call received, which is then delivered for good: a
-    /// Verdict ends the Session.
-    pub fn ack(&self) {
-        let waiter = self.call.waiter;
-        self.call.with_session(|session| {
-            if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                let (_, outcome) = session.in_flight.take().expect("checked");
-                session.delivered(&outcome);
-            }
-        });
-    }
-
-    /// A handle that stops this call waiting from another thread, e.g. when the CLI process
-    /// behind it went away.
-    pub fn canceller(&self) -> CancelReview {
-        CancelReview(self.call.clone())
-    }
-}
-
-/// Stops a `review` call waiting: its `receive` returns `None`, and the Session takes the next
-/// `review` call.
-pub struct CancelReview(Call);
-
-impl CancelReview {
-    pub fn cancel(&self) {
-        self.0.release();
-    }
-}
-
-/// One `review` call on one Session, as seen from outside the service lock.
-#[derive(Clone)]
-struct Call {
-    session: SessionId,
-    waiter: u64,
-    inner: Weak<Mutex<Inner>>,
-}
-
-impl Call {
-    /// Frees the Session's waiter slot if this call holds it.
-    fn release(&self) {
-        let waiter = self.waiter;
-        self.with_session(|session| {
-            if session.waiter.as_ref().is_some_and(|w| w.id == waiter) {
-                session.waiter = None;
-            }
-        });
-    }
-
-    fn with_session(&self, f: impl FnOnce(&mut Session)) {
-        let Some(inner) = self.inner.upgrade() else { return };
-        let mut inner = lock(&inner);
-        let Ok(at) = inner.position(&self.session) else { return };
-        let session = &mut inner.sessions[at];
-        let waiting = session.view.agent_waiting;
-        f(session);
-        session.view.agent_waiting = session.waiter.is_some();
-        let changed = session.view.agent_waiting != waiting || session.finished;
-        inner.reap();
-        if changed {
-            inner.notify();
-        } else {
-            // Nothing to show, but an ack or a requeue changes what's saved.
-            inner.save();
-        }
-    }
-}
-
-impl Drop for PendingReview {
-    fn drop(&mut self) {
-        self.call.release();
-        let waiter = self.call.waiter;
-        self.call.with_session(|session| {
-            // Received but not acknowledged: the agent may never have seen it. It goes to the
-            // call waiting now, if any, or the next one.
-            if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                let (_, outcome) = session.in_flight.take().expect("checked");
-                session.queued.insert(0, outcome);
-                session.deliver();
-            }
-        });
-    }
-}
-
 type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
-
-/// The agent's blocked `review` call.
-struct Waiter {
-    id: u64,
-    outcome: Sender<Outcome>,
-    /// The call acknowledges what it receives.
-    ack: bool,
-}
 
 /// A Session as the service keeps it, and as the store saves it: every field but the waiter
 /// survives a restart, and a field missing from an older saved Session takes its `Default`.
@@ -448,43 +476,13 @@ struct Session {
     /// A Publish is under way. A restart drops it: the call making it is gone.
     #[serde(skip)]
     publishing: bool,
+    /// What the last look for changes on disk saw, while the Changeset hasn't changed since:
+    /// the same again means nothing new to offer.
+    #[serde(skip)]
+    disk_checked: Option<disk::DiskCheck>,
 }
 
 impl Session {
-    /// Hands the oldest queued Round or Verdict to the waiting `review` call, if both exist.
-    fn deliver(&mut self) {
-        if self.queued.is_empty() {
-            return;
-        }
-        let Some(waiter) = self.waiter.take() else { return };
-        let outcome = self.queued.remove(0);
-        match waiter.outcome.send(outcome.clone()) {
-            Ok(()) => {
-                self.view.agent_waiting = false;
-                if matches!(outcome, Outcome::Round(_)) {
-                    self.view.turn = Turn::Agent;
-                }
-                if waiter.ack {
-                    self.in_flight = Some((waiter.id, outcome));
-                } else {
-                    self.delivered(&outcome);
-                }
-            }
-            // A waiter that went away without being dropped yet gives it back.
-            Err(mpsc::SendError(outcome)) => self.queued.insert(0, outcome),
-        }
-    }
-
-    /// The agent got `outcome` for good.
-    fn delivered(&mut self, outcome: &Outcome) {
-        match outcome {
-            Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
-            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } | Outcome::Closed => {
-                self.finished = true
-            }
-        }
-    }
-
     /// Opens a Thread at `anchor` whose first Comment is `author`'s Draft `comment` (already
     /// checked with `check_comment`).
     fn open_thread(&mut self, anchor: Anchor, comment: NewComment, author: Party) -> Result<ThreadId, Error> {
@@ -509,18 +507,6 @@ impl Session {
         Ok(thread)
     }
 
-    /// Ends the Session with `outcome`. With no agent, that's it; otherwise it replaces any
-    /// Round the agent hasn't received, and the Session ends once the agent receives it.
-    fn conclude(&mut self, outcome: Outcome) {
-        self.view.ended = Some(outcome.clone());
-        if self.view.agent.is_none() {
-            return;
-        }
-        self.queued.clear();
-        self.queued.push(outcome);
-        self.deliver();
-    }
-
     /// Lets an agent into the Session as `role`, unless it already has an agent in the other
     /// role.
     fn join(&mut self, role: Role) -> Result<(), Error> {
@@ -538,6 +524,7 @@ impl Session {
     /// Threads. With `default_view`, from Round 2 the view resets to the changes since the last
     /// Round, as on each re-attach.
     fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
+        self.disk_checked = None;
         let view = &mut self.view;
         let before = view.anchored_in().clone();
         for file in changeset.since(&view.changeset).files {
@@ -556,32 +543,6 @@ impl Session {
             reanchor(&mut threads, view.anchored_in());
             view.threads = threads;
         }
-    }
-}
-
-/// A Session's identity: the repository and branch of local work, or the Pull Request (with
-/// the URL it was asked by, for errors).
-enum SessionKey {
-    Local { repo: PathBuf, branch: String },
-    PullRequest(PullRequestRef, String),
-}
-
-impl SessionKey {
-    /// The position of its Session in `sessions`.
-    fn find(self, sessions: &[Session]) -> Result<usize, Error> {
-        let found = sessions.iter().position(|s| match &self {
-            SessionKey::Local { repo, branch } => {
-                s.view.pull_request.is_none() && &s.view.repo == repo && &s.view.branch == branch
-            }
-            SessionKey::PullRequest(pr, _) => s.view.pull_request.as_ref().is_some_and(|p| &p.id == pr),
-        });
-        if let Some(at) = found {
-            return Ok(at);
-        }
-        Err(match self {
-            SessionKey::Local { repo, branch } => Error::NoSessionHere { repo, branch },
-            SessionKey::PullRequest(_, url) => Error::NoPullRequestSession(url),
-        })
     }
 }
 
@@ -607,6 +568,8 @@ struct Inner {
     /// Whether the human is looking at akshually's window.
     window_focused: bool,
     notifier: Option<Box<dyn Notifier>>,
+    /// Brings the app's window up, with an XDG activation token when there is one.
+    show_window: Option<Box<dyn Fn(Option<String>) + Send>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
     inbox: inbox::InboxState,
@@ -625,26 +588,17 @@ impl Inner {
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
         }
+        // The window may have been closed (the app keeps running): bring it back.
+        if let Some(show) = &self.show_window {
+            show(None);
+        }
         if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
-            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            let repo = view.repo().map(|r| r.file_name().unwrap_or(r.as_os_str()).to_string_lossy());
             notifier.notify(Notification {
                 session: view.id.clone(),
                 title: "Your Turn to review".into(),
-                body: format!("{repo} ({})", view.branch),
+                body: format!("{} ({})", repo.unwrap_or_default(), view.branch()),
             });
-        }
-    }
-
-    /// The agent's `review` call `waiter` waits on the Session at `at`: it gets what is queued
-    /// for it at once, or else the Session becomes the human's Turn.
-    fn wait_on(&mut self, at: usize, waiter: Waiter) {
-        let session = &mut self.sessions[at];
-        session.waiter = Some(waiter);
-        session.view.agent_waiting = true;
-        if !session.queued.is_empty() {
-            session.deliver();
-        } else if session.view.turn != Turn::Human {
-            self.became_humans_turn(at);
         }
     }
 
@@ -655,7 +609,9 @@ impl Inner {
             if self.displayed.as_ref() == Some(&session.view.id) {
                 self.displayed = None;
             }
-            self.session_bases.remove(&(session.view.repo, session.view.branch));
+            if let Source::Local { repo, branch } = session.view.source {
+                self.session_bases.remove(&(repo, branch));
+            }
         }
     }
 
@@ -687,16 +643,16 @@ impl Inner {
         }
     }
 
-    /// Publishes a change: saves it, then tells subscribers.
+    /// Publishes a change: saves it, then tells subscribers, the Inbox's too.
     fn notify(&mut self) {
         self.save();
-        if self.subscribers.is_empty() {
-            return;
+        if !self.subscribers.is_empty() {
+            let views = self.views();
+            for subscriber in &self.subscribers {
+                subscriber(&views);
+            }
         }
-        let views = self.views();
-        for subscriber in &self.subscribers {
-            subscriber(&views);
-        }
+        self.tell_inbox_subscribers();
     }
 }
 
@@ -706,7 +662,6 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 
 #[derive(Default)]
 pub struct Service {
-    // One lock for Sessions and subscribers, so subscribers see changes in order.
     // One lock for Sessions and subscribers, so subscribers see changes in order. Shared with
     // each PendingReview, which frees its Session when dropped.
     inner: Arc<Mutex<Inner>>,
@@ -736,7 +691,7 @@ impl Service {
             }
             session.view.agent_waiting = false;
             // Saved before Sessions had roles: local work always has its Author.
-            if session.view.pull_request.is_none() && session.view.agent.is_none() {
+            if session.view.pull_request().is_none() && session.view.agent.is_none() {
                 session.view.agent = Some(Role::Author);
             }
         }
@@ -751,6 +706,22 @@ impl Service {
     pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
         self.lock().notifier = Some(Box::new(notifier));
         self
+    }
+
+    /// The UI: `f` brings its window up, given the XDG activation token of the launch that
+    /// asked, if any. The service asks whenever a Session becomes the human's Turn, and
+    /// `show_window` on behalf of a second launch. Like `subscribe`, `f` runs while the service
+    /// is locked: hand off, don't call back.
+    pub fn on_show_window(&self, f: impl Fn(Option<String>) + Send + 'static) {
+        self.lock().show_window = Some(Box::new(f));
+    }
+
+    /// Brings the window up, as launching the app again does; `token` is that launch's XDG
+    /// activation token.
+    pub fn show_window(&self, token: Option<String>) {
+        if let Some(show) = &self.lock().show_window {
+            show(token);
+        }
     }
 
     /// The UI: tells the service whether the human is looking at the window (unfocused until
@@ -862,7 +833,7 @@ impl Service {
         inner.next_waiter += 1;
         let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
         let waiter_id = waiter.id;
-        let existing = inner.sessions.iter().position(|s| s.view.repo == repo && s.view.branch == branch);
+        let existing = inner.sessions.iter().position(|s| s.view.is_local(&repo, &branch));
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
@@ -898,376 +869,6 @@ impl Service {
         })
     }
 
-    /// Agent, as co-Reviewer: opens a Thread in the Session of `source` with `comment`
-    /// (markdown, plus any suggestion) as an agent Draft, for the human to keep, edit, discard
-    /// or question. Opens the Session if needed, without taking the human's view; a Pull
-    /// Request's blocks on the Forge.
-    pub fn draft(
-        &self,
-        source: impl Into<Source>,
-        anchor: Anchor,
-        comment: impl Into<NewComment>,
-    ) -> Result<ThreadId, Error> {
-        let comment = comment.into();
-        check_comment(&anchor, &comment)?;
-        let id = match source.into() {
-            Source::PullRequest(url) => self.open_pull_request_session(&url, Some(Role::CoReviewer))?.0,
-            Source::Local(cwd) => self.open_local_co_review(&cwd)?,
-        };
-        let mut inner = self.lock();
-        let at = inner.position(&id)?;
-        let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        session.join(Role::CoReviewer)?;
-        let thread = session.open_thread(anchor, comment, Party::Agent)?;
-        inner.notify();
-        Ok(thread)
-    }
-
-    /// The Session of the local work at `cwd`, opened for a co-Reviewer if needed: it starts in
-    /// the agent's Turn, out of the human's way, until the agent's `review` call.
-    fn open_local_co_review(&self, cwd: &Path) -> Result<SessionId, Error> {
-        let repo = git::toplevel(cwd)?;
-        let branch = git::branch(&repo)?;
-        let here = |s: &&Session| s.view.pull_request.is_none() && s.view.repo == repo && s.view.branch == branch;
-        let (settings, session_base) = {
-            let inner = self.lock();
-            if let Some(open) = inner.sessions.iter().find(here) {
-                return Ok(open.view.id.clone());
-            }
-            (inner.settings.clone(), inner.session_bases.get(&(repo.clone(), branch.clone())).cloned())
-        };
-        let options = LocalOptions::default();
-        let local = changeset::local(&repo, &options, &settings, session_base.as_deref())?;
-
-        let mut inner = self.lock();
-        // Another call may have opened it meanwhile.
-        if let Some(open) = inner.sessions.iter().find(here) {
-            return Ok(open.view.id.clone());
-        }
-        inner.next_id += 1;
-        let id = SessionId::new(format!("s{}", inner.next_id));
-        let view = local_view(
-            id.clone(),
-            repo.clone(),
-            branch.clone(),
-            local.full,
-            local.since_session_base,
-            Role::CoReviewer,
-        );
-        inner.sessions.push(Session {
-            view: SessionView { turn: Turn::Agent, ..view },
-            local: options,
-            ..Session::default()
-        });
-        inner.notify();
-        Ok(id)
-    }
-
-    /// Human: refreshes the Session's Changeset from disk, or for a Pull Request from its Forge
-    /// (blocking on it). Threads and Drafts are re-anchored by content, or become Outdated.
-    pub fn reload(&self, id: &SessionId) -> Result<(), Error> {
-        let (repo, local, settings, session_base) = {
-            let inner = self.lock();
-            let session = &inner.sessions[inner.position(id)?];
-            if let Some(pr) = session.view.pull_request.clone() {
-                drop(inner);
-                return self.reload_pull_request(id, &pr);
-            }
-            let key = (session.view.repo.clone(), session.view.branch.clone());
-            (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
-        };
-        let now = changeset::local(&repo, &local, &settings, session_base.as_deref())?;
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        inner.sessions[at].refresh(now.full, now.since_session_base, false);
-        inner.notify();
-        Ok(())
-    }
-
-    /// Runs `check_disk` every `every` on a background thread, until the service is dropped.
-    pub fn watch_disk(self: &Arc<Self>, every: Duration) {
-        let service = Arc::downgrade(self);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(every);
-                let Some(service) = service.upgrade() else { return };
-                service.check_disk();
-            }
-        });
-    }
-
-    /// Looks for changes on disk in every local Session whose Turn is the human's, and offers
-    /// them as a reload (`SessionView::changed_on_disk`) without touching the Changeset. During
-    /// the agent's Turn there's nothing to offer: its next `review` refreshes the Changeset.
-    pub fn check_disk(&self) {
-        let (settings, checks) = {
-            let inner = self.lock();
-            let checks: Vec<_> = inner
-                .sessions
-                .iter()
-                // A Pull Request has no files on disk.
-                .filter(|s| s.view.turn == Turn::Human && s.view.pull_request.is_none())
-                .map(|s| {
-                    let key = (s.view.repo.clone(), s.view.branch.clone());
-                    (s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0)
-                })
-                .collect();
-            (inner.settings.clone(), checks)
-        };
-        for (id, local, session_base, repo) in checks {
-            // A repository that went away or broke has nothing to offer.
-            let Ok(now) = changeset::local(&repo, &local, &settings, session_base.as_deref()) else { continue };
-            let mut inner = self.lock();
-            let Ok(at) = inner.position(&id) else { continue };
-            let view = &mut inner.sessions[at].view;
-            if view.turn != Turn::Human {
-                continue;
-            }
-            let changed = changed_files(&view.changeset, &now.full);
-            if view.changed_on_disk != changed {
-                view.changed_on_disk = changed;
-                inner.notify();
-            }
-        }
-    }
-
-    /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
-    /// Draft, which goes out with the next Round.
-    pub fn comment(&self, id: &SessionId, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
-        let comment = comment.into();
-        check_comment(&anchor, &comment)?;
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let thread = inner.sessions[at].open_thread(anchor, comment, Party::Human)?;
-        inner.notify();
-        Ok(thread)
-    }
-
-    /// Human: hands every Draft over to the agent at once, as the Session's next Round, and
-    /// returns its number. The waiting `review` call receives it, or the next one if none waits.
-    pub fn hand_over_round(&self, id: &SessionId) -> Result<u32, Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        if session.view.turn != Turn::Human {
-            return Err(Error::NotYourTurn);
-        }
-        let number = session.view.round;
-        let co_review = session.view.is_co_review();
-        let mut threads = Vec::new();
-        for thread in &mut session.view.threads {
-            let goes_out: Vec<bool> = (0..thread.comments.len()).map(|at| goes_out(co_review, thread, at)).collect();
-            let drafts: Vec<Comment> = thread
-                .comments
-                .iter_mut()
-                .zip(goes_out)
-                .filter(|(_, goes)| *goes)
-                .map(|(c, _)| {
-                    c.round = Some(number);
-                    c.clone()
-                })
-                .collect();
-            let reopened = thread.reopened && !co_review;
-            if !drafts.is_empty() || reopened {
-                threads.push(Thread { comments: drafts, reopened, ..thread.clone() });
-                thread.reopened = false;
-            }
-        }
-        if threads.is_empty() {
-            return Err(Error::NoDrafts);
-        }
-        session.view.round += 1;
-        session.view.turn = Turn::Agent;
-        // The agent's next `review` refreshes the Changeset anyway.
-        session.view.changed_on_disk.clear();
-        session.view.since_last_round =
-            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
-        let replaced = session.view.last_round.replace(session.view.changeset.clone());
-        session.replaced_last_rounds.push((number, replaced));
-        session.queued.push(Outcome::Round(Round { number, threads }));
-        session.deliver();
-        inner.notify();
-        Ok(number)
-    }
-
-    /// Human: takes the Turn back from an agent that went quiet, to go on drafting, hand over
-    /// another Round, or abandon the Session.
-    pub fn take_turn_back(&self, id: &SessionId) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        if session.view.turn == Turn::Human {
-            return Err(Error::AlreadyYourTurn);
-        }
-        // Rounds no agent received yet go back to being Drafts, for the human to keep editing,
-        // and the last Round is the one before them again.
-        let first = session.queued.iter().find_map(|o| match o {
-            Outcome::Round(round) => Some(round.number),
-            _ => None,
-        });
-        if let Some(first) = first {
-            session.queued.clear();
-            for comment in session.view.threads.iter_mut().flat_map(|t| &mut t.comments) {
-                if comment.author == Party::Human && comment.round.is_some_and(|n| n >= first) {
-                    comment.round = None;
-                }
-            }
-            session.view.round = first;
-            if let Some(at) = session.replaced_last_rounds.iter().position(|(n, _)| *n == first) {
-                // The withdrawn Rounds' entries go too.
-                let (_, last_round) = session.replaced_last_rounds.drain(at..).next().expect("found at `at`");
-                session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
-                session.view.last_round = last_round;
-                if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {
-                    session.view.view = ChangesetView::Full;
-                }
-            }
-        }
-        inner.became_humans_turn(at);
-        inner.notify();
-        Ok(())
-    }
-
-    /// Agent: replies to `thread` in the Session of `source`. The human sees it at once; it
-    /// counts towards the Round being drafted.
-    pub fn reply(&self, source: impl Into<Source>, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
-        let body = body.into();
-        if body.trim().is_empty() {
-            return Err(Error::EmptyComment);
-        }
-        self.agent_thread(&source.into(), thread, |round, thread| {
-            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round), suggestion: None });
-        })
-    }
-
-    /// Agent: marks `thread` Resolved in the Session of `source`.
-    pub fn resolve(&self, source: impl Into<Source>, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_thread(&source.into(), thread, |_, thread| resolve(thread, Party::Agent))
-    }
-
-    /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
-    /// next Round under that Thread.
-    pub fn reply_in_thread(&self, id: &SessionId, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
-        let body = body.into();
-        if body.trim().is_empty() {
-            return Err(Error::EmptyComment);
-        }
-        self.human_thread(id, thread, |t| {
-            t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
-        })
-    }
-
-    /// Human: marks `thread` Resolved, whoever opened it.
-    pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| resolve(t, Party::Human))
-    }
-
-    /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
-    pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| {
-            if t.resolved.take().is_some() {
-                t.reopened = true;
-            }
-        })
-    }
-
-    /// Human: keeps the co-Reviewer's Draft `thread`, which becomes the human's own Draft.
-    pub fn keep_draft(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_draft(id, thread, |threads, at| threads[at].comments[0].author = Party::Human)
-    }
-
-    /// Human: rewrites the co-Reviewer's Draft `thread` as `comment`, which keeps it: the human
-    /// wrote what it says now.
-    pub fn edit_draft(&self, id: &SessionId, thread: &ThreadId, comment: impl Into<NewComment>) -> Result<(), Error> {
-        let comment = comment.into();
-        self.agent_draft(id, thread, |threads, at| {
-            check_comment(&threads[at].anchor, &comment)?;
-            let NewComment { body, suggestion } = comment;
-            threads[at].comments[0] = Comment { author: Party::Human, body, round: None, suggestion };
-            Ok(())
-        })?
-    }
-
-    /// Human: discards the co-Reviewer's Draft `thread`, and with it the Thread.
-    pub fn discard_draft(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_draft(id, thread, |threads, at| {
-            threads.remove(at);
-        })
-    }
-
-    /// Runs `f` on the Session's Threads with the position of `thread`, a Thread the
-    /// co-Reviewer opened whose Draft the human hasn't kept, questioned or not.
-    fn agent_draft<T>(
-        &self,
-        id: &SessionId,
-        thread: &ThreadId,
-        f: impl FnOnce(&mut Vec<Thread>, usize) -> T,
-    ) -> Result<T, Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let threads = &mut inner.sessions[at].view.threads;
-        let found = threads.iter().position(|t| &t.id == thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
-        if !threads[found].comments.first().is_some_and(Comment::is_agent_draft) {
-            return Err(Error::NotAnAgentDraft(thread.clone()));
-        }
-        let result = f(threads, found);
-        inner.notify();
-        Ok(result)
-    }
-
-    fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);
-        f(found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
-        inner.notify();
-        Ok(())
-    }
-
-    /// Runs `f` on a Thread a Round brought the agent, in the Session of `source`, with the
-    /// number of the Round being drafted.
-    fn agent_thread(&self, source: &Source, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
-        let key = self.session_key(source)?;
-        let mut inner = self.lock();
-        let at = key.find(&inner.sessions)?;
-        let session = &mut inner.sessions[at];
-        let round = session.view.round;
-        // Only a Round tells the agent about a Thread: one of its own Drafts nobody questioned,
-        // or one already on the Forge, isn't the agent's to answer.
-        let found =
-            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| c.round.is_some()));
-        f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
-        inner.notify();
-        Ok(())
-    }
-
-    /// What identifies the Session of `source`. Reads the repository, not holding the lock.
-    fn session_key(&self, source: &Source) -> Result<SessionKey, Error> {
-        Ok(match source {
-            Source::Local(cwd) => {
-                let repo = git::toplevel(cwd)?;
-                let branch = git::branch(&repo)?;
-                SessionKey::Local { repo, branch }
-            }
-            Source::PullRequest(url) => SessionKey::PullRequest(
-                self.forges
-                    .iter()
-                    .find_map(|forge| forge.recognise(url))
-                    .ok_or_else(|| Error::NotAPullRequest(url.clone()))?,
-                url.clone(),
-            ),
-        })
-    }
-
     /// Human: ticks `path` as viewed, or unticks it.
     pub fn mark_viewed(&self, id: &SessionId, path: &str, viewed: bool) -> Result<(), Error> {
         let mut inner = self.lock();
@@ -1297,15 +898,48 @@ impl Service {
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
         let closes = self.lock().sessions.iter().any(|s| {
             &s.view.id == id
-                && match s.view.pull_request {
-                    Some(_) => s.view.agent.is_none(),
-                    None => s.view.agent == Some(Role::CoReviewer),
+                && match s.view.source {
+                    Source::PullRequest(_) => s.view.agent.is_none(),
+                    Source::Local { .. } => s.view.agent == Some(Role::CoReviewer),
                 }
         });
         if closes {
             return self.close(id);
         }
         self.end(id, Outcome::Abandoned)
+    }
+
+    /// Human: closes the Session. One that has its outcome already (a Verdict, Published,
+    /// Abandoned) and whose agent hasn't collected it goes at once, outcome and all: the agent's
+    /// next `review` then starts a new Session. Otherwise a Pull Request Session closes Published
+    /// or not, its unpublished Drafts going with it, and its co-Reviewer is told it was Abandoned;
+    /// closing a co-review of local work is its normal end, which its co-Reviewer is told as
+    /// Closed. Local work under Review by its Author ends with a Verdict or by abandoning it.
+    pub fn close(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        if session.publishing {
+            return Err(Error::Publishing);
+        }
+        if session.view.ended.is_none() {
+            let outcome = match (&session.view.source, session.view.agent) {
+                (Source::Local { .. }, Some(Role::CoReviewer)) => Some(Outcome::Closed),
+                (Source::Local { .. }, _) => {
+                    return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
+                }
+                (Source::PullRequest(_), Some(_)) => Some(Outcome::Abandoned),
+                (Source::PullRequest(_), None) => None,
+            };
+            if let Some(outcome) = outcome {
+                drop(inner);
+                return self.end(id, outcome);
+            }
+        }
+        session.finished = true;
+        inner.reap();
+        inner.notify();
+        Ok(())
     }
 
     /// Gives the agent `outcome`, which ends the Session once delivered. With no `review` call
@@ -1320,7 +954,7 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        if outcome == Outcome::Approved && session.view.pull_request.is_some() {
+        if outcome == Outcome::Approved && session.view.pull_request().is_some() {
             return Err(Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()));
         }
         if outcome == Outcome::Approved && session.view.agent == Some(Role::CoReviewer) {
@@ -1352,8 +986,7 @@ fn local_view(
     };
     SessionView {
         id,
-        repo,
-        branch,
+        source: Source::Local { repo, branch },
         agent: Some(agent),
         changeset,
         since_session_base,
@@ -1362,42 +995,6 @@ fn local_view(
         turn: Turn::Human,
         ..SessionView::default()
     }
-}
-
-/// Refuses a Comment with no text, or with a suggestion somewhere other than new-side lines.
-fn check_comment(anchor: &Anchor, comment: &NewComment) -> Result<(), Error> {
-    if comment.body.trim().is_empty() {
-        return Err(Error::EmptyComment);
-    }
-    if comment.suggestion.is_some() && !matches!(anchor, Anchor::Lines { side: Side::New, .. }) {
-        return Err(Error::InvalidSuggestion);
-    }
-    Ok(())
-}
-
-/// Whether the next Round carries `thread`'s Comment at `at`: any Draft for an Author, and for
-/// a co-Reviewer only the human's questions, Draft replies in a Thread one of its Drafts opens.
-/// The human's other Drafts wait for Publish, and the agent's for the human to keep.
-fn goes_out(co_review: bool, thread: &Thread, at: usize) -> bool {
-    let comment = &thread.comments[at];
-    if !co_review {
-        return comment.is_draft();
-    }
-    at > 0 && comment.is_draft() && comment.author == Party::Human && thread.comments[0].is_agent_draft()
-}
-
-/// Marks `thread` Resolved by `by`; a reopening not yet handed over no longer needs telling.
-fn resolve(thread: &mut Thread, by: Party) {
-    thread.resolved = Some(by);
-    thread.reopened = false;
-}
-
-/// The paths whose change differs between two Changesets, including files in only one of them.
-fn changed_files(then: &Changeset, now: &Changeset) -> BTreeSet<String> {
-    let differs = |a: &Changeset, b: &Changeset| {
-        a.files.iter().filter(|f| !b.files.contains(f)).map(|f| f.path.clone()).collect::<Vec<_>>()
-    };
-    differs(then, now).into_iter().chain(differs(now, then)).collect()
 }
 
 /// The `n` of a Session id `sn`.

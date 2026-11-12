@@ -156,3 +156,34 @@ fn a_restored_session_reloads_with_what_the_agents_review_asked_for() {
     let files: Vec<_> = restored.session(&id).unwrap().changeset.files.into_iter().map(|f| f.path).collect();
     assert_eq!(files, ["lib.rs", "other.rs"], "still without untracked files");
 }
+
+#[test]
+fn a_change_after_checks_that_found_nothing_is_still_offered() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    svc.check_disk();
+    svc.check_disk();
+    assert!(svc.session(pending.session()).unwrap().changed_on_disk.is_empty());
+
+    repo.write("other.rs", "y\n");
+    svc.check_disk();
+
+    assert_eq!(svc.session(pending.session()).unwrap().changed_on_disk, paths(&["other.rs"]));
+}
+
+#[test]
+fn going_back_on_disk_to_what_was_checked_before_a_reload_is_offered() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    svc.check_disk();
+    repo.write("other.rs", "y\n");
+    svc.reload(&id).unwrap();
+
+    repo.write("other.rs", "x\n");
+    svc.check_disk();
+
+    assert_eq!(svc.session(&id).unwrap().changed_on_disk, paths(&["other.rs"]), "the diff shows y");
+}

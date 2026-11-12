@@ -25,7 +25,7 @@ fn agents_in_two_worktrees_of_one_repository_get_two_sessions() {
 
     assert_ne!(a.session(), b.session());
     let sessions = svc.sessions();
-    let opened: Vec<_> = sessions.iter().map(|s| (s.repo.as_path(), s.branch.as_str())).collect();
+    let opened: Vec<_> = sessions.iter().map(|s| (s.repo().unwrap(), s.branch())).collect();
     assert_eq!(opened, vec![(repo.path(), "agent"), (other.path(), "other-agent")]);
 }
 

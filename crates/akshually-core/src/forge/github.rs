@@ -16,8 +16,8 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use super::{epoch_seconds, file_change, with_suggestion};
-use crate::{Changeset, FileChange, Hunk, Side, Verdict};
+use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
+use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
@@ -76,7 +76,7 @@ impl GitHub {
         if cached.is_none() {
             *cached = self.credentials.github_token(&self.host);
         }
-        cached.clone().ok_or_else(|| ForgeError::NoCredentials { host: self.host.host.clone() })
+        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
     }
 
     /// `segments` appended to the REST base, each percent-encoded.
@@ -329,33 +329,34 @@ impl ForgeAdapter for GitHub {
 
         // Like the local Source, renames are a deletion plus an addition. Line comments must
         // fit GitHub's own diff, so each file keeps its hunks.
-        let mut files = Vec::new();
+        let mut fetches = Vec::new();
         for file in listed {
-            let old = |path: &str| self.file(id, path, &base).map(Some);
-            let new = |path: &str| self.file(id, path, &pr.head_sha).map(Some);
             let hunks = file.patch.as_deref().map(Hunk::parse_patch);
-            let with = |change: FileChange, hunks| FileChange { hunks, ..change };
+            let path = file.filename;
+            let fetch = |old: Option<&String>, new: Option<&String>, hunks| FileFetch {
+                path: new.or(old).cloned().unwrap_or_default(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks,
+            };
             match file.status.as_str() {
-                "added" | "copied" => {
-                    files.push(with(file_change(file.filename.clone(), None, new(&file.filename)?), hunks))
-                }
-                "removed" => files.push(with(file_change(file.filename.clone(), old(&file.filename)?, None), hunks)),
+                "added" | "copied" => fetches.push(fetch(None, Some(&path), hunks)),
+                "removed" => fetches.push(fetch(Some(&path), None, hunks)),
                 "renamed" => {
                     // GitHub shows the renamed file only: none of the old path's lines, and of
                     // the new path's only those its patch changes.
-                    let previous = file.previous_filename.unwrap_or_else(|| file.filename.clone());
-                    files.push(with(file_change(previous.clone(), old(&previous)?, None), Some(Vec::new())));
-                    let renamed = file_change(file.filename.clone(), None, new(&file.filename)?);
-                    files.push(with(renamed, Some(hunks.unwrap_or_default())));
+                    let previous = file.previous_filename.unwrap_or_else(|| path.clone());
+                    fetches.push(fetch(Some(&previous), None, Some(Vec::new())));
+                    fetches.push(fetch(None, Some(&path), Some(hunks.unwrap_or_default())));
                 }
                 "unchanged" => {}
-                _ => {
-                    let change = file_change(file.filename.clone(), old(&file.filename)?, new(&file.filename)?);
-                    files.push(with(change, hunks))
-                }
+                _ => fetches.push(fetch(Some(&path), Some(&path), hunks)),
             }
         }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = fetch_files(fetches, |path, side| {
+            self.file(id, path, if side == Side::Old { &base } else { &pr.head_sha })
+        })?;
         Ok(Changeset { base, files })
     }
 
@@ -439,19 +440,35 @@ impl ForgeAdapter for GitHub {
     }
 
     /// A pending review with each new Thread and reply in it, then the Resolved changes, then
-    /// the Verdict submits it. A failure on the way undoes the Resolved changes made and
-    /// deletes the pending review, so nothing is half-published.
+    /// the Verdict submits it. A Pull Request pushed to since `pr` was fetched is refused first.
+    /// A failure on the way undoes the Resolved changes made and deletes the pending review, so
+    /// nothing is half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
         let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
         let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
         let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, variables)?;
         let pr_id =
             data.pointer("/repository/pullRequest/id").ok_or_else(|| ForgeError::NotFound(pr.id.to_string()))?;
+        // GitHub would take the review against the old head, its Threads on lines that moved:
+        // refuse, as GitLab does, so the human reloads first.
+        if self.string_at(&data, "/repository/pullRequest/headRefOid")? != pr.head_sha {
+            return Err(ForgeError::Moved(pr.id.to_string()));
+        }
         let input = json!({ "pullRequestId": pr_id, "commitOID": pr.head_sha });
         let data: Value = self.graphql(START_REVIEW, json!({ "input": input }))?;
         let review_id = self.string_at(&data, "/addPullRequestReview/pullRequestReview/id")?;
         let mut changed = Vec::new();
-        let submitted = self.fill_and_submit(&review_id, review, &mut changed);
+        let submitted = self.fill(&review_id, review, &mut changed).and_then(|()| {
+            self.submit(&review_id, review).or_else(|error| {
+                // The submit may have gone through with its answer lost: undoing would reopen
+                // Threads of a review that went out. Ask; only a review still pending failed,
+                // and one GitHub can't say about is taken to have failed, as before asking.
+                match error.may_have_gone_through().then(|| self.submitted_url(&review_id)) {
+                    Some(Ok(Some(url))) => Ok(url),
+                    _ => Err(error),
+                }
+            })
+        });
         if submitted.is_err() {
             // Best effort: the error that stopped Publish is the one to report.
             for (thread, resolved) in changed {
@@ -517,15 +534,10 @@ impl GitHub {
 }
 
 impl GitHub {
-    /// Adds `review`'s Threads and replies to the pending review `review_id`, then submits it with the
-    /// Verdict and body, returning the review's web page.
-    /// Records in `changed` each Thread whose Resolved state it changed, and to what.
-    fn fill_and_submit(
-        &self,
-        review_id: &str,
-        review: &Review,
-        changed: &mut Vec<(String, bool)>,
-    ) -> Result<String, ForgeError> {
+    /// Adds `review`'s Threads and replies to the pending review `review_id`, and makes its
+    /// Resolved changes. Records in `changed` each Thread whose Resolved state it changed, and
+    /// to what.
+    fn fill(&self, review_id: &str, review: &Review, changed: &mut Vec<(String, bool)>) -> Result<(), ForgeError> {
         for comment in &review.comments {
             let mut input = match &comment.anchor {
                 RemoteAnchor::Lines { path, side, start, end } => {
@@ -565,6 +577,12 @@ impl GitHub {
             self.set_resolved(thread, resolved)?;
             changed.push((thread.clone(), resolved));
         }
+        Ok(())
+    }
+
+    /// Submits the pending review `review_id` with the Verdict and body, returning the review's
+    /// web page.
+    fn submit(&self, review_id: &str, review: &Review) -> Result<String, ForgeError> {
         let event = match review.verdict {
             Verdict::Approve => "APPROVE",
             Verdict::RequestChanges => "REQUEST_CHANGES",
@@ -574,6 +592,16 @@ impl GitHub {
         let input = json!({ "pullRequestReviewId": review_id, "event": event, "body": review.body });
         let data: Value = self.graphql(SUBMIT_REVIEW, json!({ "input": input }))?;
         self.string_at(&data, "/submitPullRequestReview/pullRequestReview/url")
+    }
+
+    /// The web page of the review `review_id` if it was submitted, `None` while it's pending.
+    fn submitted_url(&self, review_id: &str) -> Result<Option<String>, ForgeError> {
+        let data: Value = self.graphql(REVIEW_STATE_QUERY, json!({ "id": review_id }))?;
+        let state = self.string_at(&data, "/node/state")?;
+        if state == "PENDING" {
+            return Ok(None);
+        }
+        self.string_at(&data, "/node/url").map(Some)
     }
 
     /// Marks the Thread `thread` Resolved, or reopens it.
@@ -597,7 +625,7 @@ impl GitHub {
 }
 
 const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } }
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id headRefOid } }
 }";
 
 const START_REVIEW: &str = "mutation($input: AddPullRequestReviewInput!) {
@@ -622,6 +650,10 @@ const UNRESOLVE_THREAD: &str = "mutation($input: UnresolveReviewThreadInput!) {
 
 const SUBMIT_REVIEW: &str = "mutation($input: SubmitPullRequestReviewInput!) {
   submitPullRequestReview(input: $input) { pullRequestReview { url } }
+}";
+
+const REVIEW_STATE_QUERY: &str = "query($id: ID!) {
+  node(id: $id) { ... on PullRequestReview { state url } }
 }";
 
 const DELETE_REVIEW: &str = "mutation($input: DeletePullRequestReviewInput!) {

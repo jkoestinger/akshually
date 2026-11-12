@@ -3,7 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use akshually_core::Paths;
@@ -24,7 +24,7 @@ pub fn connect_or_launch(paths: &Paths) -> Result<Connection> {
     if std::env::var_os("AKSHUALLY_NO_LAUNCH").is_some() {
         bail!("the akshually app isn't running, and AKSHUALLY_NO_LAUNCH is set");
     }
-    launch(paths)?;
+    let mut app = launch(paths)?;
 
     // Two racing CLI calls may both launch an app; the loser exits, and both connect to the winner.
     let deadline = Instant::now() + LAUNCH_TIMEOUT;
@@ -32,6 +32,14 @@ pub fn connect_or_launch(paths: &Paths) -> Result<Connection> {
     loop {
         match ipc::connect(paths) {
             Err(e) if no_app(&e) && Instant::now() < deadline => {
+                // The app gave up: it says why last in its log.
+                if let Ok(Some(status)) = app.try_wait()
+                    && !status.success()
+                {
+                    let log = fs::read_to_string(paths.app_log()).unwrap_or_default();
+                    let why = log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no reason given");
+                    bail!("the akshually app didn't start: {why}");
+                }
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_millis(200));
             }
@@ -49,7 +57,7 @@ fn no_app(error: &io::Error) -> bool {
 
 /// Starts `akshually app` detached from this call: its own process group (so a Ctrl-C in the
 /// agent's terminal doesn't reach it), no stdin, output to the app log.
-fn launch(paths: &Paths) -> Result<()> {
+fn launch(paths: &Paths) -> Result<Child> {
     fs::create_dir_all(&paths.state).with_context(|| format!("can't create {}", paths.state.display()))?;
     let log = OpenOptions::new()
         .create(true)
@@ -68,6 +76,5 @@ fn launch(paths: &Paths) -> Result<()> {
         .stderr(log)
         .process_group(0)
         .spawn()
-        .context("can't launch the akshually app")?;
-    Ok(())
+        .context("can't launch the akshually app")
 }

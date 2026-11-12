@@ -197,6 +197,19 @@ pub struct PullRequest {
     pub base_sha: String,
 }
 
+impl PullRequest {
+    /// The Forge it's on. Only GitLab's merge request pages have `/-/merge_requests/` in their
+    /// URL.
+    pub fn kind(&self) -> ForgeKind {
+        if self.url.contains("/-/merge_requests/") { ForgeKind::GitLab } else { ForgeKind::GitHub }
+    }
+
+    /// How the Forge names it: `acme/web #482`, `platform/infra !97`.
+    pub fn reference(&self) -> String {
+        format!("{} {}{}", self.id.repo, self.kind().sigil(), self.id.number)
+    }
+}
+
 /// A Thread already on the Forge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteThread {
@@ -233,12 +246,9 @@ pub struct RemoteComment {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
-    #[error(
-        "no credentials for {host}: log in with `gh auth login --hostname {host}` (GitHub) or \
-         `glab auth login --hostname {host}` (GitLab), set a token in the environment, or paste a token \
-         into akshually's config"
-    )]
-    NoCredentials { host: String },
+    /// No token for `host` from its Forge's CLI, the environment or `config`.
+    #[error("{}", no_credentials(host, *kind, config))]
+    NoCredentials { host: String, kind: ForgeKind, config: std::path::PathBuf },
     #[error("{host} refused the token (HTTP {status}); check it is valid and can read this repository")]
     Unauthorized { host: String, status: u16 },
     #[error("{0} doesn't exist, or the token can't see it")]
@@ -260,6 +270,34 @@ pub enum ForgeError {
     DraftsInBrowser { pr: String, count: usize },
 }
 
+/// How to give akshually a token for `host`: its Forge's CLI, the environment, or pasted into
+/// the config file at `config`, spelled out to copy.
+fn no_credentials(host: &str, kind: ForgeKind, config: &std::path::Path) -> String {
+    let (login, env, name) = match kind {
+        ForgeKind::GitHub if host.eq_ignore_ascii_case("github.com") => ("gh", "set GITHUB_TOKEN", "github"),
+        ForgeKind::GitHub => ("gh", "set GH_ENTERPRISE_TOKEN", "github"),
+        ForgeKind::GitLab => ("glab", "set GITLAB_TOKEN (with GITLAB_HOST for a host other than gitlab.com)", "gitlab"),
+    };
+    format!(
+        "no credentials for {host}: log in with `{login} auth login --hostname {host}`, {env}, or paste a token \
+         into {}:\n\n[[hosts]]\nkind = \"{name}\"\nhost = \"{host}\"\ntoken = \"<your token>\"\n\nthen restart \
+         akshually",
+        config.display()
+    )
+}
+
+impl ForgeError {
+    /// Whether the request that failed so may still have done its work: its answer was lost
+    /// (no connection, a gateway error, an answer that makes no sense), rather than a refusal.
+    pub(crate) fn may_have_gone_through(&self) -> bool {
+        match self {
+            ForgeError::Http { .. } | ForgeError::Unexpected { .. } => true,
+            ForgeError::Api { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
+}
+
 /// The adapters for github.com and every configured host (`Settings::hosts`).
 pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
     config::with_github_com(hosts)
@@ -275,11 +313,64 @@ pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dy
 /// info string is `info` (`suggestion` on GitHub), in a fence longer than any backtick run in
 /// `code`. Empty `code` suggests deleting the lines.
 pub(crate) fn with_suggestion(body: &str, info: &str, code: &str) -> String {
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat((longest + 1).max(3));
+    let fence = crate::fence_for(code);
     let newline = if code.is_empty() || code.ends_with('\n') { "" } else { "\n" };
     let block = format!("{fence}{info}\n{code}{newline}{fence}");
     if body.is_empty() { block } else { format!("{body}\n\n{block}") }
+}
+
+/// How many requests for file contents run at once.
+const PARALLEL_FETCHES: usize = 8;
+
+/// One changed file to fetch: its path in the Changeset, the paths to read on each side (`None`
+/// where it doesn't exist), and the hunks of the Forge's diff.
+pub(crate) struct FileFetch {
+    pub path: String,
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub hunks: Option<Vec<crate::Hunk>>,
+}
+
+/// Fetches each of `files`, reading a side's contents with `read(path, side)`, on up to
+/// [`PARALLEL_FETCHES`] threads. The changes come back in the order of `files`; the first
+/// failure fails them all.
+pub(crate) fn fetch_files(
+    files: Vec<FileFetch>,
+    read: impl Fn(&str, Side) -> Result<Vec<u8>, ForgeError> + Sync,
+) -> Result<Vec<FileChange>, ForgeError> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fetch = |file: &FileFetch| -> Result<FileChange, ForgeError> {
+        let old = file.old.as_deref().map(|path| read(path, Side::Old)).transpose()?;
+        let new = file.new.as_deref().map(|path| read(path, Side::New)).transpose()?;
+        Ok(FileChange { hunks: file.hunks.clone(), ..file_change(file.path.clone(), old, new) })
+    };
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<Result<FileChange, ForgeError>>>> =
+        Mutex::new(std::iter::repeat_with(|| None).take(files.len()).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_FETCHES.min(files.len()) {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(at) else { return };
+                    let result = fetch(file);
+                    let failed = result.is_err();
+                    results.lock().unwrap_or_else(|e| e.into_inner())[at] = Some(result);
+                    if failed {
+                        // No point fetching the rest.
+                        next.store(files.len(), Ordering::Relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    // Files are taken in order, and each one taken is fetched: a failure stops the takes after
+    // it, so it comes before any file left unfetched, and without one every file was fetched.
+    results.into_iter().map_while(|r| r).collect()
 }
 
 /// A changed file from its contents on each side: binary (a NUL in its first 8 KB, as git

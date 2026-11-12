@@ -25,9 +25,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// Takes the single-instance lock and listens on the socket. Fails with `AlreadyRunning`
-    /// when another app holds the lock.
+    /// Takes the single-instance lock of the state dir and listens on the socket. Fails with
+    /// `AlreadyRunning` when another app holds the lock, whatever its runtime dir.
     pub fn bind(paths: &Paths, service: Arc<Service>) -> Result<Server, BindError> {
+        DirBuilder::new().recursive(true).mode(0o700).create(&paths.state)?;
         DirBuilder::new().recursive(true).mode(0o700).create(&paths.runtime)?;
         let lock = OpenOptions::new().create(true).truncate(false).write(true).open(paths.lock())?;
         match lock.try_lock() {
@@ -124,6 +125,10 @@ impl Server {
         let result = match request {
             Request::Review { .. } | Request::Ack => {
                 Err(ErrorReply::new(ErrorCode::BadRequest, "`review` and `ack` need a connection of their own"))
+            }
+            Request::Show { activation_token } => {
+                self.service.show_window(activation_token);
+                Ok(serde_json::json!({}))
             }
             Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
             Request::Reply { cwd, pr, thread, body } => {

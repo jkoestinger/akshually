@@ -48,6 +48,16 @@ pub enum ForgeKind {
     GitLab,
 }
 
+impl ForgeKind {
+    /// What precedes a Pull Request's number on this Forge: GitLab numbers merge requests `!97`.
+    pub fn sigil(self) -> char {
+        match self {
+            ForgeKind::GitHub => '#',
+            ForgeKind::GitLab => '!',
+        }
+    }
+}
+
 /// Every host to serve: `configured`, plus github.com unless configured.
 pub(super) fn with_github_com(configured: &[HostConfig]) -> Vec<HostConfig> {
     let mut hosts = configured.to_vec();

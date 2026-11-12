@@ -4,7 +4,7 @@ mod support;
 
 use std::process::Child;
 
-use akshually_core::{Anchor, NewComment, SessionId, Side, ThreadId, Turn};
+use akshually_core::{Anchor, NewComment, SessionId, Side, ThreadId, ThreadRef, Turn};
 use akshually_testkit::{TestRepo, wait_until};
 use support::{HostedApp, TIMEOUT, finish};
 
@@ -151,8 +151,8 @@ fn a_reopened_thread_and_a_reply_in_a_thread_go_out_under_their_threads() {
     let app = HostedApp::start();
     let repo = repo_with_work();
     let (session, second) = after_the_agent_resolved_t1(&app, &repo, &["review"]);
-    app.service.reopen_thread(&session, &ThreadId::new("T1")).unwrap();
-    app.service.reply_in_thread(&session, &ThreadId::new("T2"), "To what?").unwrap();
+    app.service.reopen_thread(&ThreadRef::new(&session, &ThreadId::new("T1"))).unwrap();
+    app.service.reply_in_thread(&ThreadRef::new(&session, &ThreadId::new("T2")), "To what?").unwrap();
 
     app.service.hand_over_round(&session).unwrap();
 
@@ -186,7 +186,7 @@ fn a_reopened_thread_is_flagged_in_json() {
     let app = HostedApp::start();
     let repo = repo_with_work();
     let (session, second) = after_the_agent_resolved_t1(&app, &repo, &["review", "--format", "json"]);
-    app.service.reopen_thread(&session, &ThreadId::new("T1")).unwrap();
+    app.service.reopen_thread(&ThreadRef::new(&session, &ThreadId::new("T1"))).unwrap();
 
     app.service.hand_over_round(&session).unwrap();
 

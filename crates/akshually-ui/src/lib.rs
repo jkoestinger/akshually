@@ -8,7 +8,8 @@ use std::sync::Arc;
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
-    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
+    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, ThreadRef,
+    Turn, Verdict, fence_for,
 };
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -64,11 +65,15 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
     handle.update(move |s: &mut State, _| s.handle = Some(own));
     service.subscribe(move |sessions| {
         let sessions = sessions.to_vec();
-        let any = !sessions.is_empty();
         handle.update(move |s: &mut State, _| s.apply(sessions));
-        if any && !handle.is_visible() {
-            handle.show();
-        }
+    });
+    // A Session that becomes the human's Turn, or the human launching akshually again, brings
+    // the window back after it was closed.
+    let handle = app.handle();
+    service.on_show_window(move |token| match token {
+        Some(token) => handle.activate(token),
+        None if !handle.is_visible() => handle.show(),
+        None => {}
     });
     let handle = app.handle();
     service.subscribe_inbox(move |inbox| {
@@ -96,15 +101,18 @@ struct State {
     /// For work off the UI thread to report back; `None` in headless renders.
     handle: Option<AppHandle<State>>,
     /// The Thread a reply is being written in, at most one in the window.
-    reply: Option<(SessionId, ThreadId)>,
+    reply: Option<ThreadRef>,
     reply_text: TextEdit,
     /// The co-Reviewer's Draft being edited, at most one in the window.
-    editing: Option<(SessionId, ThreadId)>,
+    editing: Option<ThreadRef>,
     edit_text: TextEdit,
     /// The Publish dialog, while it's open.
     publish: Option<Publish>,
     /// The Publish dialog's summary, the review body.
     summary: TextEdit,
+    /// The Session the human asked to abandon (or close, for a Pull Request), until they
+    /// confirm or cancel.
+    confirming_end: Option<SessionId>,
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -150,49 +158,12 @@ impl SessionTab {
     /// Puts each current Thread, and the composer when it's on this Session, under its last
     /// line. Outdated Threads have no line; they show above the diff.
     fn annotate(&mut self, composer: Option<&Composer>) {
-        let changeset = self.session.shown();
-        let mut notes: Vec<Annotation> = self
-            .session
-            .threads
-            .iter()
-            .filter(|t| !t.outdated)
-            .filter_map(|t| {
-                let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
-                if *side == Side::Old && self.session.view == ChangesetView::SinceLastRound {
-                    // That old side is the last Round's code, not the code the Thread is on.
-                    return None;
-                }
-                let file = changeset.files.iter().position(|f| &f.path == path)?;
-                Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
-            })
+        let placed = self.session.placed_threads().into_iter();
+        let mut notes: Vec<Annotation> = placed
+            .map(|p| Annotation::new(p.file, LineRef::new(diff_side(p.side), p.line), p.thread.as_str()))
             .collect();
         notes.extend(composer.filter(|c| c.session == self.session.id).and_then(|c| c.at.clone()));
         self.diff.set_annotations(notes);
-    }
-
-    /// What the next Round carries: each Draft, and each Thread the human reopened; for a
-    /// co-Reviewer, only the questions on its Drafts.
-    fn to_hand_over(&self) -> usize {
-        self.session.to_hand_over()
-    }
-
-    /// The human's Drafts, which Publish sends once kept.
-    fn drafts(&self) -> usize {
-        self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
-    }
-
-    fn title(&self) -> String {
-        if let Some(pr) = &self.session.pull_request {
-            // GitLab numbers merge requests `!97`, and only its URLs have `/-/merge_requests/`.
-            let sigil = if pr.url.contains("/-/merge_requests/") { '!' } else { '#' };
-            return format!("{} {sigil}{}", pr.id.repo, pr.id.number);
-        }
-        let repo = self
-            .session
-            .repo
-            .file_name()
-            .map_or_else(|| self.session.repo.display().to_string(), |n| n.to_string_lossy().into_owned());
-        format!("{repo} · {}", self.session.branch)
     }
 }
 
@@ -203,20 +174,11 @@ fn diff_side(side: Side) -> diff::Side {
     }
 }
 
-/// The Anchor for lines selected in the diff. A selection may run across sides; it then
-/// anchors to its last line alone.
-fn anchor_for(changeset: &Changeset, range: LineRange) -> Option<Anchor> {
-    let path = changeset.files.get(range.file)?.path.clone();
-    let side = match range.end.side {
+fn core_side(side: diff::Side) -> Side {
+    match side {
         diff::Side::Old => Side::Old,
         diff::Side::New => Side::New,
-    };
-    let (start, end) = if range.start.side == range.end.side {
-        (range.start.line.min(range.end.line), range.start.line.max(range.end.line))
-    } else {
-        (range.end.line, range.end.line)
-    };
-    Some(Anchor::lines(side, path, start..=end))
+    }
 }
 
 fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
@@ -290,6 +252,7 @@ impl State {
             edit_text: TextEdit::new(""),
             publish: None,
             summary: TextEdit::new(""),
+            confirming_end: None,
         };
         let sessions = state.service.sessions();
         state.apply(sessions);
@@ -326,11 +289,14 @@ impl State {
         if self.composer.as_ref().is_some_and(|c| !self.tabs.iter().any(|t| t.session.id == c.session)) {
             self.composer = None;
         }
-        if self.reply.as_ref().is_some_and(|(session, _)| !self.tabs.iter().any(|t| &t.session.id == session)) {
+        if self.reply.as_ref().is_some_and(|r| !self.tabs.iter().any(|t| t.session.id == r.session)) {
             self.close_reply();
         }
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
+        }
+        if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
+            self.confirming_end = None;
         }
         self.annotate();
         if self.active.is_some() && self.active_tab().is_none() {
@@ -466,9 +432,7 @@ impl State {
     }
 
     fn show(&self, id: &SessionId, view: ChangesetView) {
-        if let Err(error) = self.service.show(id, view) {
-            eprintln!("akshually: {error}");
-        }
+        report(self.service.show(id, view));
     }
 
     fn annotate(&mut self) {
@@ -480,11 +444,9 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
-        if tab.session.view == ChangesetView::SinceLastRound && range.end.side == diff::Side::Old {
-            // Those lines are the last Round's code, which a Thread can't anchor to.
-            return;
-        }
-        let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
+        let (start, end) =
+            ((core_side(range.start.side), range.start.line), (core_side(range.end.side), range.end.line));
+        let Some(anchor) = tab.session.anchor_for_selection(range.file, start, end) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.open_composer(anchor, Some(at));
     }
@@ -542,8 +504,8 @@ impl State {
     }
 
     /// Opens the reply composer in `thread`.
-    fn open_reply(&mut self, session: SessionId, thread: ThreadId) {
-        self.reply = Some((session, thread));
+    fn open_reply(&mut self, thread: ThreadRef) {
+        self.reply = Some(thread);
         self.reply_text = TextEdit::new("");
     }
 
@@ -554,20 +516,20 @@ impl State {
 
     /// Turns the reply composer's text into a Draft in its Thread.
     fn save_reply(&mut self) {
-        let Some((session, thread)) = &self.reply else { return };
-        match self.service.reply_in_thread(session, thread, self.reply_text.text.clone()) {
+        let Some(thread) = &self.reply else { return };
+        match self.service.reply_in_thread(thread, self.reply_text.text.clone()) {
             Ok(()) => self.close_reply(),
-            Err(error) => eprintln!("akshually: {error}"),
+            error => report(error),
         }
     }
 
     /// Opens the editor on the co-Reviewer's Draft `thread`, with what it says now.
-    fn open_edit(&mut self, session: SessionId, thread: ThreadId) {
-        let tab = self.tabs.iter().find(|t| t.session.id == session);
-        let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread)?.comments.first());
+    fn open_edit(&mut self, thread: ThreadRef) {
+        let tab = self.tabs.iter().find(|t| t.session.id == thread.session);
+        let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread.thread)?.comments.first());
         let Some(draft) = draft else { return };
         self.edit_text = TextEdit::new(draft_markdown(&draft.body, draft.suggestion.as_deref()));
-        self.editing = Some((session, thread));
+        self.editing = Some(thread);
     }
 
     fn close_edit(&mut self) {
@@ -577,21 +539,21 @@ impl State {
 
     /// Saves the edited co-Reviewer's Draft, which keeps it as the human's.
     fn save_edit(&mut self) {
-        let Some((session, thread)) = &self.editing else { return };
-        match self.service.edit_draft(session, thread, NewComment::from_markdown(&self.edit_text.text)) {
+        let Some(thread) = &self.editing else { return };
+        match self.service.edit_draft(thread, NewComment::from_markdown(&self.edit_text.text)) {
             Ok(()) => self.close_edit(),
-            Err(error) => eprintln!("akshually: {error}"),
+            error => report(error),
         }
     }
 
     /// Expands or collapses an Outdated Thread.
-    fn toggle_outdated(&mut self, session: &SessionId, thread: &ThreadId) {
-        let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == session) else { return };
-        match tab.expanded.iter().position(|t| t == thread) {
+    fn toggle_outdated(&mut self, thread: &ThreadRef) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.session.id == thread.session) else { return };
+        match tab.expanded.iter().position(|t| t == &thread.thread) {
             Some(at) => {
                 tab.expanded.remove(at);
             }
-            None => tab.expanded.push(thread.clone()),
+            None => tab.expanded.push(thread.thread.clone()),
         }
     }
 
@@ -604,21 +566,15 @@ impl State {
     }
 
     /// Runs a human action on the service; the service's update then refreshes the view.
-    fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
-        if let Err(error) = action(&self.service, id) {
-            eprintln!("akshually: {error}");
-        }
+    fn act(&self, id: &SessionId, action: SessionAction) {
+        report(action(&self.service, id));
     }
 
     /// Reloads a Pull Request Session from its Forge off the UI thread (the Forge may be slow);
     /// the service's update then refreshes the view.
     fn reload_pull_request(&self, id: &SessionId) {
         let (service, id) = (self.service.clone(), id.clone());
-        let reload = move || {
-            if let Err(error) = service.reload(&id) {
-                eprintln!("akshually: {error}");
-            }
-        };
+        let reload = move || report(service.reload(&id));
         match self.handle {
             Some(_) => drop(std::thread::spawn(reload)),
             None => reload(),
@@ -626,16 +582,25 @@ impl State {
     }
 
     /// `act`, for a human action on one Thread.
-    fn act_on_thread(
-        &self,
-        id: &SessionId,
-        thread: &ThreadId,
-        action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>,
-    ) {
-        if let Err(error) = action(&self.service, id, thread) {
-            eprintln!("akshually: {error}");
-        }
+    fn act_on_thread(&self, thread: &ThreadRef, action: fn(&Service, &ThreadRef) -> Result<(), akshually_core::Error>) {
+        report(action(&self.service, thread));
     }
+}
+
+/// A human action on one Session.
+type SessionAction = fn(&Service, &SessionId) -> Result<(), akshually_core::Error>;
+
+/// Reports a human action the service refused. The UI offers only what's allowed, so this is
+/// for races (the Session changed meanwhile); there's nowhere better to show it yet.
+fn report(result: Result<(), akshually_core::Error>) {
+    if let Err(error) = result {
+        eprintln!("akshually: {error}");
+    }
+}
+
+/// The first line of a Thread's first Comment, which names it in one-line summaries.
+fn first_line(thread: &Thread) -> &str {
+    thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""))
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
@@ -648,7 +613,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .status(s.inbox.attention.then_some(TabItemStatus::Attention));
     let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
         .tabs(std::iter::once(inbox_tab).chain(s.tabs.iter().map(|t| {
-            TabItem::new(t.session.id.as_str(), t.title())
+            TabItem::new(t.session.id.as_str(), t.session.title())
                 .icon(&rune_kit::glyphs::FILE_CODE)
                 .closable(false)
                 .status(tab_status(&t.session))
@@ -678,6 +643,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .min_h(0.0)
             .child(tab_bar.child(pull_request_opener(k, s)))
             .child(session_header(k, tab))
+            .children(end_confirm(k, s, &tab.session))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
@@ -795,9 +761,10 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
 /// platform/infra !97 · …`: hosts other than github.com and gitlab.com are named.
 fn inbox_meta(item: &InboxItem, now: i64) -> String {
     let PullRequestRef { host, repo, number } = &item.id;
-    let (forge, sigil) = match item.kind {
-        ForgeKind::GitHub => ("GitHub", '#'),
-        ForgeKind::GitLab => ("GitLab", '!'),
+    let sigil = item.kind.sigil();
+    let forge = match item.kind {
+        ForgeKind::GitHub => "GitHub",
+        ForgeKind::GitLab => "GitLab",
     };
     let place = if host == "github.com" || host == "gitlab.com" {
         format!("{repo} {sigil}{number}")
@@ -848,9 +815,9 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .items_center()
         .fill(k.c.layer_01)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
-        .child(text(format!("{} · {} → {base}", pr.author, session.branch)).font(k.ty.mono).color(k.c.text_muted))
+        .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
-        .child(Badge::new(format!("{} Drafts", tab.drafts())).build(k))
+        .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
         .child(
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -860,7 +827,11 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(
             Button::new("Close")
                 .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| s.act(&close_id, Service::close))
+                .on_press(move |s: &mut State| match published {
+                    true => s.act(&close_id, Service::close),
+                    // Unpublished Drafts go with it: ask first.
+                    false => s.confirming_end = Some(close_id.clone()),
+                })
                 .build(k),
         )
         .children(session.agent.is_some().then(|| hand_over_button(k, tab)))
@@ -877,7 +848,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
 fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
     let id = session.id.clone();
-    let count = tab.to_hand_over();
+    let count = session.to_hand_over();
     let label = match (session.is_co_review(), count) {
         (true, 0) => "Hand over questions".to_owned(),
         (true, n) => format!("Hand over questions ({n})"),
@@ -887,11 +858,7 @@ fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
     Button::new(label)
         .variant(ButtonVariant::Submit)
         .disabled(count == 0 || session.turn != Turn::Human || session.ended.is_some())
-        .on_press(move |s: &mut State| {
-            if let Err(error) = s.service.hand_over_round(&id) {
-                eprintln!("akshually: {error}");
-            }
-        })
+        .on_press(move |s: &mut State| report(s.service.hand_over_round(&id).map(drop)))
         .build(k)
 }
 
@@ -899,7 +866,7 @@ fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
 fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
     let Some(publish) = &s.publish else { return };
     let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
-    let Some(pr) = &tab.session.pull_request else { return };
+    let Some(pr) = tab.session.pull_request() else { return };
     let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0);
     if let Some(plan) = &publish.plan {
         let mut list = col().key("publish-drafts").w_full().gap(8.0);
@@ -996,7 +963,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
 /// One Thread's Drafts in the Publish dialog, ticked when they're sent.
 fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
     let on = publish_place(thread);
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let on = if thread.forge.is_some() { format!("Reply in {} on {on}", thread.id) } else { on };
     let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
     let suggestion = thread.comments.iter().any(|c| c.suggestion.is_some());
@@ -1021,7 +988,7 @@ fn publish_place(thread: &Thread) -> String {
 
 /// A Thread Publish resolves or reopens on the Forge (`what`), in the Publish dialog.
 fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let line = format!("{what} {} on {} — {first}", thread.id, publish_place(thread));
     row()
         .w_full()
@@ -1056,7 +1023,7 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
-    if let Some(pr) = &session.pull_request {
+    if let Some(pr) = session.pull_request() {
         return pull_request_header(k, tab, pr);
     }
     let shown = session.shown();
@@ -1074,7 +1041,8 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let turn = Badge::new(if yours { "Your Turn" } else { "Agent's Turn" });
     // During the agent's Turn the Verdict waits: take the Turn back first (or abandon). A
     // co-review of local work has no Verdict.
-    let decide = if yours && co_review {
+    let ended = session.ended.is_some();
+    let decide = if ended || (yours && co_review) {
         None
     } else if yours {
         Button::new("Approve")
@@ -1113,7 +1081,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .gap(12.0)
         .items_center()
         .fill(k.c.layer_01)
-        .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
+        .child(text(session.branch().to_owned()).font(k.ty.mono).color(k.c.text_base))
         .child(text(base).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
@@ -1126,14 +1094,65 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 .build(k),
         )
         .child(
-            // Closing a co-review of local work is its normal end, not Abandoned.
-            Button::new(if co_review { "Close" } else { "Abandon" })
-                .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
-                .build(k),
+            // Closing a co-review of local work is its normal end, not Abandoned; a Session that
+            // has its outcome already just closes.
+            match (ended, co_review) {
+                (true, _) => Button::new("Close").on_press(move |s: &mut State| s.act(&abandon_id, Service::close)),
+                (false, true) => {
+                    Button::new("Close").on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
+                }
+                (false, false) => {
+                    Button::new("Abandon").on_press(move |s: &mut State| s.confirming_end = Some(abandon_id.clone()))
+                }
+            }
+            .variant(ButtonVariant::Ghost)
+            .build(k),
         )
         .children(decide)
         .child(hand_over_button(k, tab))
+}
+
+/// Asks the human to confirm abandoning a Session (or closing a Pull Request Session before
+/// Publish), which can't be undone. Cancel keeps everything.
+fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
+    if s.confirming_end.as_ref() != Some(&session.id) {
+        return None;
+    }
+    let (question, label, end): (String, _, SessionAction) = match session.pull_request() {
+        Some(_) => {
+            let agent = if session.agent.is_some() { " The co-Reviewer is told to stop." } else { "" };
+            (format!("Close this Pull Request? Your Drafts are discarded.{agent}"), "Close", Service::close)
+        }
+        None => ("Abandon this Session? The agent is told to stop.".to_owned(), "Abandon", Service::abandon),
+    };
+    let id = session.id.clone();
+    Some(
+        row()
+            .key("end-confirm")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .gap(12.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(question).font(k.ty.ui).color(k.c.text_base))
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.confirming_end = None)
+                    .build(k),
+            )
+            .child(
+                Button::new(label)
+                    .variant(ButtonVariant::Danger)
+                    .on_press(move |s: &mut State| {
+                        s.confirming_end = None;
+                        s.act(&id, end);
+                    })
+                    .build(k),
+            ),
+    )
 }
 
 /// During the agent's Turn: what the human can still do. Once ended: that the agent hasn't
@@ -1141,25 +1160,35 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
 fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
     let note = match &session.ended {
         Some(Outcome::Approved) => {
-            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session.".to_owned()
+            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session, or close it \
+             now."
+                .to_owned()
         }
         Some(Outcome::Published { verdict, url }) => {
             format!("Published with the Verdict {verdict}: {url}. Close this Session when you're done.")
         }
         Some(Outcome::Closed) => {
-            "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session."
+            "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session, \
+             or close it now."
                 .to_owned()
         }
         Some(Outcome::Abandoned | Outcome::Round(_)) => {
-            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
+            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session, or close it \
+             now."
+                .to_owned()
         }
-        None if session.turn == Turn::Agent => format!(
-            "Waiting for the agent to answer Round {}. You can keep reading and drafting: new Drafts go out with \
-             Round {}.",
-            session.round.saturating_sub(1),
-            session.round
-        ),
-        None => return None,
+        None => match session.answering_round() {
+            Some(answering) => format!(
+                "Waiting for the agent to answer Round {answering}. You can keep reading and drafting: new Drafts go \
+                 out with Round {}.",
+                session.round
+            ),
+            // A co-Reviewer that opened the Session hasn't asked for the human yet.
+            None if session.turn == Turn::Agent => "The agent is still reviewing: its Drafts show here as it adds \
+                                                    them. You can read and draft meanwhile."
+                .to_owned(),
+            None => return None,
+        },
     };
     Some(
         row()
@@ -1270,11 +1299,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .child(
                 Checkbox::new(viewed)
                     .label("Viewed")
-                    .on_toggle(move |s: &mut State| {
-                        if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
-                            eprintln!("akshually: {error}");
-                        }
-                    })
+                    .on_toggle(move |s: &mut State| report(s.service.mark_viewed(&id, &path, !viewed)))
                     .build(&kc),
             )
     })
@@ -1345,7 +1370,8 @@ fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, age
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    if s.editing.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id) {
+    let at = ThreadRef::new(&session, &thread.id);
+    if s.editing.as_ref() == Some(&at) {
         return card.child(edit_composer(k, s));
     }
     card = card.child(Markdown::new(draft.body.clone()).selectable(true).build(k));
@@ -1353,15 +1379,14 @@ fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, age
         card = card.child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
     }
     card = comments(k, card, thread, &thread.comments[1..]);
-    if s.reply.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id) {
+    if s.reply.as_ref() == Some(&at) {
         return card.child(reply_composer(k, s));
     }
-    let on = |action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>| {
-        let (session, id) = (session.clone(), thread.id.clone());
-        move |s: &mut State| s.act_on_thread(&session, &id, action)
+    let on = |action: fn(&Service, &ThreadRef) -> Result<(), akshually_core::Error>| {
+        let at = at.clone();
+        move |s: &mut State| s.act_on_thread(&at, action)
     };
-    let (edit_session, edit_id) = (session.clone(), thread.id.clone());
-    let (question_session, question_id) = (session.clone(), thread.id.clone());
+    let (edit, question) = (at.clone(), at.clone());
     card.child(
         row()
             .w_full()
@@ -1372,13 +1397,13 @@ fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, age
                 // A question is a reply to the Draft, which the next Round hands to the agent.
                 Button::new("Question")
                     .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.open_reply(question_session.clone(), question_id.clone()))
+                    .on_press(move |s: &mut State| s.open_reply(question.clone()))
                     .build(k),
             )
             .child(
                 Button::new("Edit")
                     .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.open_edit(edit_session.clone(), edit_id.clone()))
+                    .on_press(move |s: &mut State| s.open_edit(edit.clone()))
                     .build(k),
             )
             .child(Button::new("Keep").variant(ButtonVariant::Submit).on_press(on(Service::keep_draft)).build(k)),
@@ -1425,20 +1450,19 @@ fn edit_composer(k: &Kit, s: &State) -> El {
 fn draft_markdown(body: &str, suggestion: Option<&str>) -> String {
     let Some(code) = suggestion else { return body.to_owned() };
     let code = if code.ends_with('\n') || code.is_empty() { code.to_owned() } else { format!("{code}\n") };
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
+    let fence = fence_for(&code);
     format!("{}\n\n{fence}suggestion\n{code}{fence}\n", body.trim_end())
 }
 
 /// Reopen for a Resolved Thread, Resolve for one that has reached the agent; nothing for a
 /// Thread still all Drafts.
 fn resolve_button(k: &Kit, thread: &Thread, session: SessionId) -> Option<El> {
-    let id = thread.id.clone();
+    let at = ThreadRef::new(&session, &thread.id);
     if thread.resolved.is_some() {
-        let reopen = move |s: &mut State| s.act_on_thread(&session, &id, Service::reopen_thread);
+        let reopen = move |s: &mut State| s.act_on_thread(&at, Service::reopen_thread);
         Some(Button::new("Reopen").variant(ButtonVariant::Ghost).on_press(reopen).build(k))
     } else if thread.comments.iter().any(|c| !c.is_draft()) {
-        let resolve = move |s: &mut State| s.act_on_thread(&session, &id, Service::resolve_thread);
+        let resolve = move |s: &mut State| s.act_on_thread(&at, Service::resolve_thread);
         Some(Button::new("Resolve").variant(ButtonVariant::Ghost).on_press(resolve).build(k))
     } else {
         None
@@ -1457,7 +1481,7 @@ fn resolved_by(thread: &Thread) -> String {
 
 /// A Resolved Thread, collapsed to one line with a way to reopen it.
 fn resolved_row(k: &Kit, thread: &Thread, session: SessionId) -> El {
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let count = thread.comments.len();
     row()
         .w_full()
@@ -1499,11 +1523,10 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
     // A Thread still all Drafts goes out whole with the next Round: nothing to reply to yet.
     let sent = thread.comments.iter().any(|c| !c.is_draft());
     if let Some((s, session)) = actions.filter(|_| sent) {
-        let replying = s.reply.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id);
-        card = if replying {
+        let at = ThreadRef::new(&session, &thread.id);
+        card = if s.reply.as_ref() == Some(&at) {
             card.child(reply_composer(k, s))
         } else {
-            let (reply_session, id) = (session.clone(), thread.id.clone());
             card.child(
                 row()
                     .w_full()
@@ -1512,7 +1535,7 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
                     .child(
                         Button::new("Reply")
                             .variant(ButtonVariant::Ghost)
-                            .on_press(move |s: &mut State| s.open_reply(reply_session.clone(), id.clone()))
+                            .on_press(move |s: &mut State| s.open_reply(at.clone()))
                             .build(k),
                     )
                     .children(resolve_button(k, thread, session)),
@@ -1604,8 +1627,7 @@ fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
     let removed = excerpt.lines().map(|l| format!("-{l}\n"));
     let added = suggestion.lines().map(|l| format!("+{l}\n"));
     let lines: String = removed.chain(added).collect();
-    let longest = lines.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
+    let fence = fence_for(&lines);
     format!("{fence}diff\n{lines}{fence}\n")
 }
 
@@ -1621,12 +1643,12 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             Anchor::File { path } => path.clone(),
             Anchor::Review => "Whole Review".to_owned(),
         };
-        let first = thread.comments.first().map(|c| c.body.lines().next().unwrap_or_default()).unwrap_or_default();
+        let first = first_line(thread);
         let count = match thread.comments.len() {
             1 => "1 Comment".to_owned(),
             n => format!("{n} Comments"),
         };
-        let (session, id) = (tab.session.id.clone(), thread.id.clone());
+        let at = ThreadRef::new(&tab.session.id, &thread.id);
         let summary = row()
             .w_full()
             .gap(8.0)
@@ -1641,7 +1663,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             .child(
                 Button::new(if expanded { "Hide" } else { "Show" })
                     .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.toggle_outdated(&session, &id))
+                    .on_press(move |s: &mut State| s.toggle_outdated(&at))
                     .build(k),
             );
         let mut card = card(k).max_w(f32::INFINITY).child(summary);
@@ -1711,7 +1733,7 @@ fn composer(k: &Kit, s: &State) -> El {
 /// Why the Forge would refuse a Comment at `anchor` in `session`, if it would.
 fn outside_diff(session: &SessionView, anchor: &Anchor) -> Option<String> {
     let Anchor::Lines { path, side, start, end } = anchor else { return None };
-    let refused = session.pull_request.is_some() && !session.changeset.takes_comment_at(anchor);
+    let refused = session.pull_request().is_some() && !session.changeset.takes_comment_at(anchor);
     let (path, side, start, end) = (path.clone(), *side, *start, *end);
     refused.then(|| akshually_core::Error::OutsideDiff { path, side, start, end }.to_string())
 }
@@ -1734,9 +1756,7 @@ fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {
         id: SessionId::new("sample"),
-        repo: "/home/me/akshually".into(),
-        branch: "feat/round-snapshots".into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "feat/round-snapshots".into() },
         agent: Some(Role::Author),
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
@@ -1763,8 +1783,7 @@ fn scene_session(s: &mut State) {
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
-        branch: branch.into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: branch.into() },
         round: 1,
         threads: Vec::new(),
         turn,
@@ -1800,9 +1819,7 @@ fn scene_threads(s: &mut State) {
     };
     let session = SessionView {
         id: SessionId::new("sample"),
-        repo: "/home/me/akshually".into(),
-        branch: "feat/round-snapshots".into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "feat/round-snapshots".into() },
         agent: Some(Role::Author),
         changeset: sample_changeset(),
         since_session_base: None,
@@ -1927,8 +1944,7 @@ fn scene_publish(s: &mut State) {
     answered.forge = Some(akshually_core::ForgeThread { id: "PRRT_5".into(), resolved: false });
     let session = SessionView {
         id: SessionId::new("pr"),
-        branch: "sso".into(),
-        pull_request: Some(pr),
+        source: Source::PullRequest(pr),
         changeset: sample_changeset(),
         round: 1,
         threads: vec![suggested.clone(), sample_thread("T3", 5..=5, "Should this return the error as is?", None)],

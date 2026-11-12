@@ -27,7 +27,15 @@ impl Harness {
     fn github(&self) -> GitHub {
         let host = HostConfig { api_base: Some(self.server.url()), ..HostConfig::new(ForgeKind::GitHub, "github.com") };
         let env = HashMap::from([("GITHUB_TOKEN".to_owned(), TOKEN.to_owned())]);
-        GitHub::new(host, CredentialSources { gh: "/nonexistent/gh".into(), glab: "/nonexistent/glab".into(), env })
+        GitHub::new(
+            host,
+            CredentialSources {
+                config: "/home/me/.config/akshually/config.toml".into(),
+                gh: "/nonexistent/gh".into(),
+                glab: "/nonexistent/glab".into(),
+                env,
+            },
+        )
     }
 
     /// `GET /user`, answering the token's login.
@@ -96,10 +104,16 @@ impl Harness {
             .create()
     }
 
-    /// The Pull Request's GraphQL id, `PR_1`.
+    /// The Pull Request's GraphQL id, `PR_1`, at its head `head1`.
     fn pull_request_id(&mut self) -> Mock {
+        self.pull_request_at("head1")
+    }
+
+    /// The Pull Request's GraphQL id, `PR_1`, with its head now at `head`.
+    fn pull_request_at(&mut self, head: &str) -> Mock {
         let variables = json!({ "owner": "acme", "repo": "web", "number": 482 });
-        self.graphql("pullRequest", variables, json!({ "repository": { "pullRequest": { "id": "PR_1" } } }))
+        let data = json!({ "repository": { "pullRequest": { "id": "PR_1", "headRefOid": head } } });
+        self.graphql("pullRequest", variables, data)
     }
 
     /// Starts the pending review `PRRV_1` on `head1`.
@@ -366,4 +380,81 @@ fn a_resolve_github_refuses_undoes_the_others_and_publishes_nothing() {
 
     [resolved, refused, undone, submit, deleted].iter().for_each(Mock::assert);
     assert!(matches!(&error, ForgeError::Api { message, .. } if message == "Could not resolve to a node"), "{error:?}");
+}
+
+// --- A submit whose answer is lost ---
+
+impl Harness {
+    /// Submitting the pending review fails with HTTP 502, as when GitHub's answer is lost.
+    fn submit_answer_lost(&mut self) -> Mock {
+        self.server
+            .mock("POST", "/graphql")
+            .match_body(Matcher::Regex(r"submitPullRequestReview\(".into()))
+            .with_status(502)
+            .with_body("Bad Gateway")
+            .create()
+    }
+
+    /// The review `PRRV_1` is in `state` on GitHub.
+    fn review_state(&mut self, state: &str) -> Mock {
+        let data = json!({ "node": { "state": state, "url": REVIEW_URL } });
+        self.graphql("node", json!({ "id": "PRRV_1" }), data)
+    }
+
+    /// Mutations that must not be sent: undoing the resolve, deleting the pending review.
+    fn never(&mut self, operation: &str) -> Mock {
+        self.server.mock("POST", "/graphql").match_body(Matcher::Regex(format!(r"\b{operation}\("))).expect(0).create()
+    }
+}
+
+#[test]
+fn a_submit_whose_answer_is_lost_but_went_through_is_published_and_not_undone() {
+    let mut h = Harness::new();
+    h.pull_request_id();
+    h.start_review();
+    h.resolution("resolveReviewThread", "PRRT_1");
+    h.submit_answer_lost();
+    let checked = h.review_state("APPROVED");
+    let untouched = [h.never("unresolveReviewThread"), h.never("deletePullRequestReview")];
+    let review = Review { verdict: Verdict::Approve, resolve: vec!["PRRT_1".into()], ..no_threads() };
+
+    let url = h.github().publish(&pull_request("maria"), &review).unwrap();
+
+    checked.assert();
+    untouched.iter().for_each(Mock::assert);
+    assert_eq!(url, REVIEW_URL);
+}
+
+#[test]
+fn a_submit_that_failed_with_the_review_still_pending_is_undone() {
+    let mut h = Harness::new();
+    h.pull_request_id();
+    h.start_review();
+    h.resolution("resolveReviewThread", "PRRT_1");
+    h.submit_answer_lost();
+    let checked = h.review_state("PENDING");
+    let undone = h.resolution("unresolveReviewThread", "PRRT_1");
+    let deleted = h.graphql(
+        "deletePullRequestReview",
+        json!({ "input": { "pullRequestReviewId": "PRRV_1" } }),
+        json!({ "deletePullRequestReview": { "pullRequestReview": { "id": "PRRV_1" } } }),
+    );
+    let review = Review { verdict: Verdict::Approve, resolve: vec!["PRRT_1".into()], ..no_threads() };
+
+    let error = h.github().publish(&pull_request("maria"), &review).unwrap_err();
+
+    [checked, undone, deleted].iter().for_each(Mock::assert);
+    assert!(matches!(error, ForgeError::Api { status: 502, .. }), "{error:?}");
+}
+
+#[test]
+fn a_pull_request_pushed_to_since_it_was_fetched_is_refused_before_anything_is_sent() {
+    let mut h = Harness::new();
+    h.pull_request_at("head2");
+    let started = h.never("addPullRequestReview");
+
+    let error = h.github().publish(&pull_request("maria"), &no_threads()).unwrap_err();
+
+    started.assert();
+    assert!(matches!(&error, ForgeError::Moved(pr) if pr == "github.com/acme/web#482"), "{error:?}");
 }

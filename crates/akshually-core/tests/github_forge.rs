@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, adapters,
 };
 use akshually_core::{BinarySizes, FileChange, Hunk, Settings, Side};
-use akshually_testkit::TestDirs;
+use akshually_testkit::{TestDirs, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 
 const TOKEN: &str = "gho_test";
@@ -71,6 +72,7 @@ impl Harness {
             None => self.dirs.path().join("no-gh-here"),
         };
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh,
             glab: "/nonexistent".into(),
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -166,7 +168,12 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
 
     let forges = adapters(
         &settings.hosts,
-        &CredentialSources { gh: "/nonexistent".into(), glab: "/nonexistent".into(), env: HashMap::new() },
+        &CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
+            gh: "/nonexistent".into(),
+            glab: "/nonexistent".into(),
+            env: HashMap::new(),
+        },
     );
 
     let url = "https://github.example.com/platform/infra/pull/97";
@@ -240,6 +247,37 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
             change("src/b.rs", Some("fn b() {}\n"), None, &[]),
         ]
     );
+}
+
+#[test]
+fn file_contents_are_fetched_in_parallel_and_kept_in_path_order() {
+    let paths: Vec<String> = (0..16).map(|n| format!("src/f{n:02}.rs")).collect();
+    let listed: Vec<String> =
+        paths.iter().rev().map(|p| format!(r#"{{ "filename": "{p}", "status": "modified" }}"#)).collect();
+    let listed = format!("[{}]", listed.join(","));
+    let api = threaded_http_server(move |target| {
+        if target.starts_with("/repos/acme/web/compare/") {
+            fixture("compare.json")
+        } else if target.starts_with("/repos/acme/web/pulls/482/files") {
+            listed.clone()
+        } else {
+            // Each read takes 100 ms: 32 of them one after the other would take 3.2 s.
+            std::thread::sleep(Duration::from_millis(100));
+            format!("{target}\n")
+        }
+    });
+    let h = Harness::new();
+    let host = HostConfig { api_base: Some(api), ..HostConfig::new(ForgeKind::GitHub, "github.com") };
+    let github = h.adapter(host, h.sources(Some(TOKEN), &[]));
+
+    let started = Instant::now();
+    let changeset = github.changeset(&sso_pull_request()).unwrap();
+
+    assert!(started.elapsed() < Duration::from_millis(1600), "took {:?}", started.elapsed());
+    assert_eq!(changeset.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), paths);
+    let first = &changeset.files[0];
+    assert_eq!(first.old.as_deref(), Some("/repos/acme/web/contents/src/f00.rs?ref=mb1\n"));
+    assert_eq!(first.new.as_deref(), Some("/repos/acme/web/contents/src/f00.rs?ref=head1\n"));
 }
 
 #[test]
@@ -389,6 +427,7 @@ fn when_gh_has_no_token_for_the_host_the_environment_is_next() {
     let github = h.adapter(
         h.host("github.com"),
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh,
             glab: "/nonexistent".into(),
             env: HashMap::from([("GITHUB_TOKEN".into(), "from-env".into())]),
@@ -419,7 +458,15 @@ fn enterprise_hosts_ask_gh_for_their_host_and_never_get_the_github_com_token() {
     let mock = h.get("/repos/acme/web/pulls/482", "ghe-from-gh", &fixture("pull.json"));
     let gh = fake_gh(h.dirs.path(), "github.example.com", "ghe-from-gh");
     let env = HashMap::from([("GITHUB_TOKEN".into(), "github-com-token".into())]);
-    let github = h.adapter(h.host("github.example.com"), CredentialSources { gh, glab: "/nonexistent".into(), env });
+    let github = h.adapter(
+        h.host("github.example.com"),
+        CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
+            gh,
+            glab: "/nonexistent".into(),
+            env,
+        },
+    );
 
     github.pull_request(&ghe).unwrap();
 
@@ -449,7 +496,13 @@ fn with_no_token_anywhere_nothing_is_sent() {
     let error = github.pull_request(&PullRequestRef { host: "github.example.com".into(), ..pr_ref() }).unwrap_err();
 
     mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host } if host == "github.example.com"), "{error:?}");
+    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "github.example.com"), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("gh auth login --hostname github.example.com"), "{message}");
+    assert!(message.contains("GH_ENTERPRISE_TOKEN"), "{message}");
+    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"github\"\n\
+                 host = \"github.example.com\"\ntoken = \"<your token>\"";
+    assert!(message.contains(paste), "{message}");
 }
 
 #[test]

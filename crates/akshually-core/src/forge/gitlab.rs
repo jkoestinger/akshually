@@ -16,8 +16,8 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment,
 };
-use super::{epoch_seconds, file_change, with_suggestion};
-use crate::{Changeset, FileChange, Hunk, Side, Verdict};
+use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
+use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitLab's maximum.
 const PAGE: &str = "100";
@@ -66,7 +66,7 @@ impl GitLab {
         if cached.is_none() {
             *cached = self.credentials.gitlab_token(&self.host);
         }
-        cached.clone().ok_or_else(|| ForgeError::NoCredentials { host: self.host.host.clone() })
+        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
     }
 
     /// `segments` appended to the REST base, each percent-encoded (so a project path's `/`
@@ -411,27 +411,34 @@ impl ForgeAdapter for GitLab {
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
         let id = &pr.id;
         let listed = self.diffs(id)?;
-        let old = |path: &str| self.file(id, path, &pr.base_sha).map(Some);
-        let new = |path: &str| self.file(id, path, &pr.head_sha).map(Some);
         // Like the local Source, renames are a deletion plus an addition. GitLab takes line
         // comments only on the lines its diff shows, so each file keeps the diff's hunks (none
         // for a diff GitLab collapsed or found too large).
-        let mut files = Vec::new();
+        let mut fetches = Vec::new();
         for diff in listed {
-            let hunks = Hunk::parse_patch(&diff.diff);
-            let mut push = |change: FileChange| files.push(FileChange { hunks: Some(hunks.clone()), ..change });
+            let hunks = Some(Hunk::parse_patch(&diff.diff));
+            let fetch = |path: &String, old: Option<&String>, new: Option<&String>| FileFetch {
+                path: path.clone(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks: hunks.clone(),
+            };
+            let (old, new) = (&diff.old_path, &diff.new_path);
             if diff.new_file {
-                push(file_change(diff.new_path.clone(), None, new(&diff.new_path)?));
+                fetches.push(fetch(new, None, Some(new)));
             } else if diff.deleted_file {
-                push(file_change(diff.old_path.clone(), old(&diff.old_path)?, None));
+                fetches.push(fetch(old, Some(old), None));
             } else if diff.renamed_file {
-                push(file_change(diff.old_path.clone(), old(&diff.old_path)?, None));
-                push(file_change(diff.new_path.clone(), None, new(&diff.new_path)?));
+                fetches.push(fetch(old, Some(old), None));
+                fetches.push(fetch(new, None, Some(new)));
             } else {
-                push(file_change(diff.new_path.clone(), old(&diff.old_path)?, new(&diff.new_path)?));
+                fetches.push(fetch(new, Some(old), Some(new)));
             }
         }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = fetch_files(fetches, |path, side| {
+            self.file(id, path, if side == Side::Old { &pr.base_sha } else { &pr.head_sha })
+        })?;
         Ok(Changeset { base: pr.base_sha.clone(), files })
     }
 
@@ -692,7 +699,19 @@ impl GitLab {
                 Some(state) => json!({ "reviewer_state": state }),
                 None => json!({}),
             };
-            self.post(&self.merge_request_url(pr, &["draft_notes", "bulk_publish"]), body)?;
+            if let Err(error) = self.post(&self.merge_request_url(pr, &["draft_notes", "bulk_publish"]), body) {
+                // Bulk publish may have gone through with its answer lost: undoing would
+                // unapprove a review that went out, and a retry would post it twice. Publish
+                // checked that no draft notes were left before; none now means they went out.
+                // One GitLab can't say about is taken to have failed, as before asking.
+                let published = error.may_have_gone_through()
+                    && self
+                        .get_json::<Vec<Value>>(&self.merge_request_url(pr, &["draft_notes"]))
+                        .is_ok_and(|left| left.is_empty());
+                if !published {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }

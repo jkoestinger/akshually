@@ -9,7 +9,7 @@ use akshually_core::forge::{
     ReviewComment, ReviewReply,
 };
 use akshually_core::{
-    Anchor, Changeset, Error, FileChange, ForgeThread, Hunk, NewComment, Outcome, Service, Side, Verdict,
+    Anchor, Changeset, Error, FileChange, ForgeThread, Hunk, NewComment, Outcome, Service, Side, ThreadRef, Verdict,
 };
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -260,8 +260,8 @@ fn the_plan_lists_new_threads_and_replies_on_existing_ones_and_publish_sends_the
     let id = svc.open_pull_request(URL).unwrap();
     let new = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 1..=3), "Needs a test.").unwrap();
     let existing = svc.session(&id).unwrap().threads[0].id.clone();
-    svc.reply_in_thread(&id, &existing, "Agreed.").unwrap();
-    svc.reply_in_thread(&id, &existing, "Okta and Entra.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &existing), "Agreed.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &existing), "Okta and Entra.").unwrap();
 
     let plan = svc.publish_plan(&id).unwrap();
 
@@ -296,7 +296,7 @@ fn a_reply_alone_is_enough_for_feedback() {
     let (svc, published) = service_for("maria");
     let id = svc.open_pull_request(URL).unwrap();
     let existing = svc.session(&id).unwrap().threads[0].id.clone();
-    svc.reply_in_thread(&id, &existing, "Done in the next PR.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &existing), "Done in the next PR.").unwrap();
 
     svc.publish(&id, Verdict::Feedback, "").unwrap();
 
@@ -351,8 +351,8 @@ fn resolving_and_reopening_existing_threads_is_listed_and_published_with_the_rev
     let id = svc.open_pull_request(URL).unwrap();
     let threads = svc.session(&id).unwrap().threads;
     let (open, resolved) = (threads[0].id.clone(), threads[1].id.clone());
-    svc.resolve_thread(&id, &open).unwrap();
-    svc.reopen_thread(&id, &resolved).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &open)).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &resolved)).unwrap();
 
     let plan = svc.publish_plan(&id).unwrap();
 
@@ -374,8 +374,8 @@ fn a_thread_resolved_and_reopened_again_before_publish_is_left_alone() {
     let (svc, published) = service_with(vec![readme_thread()]);
     let id = svc.open_pull_request(URL).unwrap();
     let thread = svc.session(&id).unwrap().threads[0].id.clone();
-    svc.resolve_thread(&id, &thread).unwrap();
-    svc.reopen_thread(&id, &thread).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &thread)).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &thread)).unwrap();
 
     let plan = svc.publish_plan(&id).unwrap();
     svc.publish(&id, Verdict::Approve, "").unwrap();

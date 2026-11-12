@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Anchor, LocalOptions, SessionId, SessionView, Source, ThreadId};
+use crate::{Anchor, LocalOptions, SessionId, SessionView, SourceRef, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -64,6 +64,12 @@ pub enum Request {
         pr: Option<String>,
         thread: ThreadId,
     },
+    /// Launching the app again while it runs: bring its window up, activated with the launch's
+    /// XDG activation token if it has one. Replies `{}` at once.
+    Show {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_token: Option<String>,
+    },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
@@ -82,10 +88,10 @@ pub enum HumanCommand {
 
 /// The Session an agent request names: the Pull Request `pr` if given, else the local work in
 /// `cwd`.
-pub fn source(cwd: PathBuf, pr: Option<String>) -> Source {
+pub fn source(cwd: PathBuf, pr: Option<String>) -> SourceRef {
     match pr {
-        Some(url) => Source::PullRequest(url),
-        None => Source::Local(cwd),
+        Some(url) => SourceRef::PullRequest(url),
+        None => SourceRef::Local(cwd),
     }
 }
 

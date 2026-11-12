@@ -5,7 +5,7 @@ mod support;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Party, Side};
+use akshually_core::{Anchor, Party, Side, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
 
@@ -103,7 +103,7 @@ fn review_format_json_prints_the_round_as_json() {
     let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
-    app.service.resolve_thread(&session.id, &akshually_core::ThreadId::new("T1")).unwrap();
+    app.service.resolve_thread(&ThreadRef::new(&session.id, &akshually_core::ThreadId::new("T1"))).unwrap();
 
     app.service.hand_over_round(&session.id).unwrap();
 
@@ -269,6 +269,27 @@ fn a_second_app_exits_and_leaves_the_running_one_serving() {
 }
 
 #[test]
+fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear_error() {
+    let app = LaunchedApp::new();
+    let repo = repo_with_work();
+    let call = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let running = app.wait_for("the Session", |s| s.sessions.len() == 1);
+    // As when one CLI runs without XDG_RUNTIME_DIR and another with it.
+    let elsewhere = TestDirs::new();
+
+    let other = app.akshually(repo.path(), &["review"]).env("AKSHUALLY_RUNTIME_DIR", elsewhere.runtime()).spawn();
+    let out = finish(other.unwrap());
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(EXIT_ERROR), "stderr: {stderr}");
+    assert!(stderr.contains("already running"), "stderr: {stderr}");
+    assert!(!elsewhere.runtime().join("akshually.sock").exists(), "a second app serves the same Sessions");
+    assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
+    app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
+    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+}
+
+#[test]
 fn test_control_is_refused_by_an_app_not_started_for_tests() {
     let app = HostedApp::start();
 
@@ -375,6 +396,21 @@ fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
     let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn opening_the_app_again_shows_the_running_ones_window_with_the_activation_token() {
+    let app = HostedApp::start();
+    let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = shown.clone();
+    app.service.on_show_window(move |token| sink.lock().unwrap().push(token));
+
+    let out = app.akshually(&std::env::temp_dir(), &[]).env("XDG_ACTIVATION_TOKEN", "launcher-token").output().unwrap();
+    let again = app.akshually(&std::env::temp_dir(), &[]).env_remove("XDG_ACTIVATION_TOKEN").output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(again.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&again.stderr));
+    assert_eq!(*shown.lock().unwrap(), vec![Some("launcher-token".to_owned()), None]);
 }
 
 #[test]

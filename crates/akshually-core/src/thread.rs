@@ -165,6 +165,13 @@ impl Comment {
     }
 }
 
+/// A backtick fence for a markdown code block holding `code`: longer than any backtick run in
+/// `code`, so the code can't close it, and at least three backticks.
+pub fn fence_for(code: &str) -> String {
+    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(longest.max(2) + 1)
+}
+
 /// What a party writes to open a Thread: a markdown body, optionally with a code suggestion.
 /// Plain text converts into one without a suggestion.
 #[derive(Clone, Debug, PartialEq, Eq)]

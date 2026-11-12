@@ -350,3 +350,33 @@ fn inbox_attention_survives_a_restart() {
 
     assert!(restored.inbox().attention);
 }
+
+#[test]
+fn a_pull_request_listed_as_assignee_and_reviewer_is_a_review_request() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Assignee, 100), github.item(1, InboxRole::Reviewer, 100)]);
+    let svc = service(&[&github]);
+
+    svc.refresh_inbox();
+
+    let inbox = svc.inbox();
+    assert_eq!(inbox.rows.iter().map(|r| r.item.role).collect::<Vec<_>>(), vec![InboxRole::Reviewer]);
+    assert!(inbox.attention, "a new review request");
+}
+
+#[test]
+fn inbox_subscribers_hear_when_a_session_changes_a_rows_state() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Reviewer, 100)]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+    let id = svc.open_pull_request("https://github.com/acme/web/pull/1").unwrap();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let sink = heard.clone();
+    svc.subscribe_inbox(move |inbox| sink.lock().unwrap().push(inbox.rows[0].state.clone()));
+
+    svc.comment(&id, Anchor::file("a.rs"), "Why b?").unwrap();
+
+    let last = heard.lock().unwrap().last().cloned();
+    assert_eq!(last, Some(InboxRowState::SessionOpen { session: id, drafts: 1 }));
+}

@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitLab, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
 use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
-use akshually_testkit::TestDirs;
+use akshually_testkit::{TestDirs, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value, json};
 
@@ -60,6 +61,7 @@ impl Harness {
             None => self.dirs.path().join("no-glab-here"),
         };
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh: self.dirs.path().join("no-gh-here"),
             glab,
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -133,7 +135,12 @@ fn configured_gitlab_hosts_serve_their_own_urls() {
     let file = dirs.path().join("config.toml");
     std::fs::write(&file, "[[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\n").unwrap();
     let settings = Settings::load(&file).unwrap();
-    let sources = CredentialSources { gh: "/nonexistent".into(), glab: "/nonexistent".into(), env: HashMap::new() };
+    let sources = CredentialSources {
+        config: "/home/me/.config/akshually/config.toml".into(),
+        gh: "/nonexistent".into(),
+        glab: "/nonexistent".into(),
+        env: HashMap::new(),
+    };
 
     let forges = adapters(&settings.hosts, &sources);
 
@@ -207,6 +214,39 @@ impl Harness {
             .with_body(body)
             .create()
     }
+}
+
+#[test]
+fn file_contents_are_fetched_in_parallel_and_kept_in_path_order() {
+    let paths: Vec<String> = (0..16).map(|n| format!("src/f{n:02}.rs")).collect();
+    let diff = |p: &String| {
+        format!(
+            r#"{{ "old_path": "{p}", "new_path": "{p}", "new_file": false, "renamed_file": false,
+                "deleted_file": false, "diff": "@@ -1 +1 @@\n-a\n+b\n" }}"#
+        )
+    };
+    let listed = format!("[{}]", paths.iter().rev().map(diff).collect::<Vec<_>>().join(","));
+    let api = threaded_http_server(move |target| {
+        if target.starts_with("/projects/platform%2Finfra/merge_requests/97/diffs") {
+            listed.clone()
+        } else {
+            // Each read takes 100 ms: 32 of them one after the other would take 3.2 s.
+            std::thread::sleep(Duration::from_millis(100));
+            format!("{target}\n")
+        }
+    });
+    let h = Harness::new();
+    let host = HostConfig { api_base: Some(api), ..HostConfig::new(ForgeKind::GitLab, "gitlab.example.com") };
+    let gitlab = GitLab::new(host, h.sources(Some(("gitlab.example.com", TOKEN)), &[]));
+
+    let started = Instant::now();
+    let changeset = gitlab.changeset(&rotate_creds()).unwrap();
+
+    assert!(started.elapsed() < Duration::from_millis(1600), "took {:?}", started.elapsed());
+    assert_eq!(changeset.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), paths);
+    let raw = "/projects/platform%2Finfra/repository/files/src%2Ff00.rs/raw";
+    assert_eq!(changeset.files[0].old, Some(format!("{raw}?ref=mb1\n")));
+    assert_eq!(changeset.files[0].new, Some(format!("{raw}?ref=head1\n")));
 }
 
 #[test]
@@ -514,7 +554,12 @@ fn with_no_token_anywhere_nothing_is_sent() {
     let error = h.fetch_with("gitlab.example.com", sources, None).unwrap_err();
 
     mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host } if host == "gitlab.example.com"), "{error:?}");
+    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "gitlab.example.com"), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("glab auth login --hostname gitlab.example.com"), "{message}");
+    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"gitlab\"\n\
+                 host = \"gitlab.example.com\"\ntoken = \"<your token>\"";
+    assert!(message.contains(paste), "{message}");
 }
 
 #[test]
@@ -535,8 +580,8 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
     let id = svc.open_pull_request("https://gitlab.example.com/platform/infra/-/merge_requests/97/diffs").unwrap();
 
     let session = svc.session(&id).expect("the Session is open");
-    assert_eq!(session.pull_request, Some(rotate_creds()));
-    assert_eq!(session.branch, "rotate-creds");
+    assert_eq!(session.pull_request(), Some(&rotate_creds()));
+    assert_eq!(session.branch(), "rotate-creds");
     let paths: Vec<_> = session.changeset.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, ["docs/new.md", "src/a.rs"]);
     let thread = &session.threads[0];
@@ -989,6 +1034,55 @@ fn a_failure_part_way_deletes_the_draft_notes_and_undoes_resolves_and_the_approv
 
     undone.iter().for_each(Mock::assert);
     assert!(matches!(&error, ForgeError::Api { status: 429, .. }), "{error:?}");
+}
+
+impl Harness {
+    /// A Publish of a summary and an approval whose bulk publish fails with HTTP 502, as when
+    /// GitLab's answer is lost.
+    fn publish_whose_answer_is_lost(&mut self) {
+        self.before_publish("19.2.0");
+        self.approvals(true, false);
+        self.draft_note(json!({ "note": "Ship it." }), 501);
+        self.approve();
+        self.server
+            .mock("POST", format!("{MR}/draft_notes/bulk_publish").as_str())
+            .with_status(502)
+            .with_body("Bad Gateway")
+            .create();
+    }
+}
+
+#[test]
+fn a_bulk_publish_whose_answer_is_lost_but_went_through_is_published_and_not_undone() {
+    let mut h = Harness::new();
+    // No draft notes left: they were published.
+    h.publish_whose_answer_is_lost();
+    let untouched = [
+        h.server.mock("DELETE", Matcher::Any).expect(0).create(),
+        h.server.mock("POST", format!("{MR}/unapprove").as_str()).expect(0).create(),
+    ];
+
+    let url = h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "Ship it.")).unwrap();
+
+    untouched.iter().for_each(Mock::assert);
+    assert_eq!(url, MR_URL);
+}
+
+#[test]
+fn a_bulk_publish_that_failed_with_the_draft_notes_still_there_is_undone() {
+    let mut h = Harness::new();
+    h.publish_whose_answer_is_lost();
+    // Read again after the failure, the draft note is still there.
+    h.get(&format!("{MR}/draft_notes"), TOKEN, r#"[{ "id": 501, "note": "Ship it." }]"#);
+    let undone = [
+        h.server.mock("DELETE", format!("{MR}/draft_notes/501").as_str()).with_status(204).create(),
+        h.server.mock("POST", format!("{MR}/unapprove").as_str()).with_status(201).with_body("{}").create(),
+    ];
+
+    let error = h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "Ship it.")).unwrap_err();
+
+    undone.iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::Api { status: 502, .. }), "{error:?}");
 }
 
 #[test]

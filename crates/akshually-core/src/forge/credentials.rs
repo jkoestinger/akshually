@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::HostConfig;
+use super::{ForgeError, HostConfig};
 
 /// Where tokens come from, injectable so tests use a fake `gh`/`glab` and a controlled
 /// environment.
@@ -17,14 +17,21 @@ pub struct CredentialSources {
     pub glab: PathBuf,
     /// The environment variables to read tokens from.
     pub env: HashMap<String, String>,
+    /// akshually's config file, where the human can paste a token as the last resort.
+    pub config: PathBuf,
 }
 
 impl CredentialSources {
-    /// The `gh` and `glab` on `PATH` and this process's environment.
+    /// The `gh` and `glab` on `PATH`, this process's environment and its config file.
     pub fn from_env() -> Self {
         let env =
             std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
-        CredentialSources { gh: "gh".into(), glab: "glab".into(), env }
+        CredentialSources { gh: "gh".into(), glab: "glab".into(), env, config: crate::Settings::file_from_env() }
+    }
+
+    /// Why there's no token for `host`, telling the human every way to give one.
+    pub(crate) fn none_for(&self, host: &HostConfig) -> ForgeError {
+        ForgeError::NoCredentials { host: host.host.clone(), kind: host.kind, config: self.config.clone() }
     }
 
     /// A GitHub token for `host`: `gh`'s, then `GITHUB_TOKEN` for github.com (for GitHub
