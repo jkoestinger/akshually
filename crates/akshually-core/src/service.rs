@@ -238,7 +238,14 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            session.view = view;
+            // Threads are anchored in the shown Changeset, so they follow it.
+            let mut threads = std::mem::take(&mut session.threads);
+            reanchor(&mut threads, session.shown());
+            session.threads = threads;
+        }
         inner.notify();
         Ok(())
     }

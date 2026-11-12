@@ -676,6 +676,27 @@ fn excluded_untracked_files_stay_out_of_the_view_since_the_session_base() {
 }
 
 #[test]
+fn toggling_the_view_re_anchors_threads_in_the_shown_changeset() {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "fn x() {}\n").commit_all("base");
+    repo.branch("feature").write("lib.rs", "// human\nfn x() {}\n");
+    let svc = Service::new();
+    svc.start(repo.path()).unwrap();
+    repo.write("lib.rs", "// human\nfn y() {}\n");
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    // Line 2 on the old side since the Session base is line 1 at the merge-base.
+    svc.comment(&id, Anchor::lines(Side::Old, "lib.rs", 2..=2), "Keep x").unwrap();
+
+    svc.show(&id, ChangesetView::Full).unwrap();
+
+    let t = &svc.session(&id).unwrap().threads[0];
+    assert_eq!(t.anchor, Anchor::lines(Side::Old, "lib.rs", 1..=1));
+    assert!(!t.outdated);
+    svc.show(&id, ChangesetView::SinceSessionBase).unwrap();
+    assert_eq!(svc.session(&id).unwrap().threads[0].anchor, Anchor::lines(Side::Old, "lib.rs", 2..=2));
+}
+
+#[test]
 fn start_outside_a_repository_fails() {
     let dir = TestDirs::new();
 
