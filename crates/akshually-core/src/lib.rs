@@ -4,6 +4,7 @@
 //! the CLI, which talks to the running app over the local channel in [`ipc`] (ADR 0002).
 
 mod changeset;
+pub mod forge;
 pub mod git;
 pub mod ipc;
 mod paths;
@@ -29,4 +30,8 @@ pub enum Error {
     EmptyComment,
     #[error("there are no Drafts to hand over")]
     NoDrafts,
+    #[error("{0} isn't a Pull Request on any configured Forge")]
+    NotAPullRequest(String),
+    #[error(transparent)]
+    Forge(#[from] forge::ForgeError),
 }

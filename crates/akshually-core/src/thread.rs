@@ -90,11 +90,13 @@ pub struct Thread {
 }
 
 /// Who wrote a Comment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Party {
     Human,
     Agent,
+    /// Someone on the Forge, by login: a Comment that was on the Pull Request already.
+    Other(String),
 }
 
 /// A single message inside a Thread.
@@ -103,13 +105,14 @@ pub struct Comment {
     pub author: Party,
     /// Markdown.
     pub body: String,
-    /// The Round that carried it to the other side; `None` while it's a Draft.
+    /// The Round that carried it to the other side; `None` while it's a Draft, and for a
+    /// Comment that was on the Forge already.
     pub round: Option<u32>,
 }
 
 impl Comment {
     pub fn is_draft(&self) -> bool {
-        self.round.is_none()
+        self.round.is_none() && !matches!(self.author, Party::Other(_))
     }
 }
 

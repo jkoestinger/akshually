@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use akshually_core::ipc::{BindError, Server};
-use akshually_core::{Outcome, Paths, Service};
+use akshually_core::{Outcome, Paths, Service, forge};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -79,8 +79,18 @@ fn review() -> Result<ExitCode> {
     Ok(ExitCode::from(code))
 }
 
+/// An adapter per Forge host in the config file. A broken config leaves github.com only, so the
+/// app still opens for local reviews.
+fn forges() -> Vec<Box<dyn forge::ForgeAdapter>> {
+    let config = forge::Config::load(&forge::Config::path()).unwrap_or_else(|error| {
+        eprintln!("akshually: {error}; using github.com only");
+        forge::Config::default()
+    });
+    forge::adapters(&config, &forge::CredentialSources::from_env())
+}
+
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
-    let service = Arc::new(Service::new());
+    let service = Arc::new(Service::new().with_forges(forges()));
     if !headless && akshually_ui::is_headless_run(&rune_args) {
         // A headless render (`--snap`, ...) of the UI alone: no socket, no state.
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;

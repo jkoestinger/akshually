@@ -1,0 +1,30 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": { "hasNextPage": true, "endCursor": "CURSOR1" },
+          "nodes": [
+            {
+              "id": "PRRT_1", "isResolved": false, "isOutdated": false, "path": "src/a.rs", "subjectType": "LINE",
+              "line": 1, "originalLine": 1, "startLine": null, "originalStartLine": null,
+              "diffSide": "RIGHT", "startDiffSide": null,
+              "comments": { "nodes": [
+                { "body": "Why the rename?", "author": { "login": "lee" }, "diffHunk": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" },
+                { "body": "Clearer.", "author": { "login": "maria" }, "diffHunk": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" }
+              ] }
+            },
+            {
+              "id": "PRRT_2", "isResolved": true, "isOutdated": false, "path": "old.txt", "subjectType": "LINE",
+              "line": 5, "originalLine": 5, "startLine": 3, "originalStartLine": 3,
+              "diffSide": "LEFT", "startDiffSide": "LEFT",
+              "comments": { "nodes": [
+                { "body": "Still needed?", "author": null, "diffHunk": "@@ -1,5 +0,0 @@" }
+              ] }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -25,11 +25,16 @@ rune-kit = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfb
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+mockito = "1.7"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
+toml = "1.2"
+# Blocking HTTP for the Forge adapters: no async runtime in the core.
+ureq = { version = "3.5", features = ["json"] }
+url = "2.5"
 
 # Cargo ignores a dependency's [patch], so Rune's are repeated here, all at the pinned rev.
 # Re-check `[patch.crates-io]` in Rune's root Cargo.toml whenever the rev is bumped.

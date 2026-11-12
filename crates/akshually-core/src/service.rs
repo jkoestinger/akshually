@@ -9,8 +9,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset};
+use crate::forge::{ForgeAdapter, PullRequest};
 use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
 use crate::{Error, git};
+
+mod pull_request;
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,9 +65,12 @@ impl ReviewRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: SessionId,
-    /// The working tree root: each worktree is its own Session.
+    /// The working tree root: each worktree is its own Session. Empty for a Pull Request.
     pub repo: PathBuf,
+    /// The branch under Review; a Pull Request's head branch.
     pub branch: String,
+    /// The Pull Request under Review, which is the Session's identity; `None` for local work.
+    pub pull_request: Option<PullRequest>,
     pub changeset: Changeset,
     /// The Round being drafted: 1 until the first handover, then one more after each.
     pub round: u32,
@@ -138,6 +144,8 @@ impl Inner {
 pub struct Service {
     // One lock for Sessions and subscribers, so subscribers see changes in order.
     inner: Mutex<Inner>,
+    /// One per Forge host, asked in order which one serves a Pull Request URL.
+    forges: Vec<Box<dyn ForgeAdapter>>,
 }
 
 impl Service {
@@ -190,7 +198,15 @@ impl Service {
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = SessionView { id: id.clone(), repo, branch, changeset, round: 1, threads: Vec::new() };
+                let view = SessionView {
+                    id: id.clone(),
+                    repo,
+                    branch,
+                    pull_request: None,
+                    changeset,
+                    round: 1,
+                    threads: Vec::new(),
+                };
                 inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
                 id
             }
