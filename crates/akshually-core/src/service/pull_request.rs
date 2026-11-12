@@ -1,14 +1,17 @@
 //! Pull Request Sessions: the Changeset and existing Threads come from a Forge adapter.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use super::{ChangesetView, Outcome, Service, Session, SessionId, SessionView, Turn, Verdict};
+use super::{
+    Call, ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Turn, Verdict, Waiter,
+    check_comment,
+};
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
-use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, ForgeThread, NewComment, Party, Thread, ThreadId};
 use crate::{Changeset, Error};
 
 impl Service {
@@ -23,14 +26,70 @@ impl Service {
     /// displayed: the human asked for it, and has now seen it as far as the Inbox goes. Blocks
     /// on the Forge.
     pub fn open_pull_request(&self, url: &str) -> Result<SessionId, Error> {
-        let (id, pr) = self.open_pull_request_session(url)?;
+        let (id, pr) = self.open_pull_request_session(url, None)?;
         let mut inner = self.lock();
         inner.inbox.saved.looked_at(&pr);
         inner.notify_inbox();
         Ok(id)
     }
 
-    fn open_pull_request_session(&self, url: &str) -> Result<(SessionId, PullRequestRef), Error> {
+    /// Agent, as co-Reviewer: opens a Thread on the Pull Request at `url` with `comment`
+    /// (markdown, plus any suggestion) as an agent Draft, for the human to keep, edit or
+    /// discard. Opens the Pull Request's Session if needed, without taking the human's view.
+    /// Blocks on the Forge.
+    pub fn draft(&self, url: &str, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
+        let comment = comment.into();
+        check_comment(&anchor, &comment)?;
+        let (id, _) = self.open_pull_request_session(url, Some(Role::CoReviewer))?;
+        let mut inner = self.lock();
+        let at = inner.position(&id)?;
+        let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        session.join(Role::CoReviewer)?;
+        let thread = session.open_thread(anchor, comment, Party::Agent)?;
+        inner.notify();
+        Ok(thread)
+    }
+
+    /// Agent, as co-Reviewer: hands its Drafts on the Pull Request at `url` to the human, and
+    /// waits for what the human Published, or Abandoned (see `review`).
+    pub(super) fn co_review(&self, url: &str, ack: bool) -> Result<PendingReview, Error> {
+        let (id, _) = self.open_pull_request_session(url, Some(Role::CoReviewer))?;
+        let (tx, rx) = mpsc::channel();
+        let mut inner = self.lock();
+        let at = inner.position(&id)?;
+        inner.next_waiter += 1;
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack };
+        let waiter_id = waiter.id;
+        let session = &mut inner.sessions[at];
+        if session.waiter.is_some() {
+            return Err(Error::Busy);
+        }
+        // Ended with nothing left to collect: the human Published before any agent joined.
+        if session.view.ended.is_some() && session.queued.is_empty() {
+            return Err(Error::Ended);
+        }
+        session.join(Role::CoReviewer)?;
+        inner.wait_on(at, waiter);
+        // An outcome waiting for this call ends the Session.
+        inner.reap();
+        inner.notify();
+        Ok(PendingReview {
+            call: Call { session: id, waiter: waiter_id, inner: Arc::downgrade(&self.inner) },
+            outcome: rx,
+        })
+    }
+
+    /// The Session of the Pull Request at `url`, opened if needed. The human (`agent: None`)
+    /// gets it displayed; an agent joins it in its `role`, and a Session it opens starts in
+    /// the agent's Turn, out of the human's way.
+    pub(super) fn open_pull_request_session(
+        &self,
+        url: &str,
+        agent: Option<Role>,
+    ) -> Result<(SessionId, PullRequestRef), Error> {
         let (forge, pr) = self
             .forges
             .iter()
@@ -40,11 +99,16 @@ impl Service {
             let mut sessions = sessions.iter();
             sessions.find(|s| s.view.pull_request.as_ref().is_some_and(|p| p.id == pr)).map(|s| s.view.id.clone())
         };
+        let found = |id: SessionId| -> Result<(SessionId, PullRequestRef), Error> {
+            if agent.is_none() {
+                self.display(&id)?;
+            }
+            Ok((id, pr.clone()))
+        };
         // Bound first, so the lock is released before `display` takes it again.
         let already = open(&self.lock().sessions);
         if let Some(id) = already {
-            self.display(&id)?;
-            return Ok((id, pr));
+            return found(id);
         }
 
         // Not holding the lock: the Forge may take a while.
@@ -56,8 +120,7 @@ impl Service {
         // Another call may have opened it meanwhile.
         if let Some(id) = open(&inner.sessions) {
             drop(inner);
-            self.display(&id)?;
-            return Ok((id, pr));
+            return found(id);
         }
         let threads: Vec<Thread> = remote
             .into_iter()
@@ -76,14 +139,17 @@ impl Service {
             view: ChangesetView::Full,
             round: 1,
             threads,
-            // No agent: the human drafts until Publish.
-            turn: Turn::Human,
+            agent,
+            // The human drafts until Publish; an agent that opens it is still reviewing.
+            turn: if agent.is_some() { Turn::Agent } else { Turn::Human },
             ..SessionView::default()
         };
         let threads_opened = view.threads.len() as u32;
         inner.sessions.push(Session { view, threads_opened, ..Session::default() });
-        inner.displayed = Some(id.clone());
-        inner.inbox.displayed = false;
+        if agent.is_none() {
+            inner.displayed = Some(id.clone());
+            inner.inbox.displayed = false;
+        }
         inner.notify();
         Ok((id, pr))
     }
@@ -110,7 +176,8 @@ impl Service {
         let at = inner.position(id)?;
         inner.sessions[at].publishing = false;
         let url = sent?;
-        let view = &mut inner.sessions[at].view;
+        let session = &mut inner.sessions[at];
+        let view = &mut session.view;
         // Only what was sent: the human may have drafted more meanwhile.
         for sent in &drafts.kept {
             let Some(thread) = view.threads.iter_mut().find(|t| t.id == sent.id) else { continue };
@@ -126,7 +193,9 @@ impl Service {
                 forge.resolved = resolved;
             }
         }
-        view.ended = Some(Outcome::Published { verdict, url: url.clone() });
+        // A co-Reviewer learns what went out; without one, the human closes the Session.
+        session.conclude(Outcome::Published { verdict, url: url.clone() });
+        inner.reap();
         inner.inbox.saved.published(&pr.id);
         inner.notify();
         inner.notify_inbox();
@@ -151,7 +220,8 @@ impl Service {
     }
 
     /// Human: closes a Pull Request Session, Published or not; unpublished Drafts go with it.
-    /// No agent is waiting on it, so nothing is told.
+    /// A co-Reviewer is told the Session was Abandoned, unless it is still to collect what the
+    /// human Published (`Error::Ended`).
     pub fn close(&self, id: &SessionId) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
@@ -161,6 +231,10 @@ impl Service {
         }
         if session.publishing {
             return Err(Error::Publishing);
+        }
+        if session.view.agent.is_some() {
+            drop(inner);
+            return self.end(id, Outcome::Abandoned);
         }
         session.finished = true;
         inner.reap();

@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{LocalOptions, Outcome, Paths, ThreadId};
+use crate::{Anchor, LocalOptions, NewComment, Outcome, Paths, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -32,12 +32,43 @@ impl Connection {
     /// hands the outcome to `deliver` (which prints it). It is acknowledged only once `deliver`
     /// succeeds; until then the app keeps it for the next `review` call.
     pub fn review(
-        mut self,
+        self,
         cwd: &Path,
         local: LocalOptions,
         deliver: impl FnOnce(&Outcome) -> io::Result<()>,
     ) -> Result<Outcome, ClientError> {
-        self.send(Request::Review { cwd: cwd.to_owned(), local })?;
+        self.wait(Request::Review { cwd: cwd.to_owned(), local, pr: None }, deliver)
+    }
+
+    /// As co-Reviewer of the Pull Request at `url`, hands the agent's Drafts to the human and
+    /// blocks until the human Publishes or abandons, like `review`.
+    pub fn co_review(
+        self,
+        url: &str,
+        deliver: impl FnOnce(&Outcome) -> io::Result<()>,
+    ) -> Result<Outcome, ClientError> {
+        let request = Request::Review { cwd: Default::default(), local: LocalOptions::default(), pr: Some(url.into()) };
+        self.wait(request, deliver)
+    }
+
+    /// Adds a co-Reviewer Draft at `anchor` on the Pull Request at `url`, and returns its Thread.
+    pub fn draft(self, url: &str, anchor: Anchor, comment: NewComment) -> Result<ThreadId, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Drafted {
+            thread: ThreadId,
+        }
+        let NewComment { body, suggestion } = comment;
+        let request = Request::Draft { pr: url.to_owned(), anchor, body, suggestion };
+        self.call::<Drafted>(request).map(|d| d.thread)
+    }
+
+    /// Sends a blocking `review` request, hands its outcome to `deliver`, then acknowledges it.
+    fn wait(
+        mut self,
+        request: Request,
+        deliver: impl FnOnce(&Outcome) -> io::Result<()>,
+    ) -> Result<Outcome, ClientError> {
+        self.send(request)?;
         let mut reader = BufReader::new(self.stream.try_clone()?);
         let outcome: Outcome = read_reply(&mut reader)?;
         deliver(&outcome)?;

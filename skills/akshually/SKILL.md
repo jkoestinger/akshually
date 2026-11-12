@@ -1,6 +1,6 @@
 ---
 name: akshually
-description: Get a human's review of your local code changes with the `akshually` CLI, one Round of Threads at a time until they approve. Use when you're asked to have your work reviewed, to wait for review, or to use akshually.
+description: Get a human's review of your local code changes with the `akshually` CLI, one Round of Threads at a time until they approve, or hand a human your review of a Pull Request as Drafts. Use when you're asked to have your work reviewed, to wait for review, to co-review a Pull Request with the human, or to use akshually.
 ---
 
 # akshually
@@ -29,6 +29,11 @@ The human can take minutes or hours. Run `review` without a timeout if your shel
   - `--format json`: print the outcome as one line of JSON instead of markdown: `{"outcome":"approved"}`, `{"outcome":"abandoned"}`, or `{"outcome":"round","number":N,"threads":[…]}`, each Thread with its `id`, `anchor`, `excerpt`, `comments` (`author`, `body`, `round`, optional `suggestion`), `resolved`, `outdated` and `reopened`.
 - `akshually reply <thread> <body>`: answer a Thread, e.g. `akshually reply T3 "Renamed it to parse_range."`. The body is markdown. The human sees it at once; the call returns at once.
 - `akshually resolve <thread>`: mark a Thread Resolved when you've dealt with it. The human can reopen it.
+- `akshually draft --pr <url> (--lines PATH:N[-M] [--old] | --file PATH | --review) <body>`: as the human's **co-Reviewer** of a Pull Request, add a **Draft** to it, e.g. `akshually draft --pr https://github.com/acme/web/pull/7 --lines src/lib.rs:2-3 "Validate the state first."`. It opens the Pull Request in the app if needed, prints the Draft's Thread ID and returns at once.
+  - `--lines`: lines of a file, 1-based and inclusive, in the Pull Request's new code (`--old`: in its base). `--file`: the whole file. `--review`: the Review as a whole.
+  - The body is markdown; `-` reads it from stdin. A ```` ```suggestion ```` fence in it proposes the exact replacement for new-side `--lines`.
+  - Your Drafts are only proposals: the human keeps, edits or discards each one, and only what they keep is published, under their name.
+- `akshually review --pr <url> [--format markdown|json]`: once you've added your Drafts, hand them to the human and **block** until they finish the Review. Exits `5` when they Publish it, printing the Verdict and the review's link (`{"outcome":"published","verdict":"approve","url":"…"}` with `--format json`), or `3` when they close it without publishing. Report that back; there is nothing left to do on the Pull Request.
 - `akshually agent-help`: print this guide.
 
 `reply` and `resolve` act on Threads already handed to you in a Round. They fail with exit 1 when there is no Session for this repository and branch, or no such Thread.
@@ -58,5 +63,6 @@ Thread IDs stay the same across Rounds, so `T3` in Round 2 is the Thread `T3` fr
 | `0` | Approved: the Review is over. Any command that returns at once also exits 0 on success. |
 | `1` | Error, explained on stderr after `akshually:`. |
 | `2` | Usage error: a wrong subcommand, flag or combination. |
-| `3` | Abandoned: stop working on this change. |
+| `3` | Abandoned: stop working on this change. For `review --pr`, the human closed the Pull Request without publishing. |
 | `4` | A Round was handed over: address it and run `review` again. |
+| `5` | Published (`review --pr` only): the human published their Review of the Pull Request; stdout has the Verdict and the link. |

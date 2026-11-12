@@ -13,8 +13,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::ipc::{self, AppState, HumanCommand, Server};
-use akshually_core::{Paths, Service, SessionView};
+use akshually_core::{Changeset, FileChange, Paths, Service, SessionView, Verdict};
 use akshually_testkit::{TestDirs, wait_until};
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,8 +45,17 @@ pub struct HostedApp {
 
 impl HostedApp {
     pub fn start() -> Self {
+        Self::serving(Service::new())
+    }
+
+    /// An app serving the one Pull Request of [`FakeForge`], at [`PR_URL`].
+    pub fn with_pull_request() -> Self {
+        Self::serving(Service::new().with_forges(vec![Box::new(FakeForge)]))
+    }
+
+    fn serving(service: Service) -> Self {
         let dirs = TestDirs::new();
-        let service = Arc::new(Service::new());
+        let service = Arc::new(service);
         let server = Server::bind(&paths(&dirs), service.clone()).expect("bind the socket");
         std::thread::spawn(move || server.serve());
         HostedApp { dirs, service }
@@ -65,6 +75,64 @@ impl HostedApp {
     /// Waits until a Session for the repository at `repo` is open.
     pub fn wait_for_session(&self, repo: &Path) -> SessionView {
         wait_until(TIMEOUT, "the Session to open", || self.service.sessions().into_iter().find(|s| s.repo == repo))
+    }
+
+    /// Waits until the co-Reviewer's `review` call waits on the Pull Request's Session.
+    pub fn wait_for_co_reviewer(&self) -> SessionView {
+        wait_until(TIMEOUT, "the co-Reviewer to wait", || {
+            self.service.sessions().into_iter().find(|s| s.pull_request.is_some() && s.agent_waiting)
+        })
+    }
+}
+
+/// The Pull Request [`FakeForge`] serves.
+pub const PR_URL: &str = "https://forge.test/acme/web/pull/7";
+
+/// A Forge with one Pull Request, `acme/web#7`, changing `login.rs` and `README.md`. Publish
+/// accepts any review; nothing goes over the network.
+pub struct FakeForge;
+
+fn pr_ref() -> PullRequestRef {
+    PullRequestRef { host: "forge.test".into(), repo: "acme/web".into(), number: 7 }
+}
+
+impl ForgeAdapter for FakeForge {
+    fn recognise(&self, url: &str) -> Option<PullRequestRef> {
+        url.starts_with(PR_URL).then(pr_ref)
+    }
+
+    fn pull_request(&self, _: &PullRequestRef) -> Result<PullRequest, ForgeError> {
+        Ok(PullRequest {
+            id: pr_ref(),
+            url: PR_URL.into(),
+            title: "Add SSO login".into(),
+            author: "maria".into(),
+            head_branch: "sso".into(),
+            head_sha: "headsha".into(),
+            base_sha: "basesha".into(),
+        })
+    }
+
+    fn changeset(&self, _: &PullRequest) -> Result<Changeset, ForgeError> {
+        Ok(Changeset {
+            base: "basesha".into(),
+            files: vec![
+                FileChange::text("login.rs", Some("fn login() {}\n"), Some("fn login() {\n    sso();\n}\n")),
+                FileChange::text("README.md", Some("# Web\n"), Some("# Web\n\nSSO.\n")),
+            ],
+        })
+    }
+
+    fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
+        Ok(Vec::new())
+    }
+
+    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        Ok(Verdict::ALL.to_vec())
+    }
+
+    fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
+        Ok(format!("{PR_URL}#pullrequestreview-1"))
     }
 }
 

@@ -4,9 +4,9 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use akshually_core::{Anchor, Service, SessionId, Side};
+use akshually_core::{Anchor, Service, SessionId, Side, Verdict};
 use akshually_testkit::TestRepo;
-use support::{HostedApp, finish};
+use support::{HostedApp, PR_URL, finish};
 
 /// The shipped skill, which `agent-help` prints.
 const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
@@ -94,14 +94,24 @@ fn exit_code_reached_for(code: i32) -> Option<i32> {
             service.comment(id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
             service.hand_over_round(id).unwrap();
         }),
+        5 => co_review_published(),
         _ => None,
     }
+}
+
+/// Runs `review --pr` and lets the human Publish the Pull Request.
+fn co_review_published() -> Option<i32> {
+    let app = HostedApp::with_pull_request();
+    let child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
+    let session = app.wait_for_co_reviewer();
+    app.service.publish(&session.id, Verdict::Approve, "").unwrap();
+    finish(child).status.code()
 }
 
 #[test]
 fn every_exit_code_the_skill_documents_is_one_the_cli_exits_with() {
     let documented = documented_exit_codes();
-    assert_eq!(documented, BTreeSet::from([0, 1, 2, 3, 4]), "every exit code the CLI has");
+    assert_eq!(documented, BTreeSet::from([0, 1, 2, 3, 4, 5]), "every exit code the CLI has");
     for code in documented {
         assert_eq!(exit_code_reached_for(code), Some(code), "exit code {code}");
     }
