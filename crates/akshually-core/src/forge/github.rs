@@ -11,28 +11,37 @@ use ureq::http::Response;
 use ureq::{Body, RequestBuilder};
 use url::Url;
 
+use super::http::{Client, Dialect, host_matches, not_found_as};
 use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use super::{FileFetch, REQUEST_TIMEOUT, epoch_seconds, fetch_files, with_suggestion};
+use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
 use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
-/// GitHub serves raw contents up to 100 MB.
-const MAX_FILE: u64 = 100 * 1024 * 1024;
+
+/// The REST API version every request asks for.
+const API_VERSION: &str = "2022-11-28";
+
+/// How GitHub's API takes a token and words an error.
+const DIALECT: Dialect = Dialect {
+    token: CredentialSources::github_token,
+    authorization: |token| format!("Bearer {token}"),
+    error_message: |body| {
+        #[derive(Deserialize)]
+        struct Message {
+            message: String,
+        }
+        serde_json::from_str::<Message>(&body).map_or(body, |m| m.message)
+    },
+};
 
 /// The [`ForgeAdapter`] for one GitHub host.
 pub struct GitHub {
-    host: HostConfig,
-    /// The REST API's base URL, without a trailing `/`.
-    api: String,
+    client: Client,
     graphql: String,
-    credentials: CredentialSources,
-    /// Resolved on first use; forgotten when the host refuses it, so a fresh login is picked up.
-    token: Mutex<Option<String>>,
-    agent: ureq::Agent,
     /// The last `update` answer per Pull Request, to poll again conditionally.
     polls: Mutex<HashMap<PullRequestRef, Polled>>,
 }
@@ -61,72 +70,25 @@ impl GitHub {
             Some(root) => format!("{root}/api/graphql"),
             None => format!("{api}/graphql"),
         };
-        let agent = ureq::Agent::config_builder()
-            // Read 4xx/5xx bodies for GitHub's error messages.
-            .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
-        GitHub { host, api, graphql, credentials, token: Mutex::new(None), agent, polls: Mutex::default() }
+        GitHub { client: Client::new(host, &api, credentials, DIALECT), graphql, polls: Mutex::default() }
     }
 
-    fn token(&self) -> Result<String, ForgeError> {
-        let mut cached = self.token.lock().unwrap_or_else(|e| e.into_inner());
-        if cached.is_none() {
-            *cached = self.credentials.github_token(&self.host);
-        }
-        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
-    }
-
-    /// `segments` appended to the REST base, each percent-encoded.
-    fn endpoint(&self, segments: &[&str]) -> Url {
-        let mut url = Url::parse(&self.api).expect("the API base is a URL");
-        url.path_segments_mut().expect("the API base is a URL with a path").pop_if_empty().extend(segments);
-        url
-    }
-
+    /// Sends `request` asking for `accept`, with the headers GitHub wants on every request.
     fn send<B>(
         &self,
         request: RequestBuilder<B>,
         accept: &str,
         send: impl FnOnce(RequestBuilder<B>) -> Result<Response<Body>, ureq::Error>,
     ) -> Result<Response<Body>, ForgeError> {
-        let request = request
-            .header("Authorization", format!("Bearer {}", self.token()?))
-            .header("Accept", accept)
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        let mut response = send(request).map_err(|e| self.http(e))?;
-        let status = response.status().as_u16();
-        // 304 answers a conditional request: unchanged.
-        if (200..300).contains(&status) || status == 304 {
-            return Ok(response);
-        }
-        let host = self.host.host.clone();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        Err(match status {
-            401 => {
-                *self.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                ForgeError::Unauthorized { host, status }
-            }
-            404 => ForgeError::NotFound(host),
-            _ => {
-                #[derive(Deserialize)]
-                struct Message {
-                    message: String,
-                }
-                let message = serde_json::from_str::<Message>(&body).map_or(body, |m| m.message);
-                ForgeError::Api { host, status, message }
-            }
-        })
+        self.client.send(with_headers(request, accept), send)
     }
 
     fn get(&self, url: &str, accept: &str) -> Result<Response<Body>, ForgeError> {
-        self.send(self.agent.get(url), accept, RequestBuilder::call)
+        self.send(self.client.agent().get(url), accept, RequestBuilder::call)
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ForgeError> {
-        self.get(url, "application/vnd.github+json")?.body_mut().read_json().map_err(|e| self.unexpected(e))
+        self.get(url, "application/vnd.github+json")?.body_mut().read_json().map_err(|e| self.client.unexpected(e))
     }
 
     fn graphql<T: DeserializeOwned>(&self, query: &str, variables: &Value) -> Result<T, ForgeError> {
@@ -142,30 +104,26 @@ impl GitHub {
         }
         let body = serde_json::json!({ "query": query, "variables": variables });
         let answer: Answer<T> = self
-            .send(self.agent.post(&self.graphql), "application/vnd.github+json", |r| r.send_json(body))?
+            .send(self.client.agent().post(&self.graphql), "application/vnd.github+json", |r| r.send_json(body))?
             .body_mut()
             .read_json()
-            .map_err(|e| self.unexpected(e))?;
+            .map_err(|e| self.client.unexpected(e))?;
         match (answer.data, answer.errors.into_iter().next()) {
             (Some(data), None) => Ok(data),
             (_, Some(error)) => {
-                Err(ForgeError::Api { host: self.host.host.clone(), status: 200, message: error.message })
+                Err(ForgeError::Api { host: self.client.host().to_owned(), status: 200, message: error.message })
             }
-            (None, None) => Err(self.unexpected("GraphQL answered no data")),
+            (None, None) => Err(self.client.unexpected("GraphQL answered no data")),
         }
     }
 
     /// A file's contents at `sha`.
     fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
-        let mut url = self.endpoint(&repo_segments(pr, &["contents"]));
+        let mut url = self.client.endpoint(&repo_segments(pr, &["contents"]));
         url.path_segments_mut().expect("the API base is a URL with a path").extend(path.split('/'));
         url.query_pairs_mut().append_pair("ref", sha);
-        self.get(url.as_str(), "application/vnd.github.raw+json")?
-            .body_mut()
-            .with_config()
-            .limit(MAX_FILE)
-            .read_to_vec()
-            .map_err(|e| self.http(e))
+        let request = self.client.agent().get(url.as_str());
+        self.client.file(with_headers(request, "application/vnd.github.raw+json"))
     }
 
     /// Appends the rest of `thread`'s Comments when they didn't fit on the Threads' page, one
@@ -174,8 +132,10 @@ impl GitHub {
         while let Some(cursor) = thread.comments.page_info.next_cursor() {
             let variables = serde_json::json!({ "id": thread.id, "after": cursor });
             let data: ThreadCommentsData = self.graphql(THREAD_COMMENTS_QUERY, &variables)?;
-            let page =
-                data.node.ok_or_else(|| self.unexpected("a Thread vanished while its Comments were fetched"))?.comments;
+            let page = data
+                .node
+                .ok_or_else(|| self.client.unexpected("a Thread vanished while its Comments were fetched"))?
+                .comments;
             thread.comments.nodes.extend(page.nodes);
             thread.comments.page_info = page.page_info;
         }
@@ -187,15 +147,7 @@ impl GitHub {
     }
 
     fn pull_url(&self, pr: &PullRequestRef) -> Url {
-        self.endpoint(&repo_segments(pr, &["pulls", &pr.number.to_string()]))
-    }
-
-    /// A 404 names the Pull Request.
-    fn not_found_as(&self, error: ForgeError, pr: &PullRequestRef) -> ForgeError {
-        match error {
-            ForgeError::NotFound(_) => ForgeError::NotFound(pr.to_string()),
-            e => e,
-        }
+        self.client.endpoint(&repo_segments(pr, &["pulls", &pr.number.to_string()]))
     }
 
     /// How many commits `new` is ahead of `old`; `None` when GitHub can't say, as after a
@@ -206,16 +158,8 @@ impl GitHub {
             ahead_by: u32,
         }
         let range = format!("{old}...{new}");
-        let url = self.endpoint(&repo_segments(pr, &["compare", &range]));
+        let url = self.client.endpoint(&repo_segments(pr, &["compare", &range]));
         self.get_json::<Compare>(url.as_str()).ok().map(|c| c.ahead_by)
-    }
-
-    fn http(&self, error: impl std::fmt::Display) -> ForgeError {
-        ForgeError::Http { host: self.host.host.clone(), message: error.to_string() }
-    }
-
-    fn unexpected(&self, error: impl std::fmt::Display) -> ForgeError {
-        ForgeError::Unexpected { host: self.host.host.clone(), message: error.to_string() }
     }
 }
 
@@ -255,6 +199,11 @@ impl Pull {
     }
 }
 
+/// `request` asking for `accept`, with the API version GitHub wants on every request.
+fn with_headers<B>(request: RequestBuilder<B>, accept: &str) -> RequestBuilder<B> {
+    request.header("Accept", accept).header("X-GitHub-Api-Version", API_VERSION)
+}
+
 /// `repos/OWNER/REPO` followed by `rest`.
 fn repo_segments<'a>(pr: &'a PullRequestRef, rest: &[&'a str]) -> Vec<&'a str> {
     let mut segments = vec!["repos"];
@@ -275,14 +224,7 @@ fn next_page(response: &Response<Body>) -> Option<String> {
 impl ForgeAdapter for GitHub {
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         let url = Url::parse(url).ok()?;
-        if !matches!(url.scheme(), "https" | "http") {
-            return None;
-        }
-        let host = match url.port() {
-            Some(port) => format!("{}:{port}", url.host_str()?),
-            None => url.host_str()?.to_owned(),
-        };
-        if !host.eq_ignore_ascii_case(&self.host.host) {
+        if !host_matches(&url, self.client.host()) {
             return None;
         }
         let segments: Vec<&str> = url.path_segments()?.collect();
@@ -291,14 +233,14 @@ impl ForgeAdapter for GitHub {
             return None;
         }
         Some(PullRequestRef {
-            host: self.host.host.clone(),
+            host: self.client.host().to_owned(),
             repo: format!("{owner}/{repo}"),
             number: number.parse().ok()?,
         })
     }
 
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError> {
-        let pull: Pull = self.get_json(self.pull_url(pr).as_str()).map_err(|e| self.not_found_as(e, pr))?;
+        let pull: Pull = self.get_json(self.pull_url(pr).as_str()).map_err(|e| not_found_as(e, pr))?;
         Ok(pull.into_pull_request(pr))
     }
 
@@ -322,22 +264,23 @@ impl ForgeAdapter for GitHub {
         let id = &pr.id;
         // `base.sha` is the base branch's tip; GitHub's diff is against the merge-base.
         let range = format!("{}...{}", pr.base_sha, pr.head_sha);
-        let compare: Compare = self.get_json(self.endpoint(&repo_segments(id, &["compare", &range])).as_str())?;
+        let compare: Compare =
+            self.get_json(self.client.endpoint(&repo_segments(id, &["compare", &range])).as_str())?;
         let base = compare.merge_base_commit.sha;
 
         let number = id.number.to_string();
-        let mut url = self.endpoint(&repo_segments(id, &["pulls", &number, "files"]));
+        let mut url = self.client.endpoint(&repo_segments(id, &["pulls", &number, "files"]));
         url.query_pairs_mut().append_pair("per_page", PAGE);
         let mut next = Some(url.to_string());
         let mut listed = Vec::new();
         while let Some(url) = next.take() {
             // Only ever send the token to this host's API.
-            if !url.starts_with(&format!("{}/", self.api)) {
-                return Err(self.unexpected(format!("a page link leads off the API: {url}")));
+            if !url.starts_with(&format!("{}/", self.client.api())) {
+                return Err(self.client.unexpected(format!("a page link leads off the API: {url}")));
             }
             let mut response = self.get(&url, "application/vnd.github+json")?;
             next = next_page(&response);
-            let page: Vec<File> = response.body_mut().read_json().map_err(|e| self.unexpected(e))?;
+            let page: Vec<File> = response.body_mut().read_json().map_err(|e| self.client.unexpected(e))?;
             listed.extend(page);
         }
 
@@ -378,22 +321,21 @@ impl ForgeAdapter for GitHub {
         let id = &pr.id;
         // Bound first, so the lock is released before the request.
         let etag = self.lock_polls().get(id).filter(|p| p.since == pr.head_sha).map(|p| p.etag.clone());
-        let mut request = self.agent.get(self.pull_url(id).as_str());
+        let mut request = self.client.agent().get(self.pull_url(id).as_str());
         if let Some(etag) = &etag {
             request = request.header("If-None-Match", etag);
         }
-        let mut response = self
-            .send(request, "application/vnd.github+json", RequestBuilder::call)
-            .map_err(|e| self.not_found_as(e, id))?;
+        let mut response =
+            self.send(request, "application/vnd.github+json", RequestBuilder::call).map_err(|e| not_found_as(e, id))?;
         if response.status().as_u16() == 304 {
             let polled = self.lock_polls().get(id).filter(|p| p.since == pr.head_sha).map(|p| p.update.clone());
             if let Some(update) = polled {
                 return Ok(update);
             }
-            return Err(self.unexpected("304 Not Modified to a request that wasn't conditional"));
+            return Err(self.client.unexpected("304 Not Modified to a request that wasn't conditional"));
         }
         let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_owned);
-        let pull: Pull = response.body_mut().read_json().map_err(|e| self.unexpected(e))?;
+        let pull: Pull = response.body_mut().read_json().map_err(|e| self.client.unexpected(e))?;
         let now = pull.into_pull_request(id);
         let update = (now.head_sha != pr.head_sha).then(|| PullRequestUpdate {
             commits: self.commits_between(id, &pr.head_sha, &now.head_sha),
@@ -412,7 +354,8 @@ impl ForgeAdapter for GitHub {
     }
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
-        let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
+        let (owner, repo) =
+            pr.id.repo.split_once('/').ok_or_else(|| self.client.unexpected("a repository without owner"))?;
         let mut threads = Vec::new();
         let mut after: Option<String> = None;
         loop {
@@ -451,7 +394,7 @@ impl ForgeAdapter for GitHub {
         struct User {
             login: String,
         }
-        let viewer: User = self.get_json(self.endpoint(&["user"]).as_str())?;
+        let viewer: User = self.get_json(self.client.endpoint(&["user"]).as_str())?;
         Ok(viewer.login)
     }
 
@@ -465,7 +408,8 @@ impl ForgeAdapter for GitHub {
     /// A failure on the way undoes the Resolved changes made and deletes the pending review, so
     /// nothing is half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
-        let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
+        let (owner, repo) =
+            pr.id.repo.split_once('/').ok_or_else(|| self.client.unexpected("a repository without owner"))?;
         let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
         let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, &variables)?;
         let pr_id =
@@ -520,7 +464,7 @@ impl GitHub {
             created_at: String,
             updated_at: String,
         }
-        let mut url = self.endpoint(&["search", "issues"]);
+        let mut url = self.client.endpoint(&["search", "issues"]);
         url.query_pairs_mut()
             .append_pair("q", &format!("is:pr is:open archived:false {filter}"))
             .append_pair("sort", "updated")
@@ -533,10 +477,10 @@ impl GitHub {
                 // `…/repos/OWNER/REPO`
                 let mut path = issue.repository_url.rsplit('/');
                 let (repo, owner) = (path.next().unwrap_or_default(), path.next().unwrap_or_default());
-                let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.unexpected(format!("a time of {t:?}")));
+                let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.client.unexpected(format!("a time of {t:?}")));
                 Ok(InboxItem {
                     id: PullRequestRef {
-                        host: self.host.host.clone(),
+                        host: self.client.host().to_owned(),
                         repo: format!("{owner}/{repo}"),
                         number: issue.number,
                     },
@@ -641,7 +585,7 @@ impl GitHub {
         data.pointer(pointer)
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| self.unexpected(format!("GraphQL answered no {pointer}")))
+            .ok_or_else(|| self.client.unexpected(format!("GraphQL answered no {pointer}")))
     }
 }
 

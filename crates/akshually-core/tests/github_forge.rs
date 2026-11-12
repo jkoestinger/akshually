@@ -1,5 +1,6 @@
 //! Seam C: the GitHub adapter at the HTTP boundary, against a mock server, a fake `gh` and a
-//! controlled environment. Nothing here reaches the network or real credentials.
+//! controlled environment: GitHub's endpoints, error body and credentials; what every adapter does
+//! the same is in `forge_http.rs`. Nothing here reaches the network or real credentials.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -21,15 +22,12 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// A `gh` that prints `token` for `auth token --hostname <host>` and fails otherwise, and
-/// counts its runs in `<dir>/gh-runs`.
+/// A `gh` that prints `token` for `auth token --hostname <host>` and fails otherwise.
 fn fake_gh(dir: &Path, host: &str, token: &str) -> PathBuf {
     let gh = dir.join("gh");
-    let runs = dir.join("gh-runs");
     let script = format!(
-        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\necho run >> '{}'\nif [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi\n\
-         echo 'no oauth token' >&2\nexit 1\n",
-        runs.display()
+        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\nif [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi\n\
+         echo 'no oauth token' >&2\nexit 1\n"
     );
     std::fs::write(&gh, script).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -40,10 +38,6 @@ fn fake_gh(dir: &Path, host: &str, token: &str) -> PathBuf {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     gh
-}
-
-fn gh_runs(dir: &Path) -> usize {
-    std::fs::read_to_string(dir.join("gh-runs")).map_or(0, |s| s.lines().count())
 }
 
 /// A mock GitHub API, and the adapter for one host pointed at it.
@@ -426,16 +420,6 @@ fn a_failed_query_for_a_thread_s_further_comments_fails_the_threads() {
 }
 
 #[test]
-fn a_missing_pull_request_is_not_found() {
-    let mut h = Harness::new();
-    h.server.mock("GET", "/repos/acme/web/pulls/482").with_status(404).with_body(r#"{"message":"Not Found"}"#).create();
-
-    let error = h.github().pull_request(&pr_ref()).unwrap_err();
-
-    assert!(matches!(error, ForgeError::NotFound(_)), "{error:?}");
-}
-
-#[test]
 fn an_api_error_carries_github_s_message() {
     let mut h = Harness::new();
     h.server
@@ -450,63 +434,6 @@ fn an_api_error_carries_github_s_message() {
 }
 
 // --- Credentials: `gh`, then the environment, then the pasted token ---
-
-#[test]
-fn the_token_comes_from_gh_first() {
-    let mut h = Harness::new();
-    let mock = h.get("/repos/acme/web/pulls/482", "from-gh", &fixture("pull.json"));
-    let host = HostConfig { token: Some("pasted".into()), ..h.host("github.com") };
-    let github = h.adapter(host, h.sources(Some("from-gh"), &[("GITHUB_TOKEN", "from-env")]));
-
-    github.pull_request(&pr_ref()).unwrap();
-
-    mock.assert();
-}
-
-#[test]
-fn without_gh_the_token_comes_from_github_token() {
-    let mut h = Harness::new();
-    let mock = h.get("/repos/acme/web/pulls/482", "from-env", &fixture("pull.json"));
-    let host = HostConfig { token: Some("pasted".into()), ..h.host("github.com") };
-    let github = h.adapter(host, h.sources(None, &[("GITHUB_TOKEN", "from-env")]));
-
-    github.pull_request(&pr_ref()).unwrap();
-
-    mock.assert();
-}
-
-#[test]
-fn when_gh_has_no_token_for_the_host_the_environment_is_next() {
-    let mut h = Harness::new();
-    let mock = h.get("/repos/acme/web/pulls/482", "from-env", &fixture("pull.json"));
-    // `gh` is logged in to another host only.
-    let gh = fake_gh(h.dirs.path(), "github.example.com", "other-host");
-    let github = h.adapter(
-        h.host("github.com"),
-        CredentialSources {
-            config: "/home/me/.config/akshually/config.toml".into(),
-            gh,
-            glab: "/nonexistent".into(),
-            env: HashMap::from([("GITHUB_TOKEN".into(), "from-env".into())]),
-        },
-    );
-
-    github.pull_request(&pr_ref()).unwrap();
-
-    mock.assert();
-}
-
-#[test]
-fn the_pasted_token_is_the_last_resort() {
-    let mut h = Harness::new();
-    let mock = h.get("/repos/acme/web/pulls/482", "pasted", &fixture("pull.json"));
-    let host = HostConfig { token: Some("pasted".into()), ..h.host("github.com") };
-    let github = h.adapter(host, h.sources(None, &[]));
-
-    github.pull_request(&pr_ref()).unwrap();
-
-    mock.assert();
-}
 
 #[test]
 fn enterprise_hosts_ask_gh_for_their_host_and_never_get_the_github_com_token() {
@@ -544,7 +471,7 @@ fn enterprise_hosts_take_the_enterprise_token_from_the_environment() {
 }
 
 #[test]
-fn with_no_token_anywhere_nothing_is_sent() {
+fn an_enterprise_host_with_only_a_github_com_token_sends_nothing_and_names_gh_enterprise_token() {
     let mut h = Harness::new();
     let mock = h.server.mock("GET", Matcher::Any).expect(0).create();
     let env = [("GITHUB_TOKEN", "github-com-token")];
@@ -555,35 +482,7 @@ fn with_no_token_anywhere_nothing_is_sent() {
     mock.assert();
     assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "github.example.com"), "{error:?}");
     let message = error.to_string();
-    assert!(message.contains("gh auth login --hostname github.example.com"), "{message}");
     assert!(message.contains("GH_ENTERPRISE_TOKEN"), "{message}");
-    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"github\"\n\
-                 host = \"github.example.com\"\ntoken = \"<your token>\"";
-    assert!(message.contains(paste), "{message}");
-}
-
-#[test]
-fn gh_is_asked_once_and_again_after_the_token_is_refused() {
-    let mut h = Harness::new();
-    let github = h.github();
-    h.get("/repos/acme/web/pulls/482", TOKEN, &fixture("pull.json"));
-    github.pull_request(&pr_ref()).unwrap();
-    github.pull_request(&pr_ref()).unwrap();
-    assert_eq!(gh_runs(h.dirs.path()), 1);
-
-    h.server.reset();
-    h.server
-        .mock("GET", "/repos/acme/web/pulls/482")
-        .with_status(401)
-        .with_body(r#"{"message":"Bad credentials"}"#)
-        .create();
-    let error = github.pull_request(&pr_ref()).unwrap_err();
-    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
-    h.server.reset();
-    h.get("/repos/acme/web/pulls/482", TOKEN, &fixture("pull.json"));
-    github.pull_request(&pr_ref()).unwrap();
-
-    assert_eq!(gh_runs(h.dirs.path()), 2);
 }
 
 // --- The Inbox ---
@@ -654,17 +553,6 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_470_400, 1_794_475_800));
     // 2026-11-11T16:45:10Z.
     assert_eq!(inbox[1].updated_at, 1_794_415_510);
-}
-
-#[test]
-fn a_refused_token_fails_the_inbox() {
-    let mut h = Harness::new();
-    let github = h.github();
-    h.server.mock("GET", "/search/issues").match_query(Matcher::Any).with_status(401).create();
-
-    let error = github.inbox().unwrap_err();
-
-    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
 }
 
 // --- New pushes ---

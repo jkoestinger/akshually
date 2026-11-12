@@ -1,5 +1,6 @@
 //! Seam C: the GitLab adapter at the HTTP boundary, against a mock server, a fake `glab` and a
-//! controlled environment. Nothing here reaches the network or real credentials.
+//! controlled environment: GitLab's endpoints, error body and credentials; what every adapter does
+//! the same is in `forge_http.rs`. Nothing here reaches the network or real credentials.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -475,17 +476,6 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!(inbox[1].created_at, 1_794_308_400);
 }
 
-#[test]
-fn a_refused_token_fails_the_inbox() {
-    let mut h = Harness::new();
-    let gitlab = h.gitlab();
-    h.server.mock("GET", "/user").with_status(401).with_body(r#"{"message":"401 Unauthorized"}"#).create();
-
-    let error = gitlab.inbox().unwrap_err();
-
-    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
-}
-
 // --- Credentials: `glab`, then the environment, then the pasted token ---
 
 impl Harness {
@@ -494,18 +484,6 @@ impl Harness {
         let config = HostConfig { token: pasted.map(Into::into), ..self.host(host) };
         GitLab::new(config, sources).pull_request(&PullRequestRef { host: host.into(), ..mr_ref() }).map(drop)
     }
-}
-
-#[test]
-fn the_token_comes_from_glab_first() {
-    let mut h = Harness::new();
-    let mock = h.get("/projects/platform%2Finfra/merge_requests/97", "from-glab", &fixture("mr.json"));
-    let env = [("GITLAB_HOST", "gitlab.example.com"), ("GITLAB_TOKEN", "from-env")];
-    let sources = h.sources(Some(("gitlab.example.com", "from-glab")), &env);
-
-    h.fetch_with("gitlab.example.com", sources, Some("pasted")).unwrap();
-
-    mock.assert();
 }
 
 #[test]
@@ -546,23 +524,6 @@ fn gitlab_token_never_goes_to_another_host() {
 }
 
 #[test]
-fn with_no_token_anywhere_nothing_is_sent() {
-    let mut h = Harness::new();
-    let mock = h.server.mock("GET", Matcher::Any).expect(0).create();
-    let sources = h.sources(None, &[("GITLAB_HOST", "gitlab.other.com"), ("GITLAB_TOKEN", "from-env")]);
-
-    let error = h.fetch_with("gitlab.example.com", sources, None).unwrap_err();
-
-    mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "gitlab.example.com"), "{error:?}");
-    let message = error.to_string();
-    assert!(message.contains("glab auth login --hostname gitlab.example.com"), "{message}");
-    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"gitlab\"\n\
-                 host = \"gitlab.example.com\"\ntoken = \"<your token>\"";
-    assert!(message.contains(paste), "{message}");
-}
-
-#[test]
 fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads() {
     let mut h = Harness::new();
     h.get("/projects/platform%2Finfra/merge_requests/97", TOKEN, &fixture("mr.json"));
@@ -588,20 +549,6 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
     assert_eq!(thread.anchor, Anchor::lines(Side::New, "src/a.rs", 1..=1));
     assert_eq!(thread.excerpt, "fn a2() {}\n");
     assert_eq!(thread.comments[0].author, Party::Other("lee".into()));
-}
-
-#[test]
-fn a_missing_merge_request_is_not_found() {
-    let mut h = Harness::new();
-    h.server
-        .mock("GET", "/projects/platform%2Finfra/merge_requests/97")
-        .with_status(404)
-        .with_body(r#"{"message":"404 Not found"}"#)
-        .create();
-
-    let error = h.gitlab().pull_request(&mr_ref()).unwrap_err();
-
-    assert!(matches!(&error, ForgeError::NotFound(what) if what.contains("platform/infra")), "{error:?}");
 }
 
 #[test]
