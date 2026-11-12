@@ -34,6 +34,7 @@ mod exit {
     pub const ABANDONED: u8 = 3;
     pub const ROUND: u8 = 4;
     pub const PUBLISHED: u8 = 5;
+    pub const CLOSED: u8 = 6;
 }
 
 #[derive(Parser)]
@@ -55,26 +56,35 @@ enum Command {
     /// answers. Exits 0 when they approve, 4 when they hand over a Round (printed as markdown,
     /// or JSON with `--format json`: address it, reply to or resolve its Threads, then run
     /// `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
-    /// With `--pr <url>`, hand your Drafts on that Pull Request to the human instead: exits 5
-    /// when they Publish (printing the Verdict and the review's link), 3 when they abandon it.
+    /// After `draft` on this branch, it hands your Drafts to the human instead: exits 4 when
+    /// they question them, 6 when they close the co-review. With `--pr <url>`, hand your Drafts
+    /// on that Pull Request to the human: exits 5 when they Publish (printing the Verdict and
+    /// the review's link), 4 when they question your Drafts, 3 when they abandon it.
     Review(ReviewArgs),
-    /// Reply to a Thread of this branch's Session, e.g. `akshually reply T3 "Done: …"`. The
-    /// human sees it at once; returns immediately.
+    /// Reply to a Thread of this branch's Session (or with `--pr`, of that Pull Request's),
+    /// e.g. `akshually reply T3 "Done: …"`. The human sees it at once; returns immediately.
     Reply {
+        /// The Pull Request you co-review, instead of this branch.
+        #[arg(long, value_name = "URL")]
+        pr: Option<String>,
         /// The Thread ID from the Round, e.g. `T3`.
         thread: String,
         /// Markdown.
         body: String,
     },
-    /// Mark a Thread of this branch's Session Resolved, e.g. `akshually resolve T3`. The human
-    /// can reopen it. Returns immediately.
+    /// Mark a Thread of this branch's Session (or with `--pr`, of that Pull Request's)
+    /// Resolved, e.g. `akshually resolve T3`. The human can reopen it. Returns immediately.
     Resolve {
+        /// The Pull Request you co-review, instead of this branch.
+        #[arg(long, value_name = "URL")]
+        pr: Option<String>,
         /// The Thread ID from the Round, e.g. `T3`.
         thread: String,
     },
-    /// As co-Reviewer of a Pull Request, add a Draft for the human to keep, edit or discard,
-    /// e.g. `akshually draft --pr <url> --lines src/lib.rs:2-3 "…"`. Prints its Thread ID.
-    /// Then run `akshually review --pr <url>` to hand your Drafts to the human.
+    /// As co-Reviewer of a Pull Request (`--pr <url>`) or of this branch's local work, add a
+    /// Draft for the human to keep, edit, discard or question, e.g.
+    /// `akshually draft --pr <url> --lines src/lib.rs:2-3 "…"`. Prints its Thread ID. Then run
+    /// `akshually review` (with the same `--pr`) to hand your Drafts to the human.
     Draft(DraftArgs),
     /// Print the guide for agents: the review loop, the commands and the exit codes. It is
     /// also a `SKILL.md` you can install as an agent skill.
@@ -117,9 +127,9 @@ struct ReviewArgs {
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("anchor").required(true).args(["lines", "file", "review"])))]
 struct DraftArgs {
-    /// The Pull Request you co-review.
-    #[arg(long, value_name = "URL", required = true)]
-    pr: String,
+    /// The Pull Request you co-review; without it, this branch's local work.
+    #[arg(long, value_name = "URL")]
+    pr: Option<String>,
     /// Anchor to lines of a file, 1-based and inclusive: `src/lib.rs:2-3` or `src/lib.rs:2`.
     #[arg(long, value_name = "PATH:N[-M]", value_parser = parse_lines)]
     lines: Option<(String, u32, u32)>,
@@ -190,11 +200,11 @@ fn main() -> ExitCode {
             }
         }
         Some(Command::Draft(args)) => draft(args),
-        Some(Command::Reply { thread, body }) => {
-            agent_call(|conn, cwd| conn.reply(cwd, &ThreadId::new(thread), &body).map_err(Into::into))
+        Some(Command::Reply { pr, thread, body }) => {
+            agent_call(|conn, cwd| conn.reply(cwd, pr.as_deref(), &ThreadId::new(thread), &body).map_err(Into::into))
         }
-        Some(Command::Resolve { thread }) => {
-            agent_call(|conn, cwd| conn.resolve(cwd, &ThreadId::new(thread)).map_err(Into::into))
+        Some(Command::Resolve { pr, thread }) => {
+            agent_call(|conn, cwd| conn.resolve(cwd, pr.as_deref(), &ThreadId::new(thread)).map_err(Into::into))
         }
         Some(Command::AgentHelp) => {
             print!("{SKILL}");
@@ -220,13 +230,15 @@ fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
     // Printed and flushed before the app hears back, so the outcome is acknowledged only once
     // the agent can see it.
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, |o| print_outcome(o, format))?;
+    let print = |o: &Outcome| print_outcome(o, None, format);
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, print)?;
     Ok(exit_code(&outcome))
 }
 
 /// `review --pr`: the co-Reviewer hands its Drafts to the human and waits for the outcome.
 fn co_review(url: &str, format: Format) -> Result<ExitCode> {
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.co_review(url, |o| print_outcome(o, format))?;
+    let outcome =
+        launch::connect_or_launch(&Paths::from_env())?.co_review(url, |o| print_outcome(o, Some(url), format))?;
     Ok(exit_code(&outcome))
 }
 
@@ -237,14 +249,16 @@ fn draft(args: DraftArgs) -> Result<ExitCode> {
         _ => args.body,
     };
     let comment = NewComment::from_markdown(&body);
-    let thread = launch::connect_or_launch(&Paths::from_env())?.draft(&args.pr, anchor, comment)?;
+    let cwd = std::env::current_dir().context("can't read the current directory")?;
+    let thread = launch::connect_or_launch(&Paths::from_env())?.draft(&cwd, args.pr.as_deref(), anchor, comment)?;
     println!("{thread}");
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_outcome(outcome: &Outcome, format: Format) -> io::Result<()> {
+/// Prints what `review` received; `pr` is the Pull Request co-reviewed, if any.
+fn print_outcome(outcome: &Outcome, pr: Option<&str>, format: Format) -> io::Result<()> {
     let text = match format {
-        Format::Markdown => render::outcome_markdown(outcome),
+        Format::Markdown => render::outcome_markdown(outcome, pr),
         Format::Json => format!("{}\n", serde_json::to_string(outcome).map_err(io::Error::other)?),
     };
     let mut stdout = io::stdout().lock();
@@ -258,6 +272,7 @@ fn exit_code(outcome: &Outcome) -> ExitCode {
         Outcome::Approved => exit::APPROVED,
         Outcome::Abandoned => exit::ABANDONED,
         Outcome::Published { .. } => exit::PUBLISHED,
+        Outcome::Closed => exit::CLOSED,
     };
     ExitCode::from(code)
 }

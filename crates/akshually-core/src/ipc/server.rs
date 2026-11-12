@@ -4,7 +4,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, mpsc};
 
-use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
+use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION, source};
 use crate::{NewComment, Paths, ReviewRequest, Service};
 
 #[derive(Debug, thiserror::Error)]
@@ -126,15 +126,15 @@ impl Server {
                 Err(ErrorReply::new(ErrorCode::BadRequest, "`review` and `ack` need a connection of their own"))
             }
             Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
-            Request::Reply { cwd, thread, body } => {
-                self.service.reply(&cwd, &thread, body).map(|()| serde_json::json!({})).map_err(failed)
+            Request::Reply { cwd, pr, thread, body } => {
+                self.service.reply(source(cwd, pr), &thread, body).map(|()| serde_json::json!({})).map_err(failed)
             }
-            Request::Resolve { cwd, thread } => {
-                self.service.resolve(&cwd, &thread).map(|()| serde_json::json!({})).map_err(failed)
+            Request::Resolve { cwd, pr, thread } => {
+                self.service.resolve(source(cwd, pr), &thread).map(|()| serde_json::json!({})).map_err(failed)
             }
-            Request::Draft { pr, anchor, body, suggestion } => self
+            Request::Draft { cwd, pr, anchor, body, suggestion } => self
                 .service
-                .draft(&pr, anchor, NewComment { body, suggestion })
+                .draft(source(cwd, pr), anchor, NewComment { body, suggestion })
                 .map(|thread| serde_json::json!({ "thread": thread }))
                 .map_err(failed),
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {

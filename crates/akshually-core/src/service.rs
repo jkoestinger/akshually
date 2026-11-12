@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, PullRequestUpdate};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
@@ -55,6 +55,8 @@ pub enum Outcome {
     /// The human Published their Review of a Pull Request with `verdict`; `url` is the review
     /// on the Forge.
     Published { verdict: Verdict, url: String },
+    /// The human closed a co-review of local work, which has no Verdict: a normal end.
+    Closed,
 }
 
 /// How the human ends a Review of a Pull Request, at Publish. Feedback becomes the Forge's
@@ -165,6 +167,32 @@ impl ReviewRequest {
     }
 }
 
+/// Where an agent call finds its Session: the local work in the repository (and branch) at a
+/// directory, or a Pull Request by URL. A path converts into the first, a URL into the second.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    Local(PathBuf),
+    PullRequest(String),
+}
+
+impl From<&Path> for Source {
+    fn from(cwd: &Path) -> Self {
+        Source::Local(cwd.to_owned())
+    }
+}
+
+impl From<&PathBuf> for Source {
+    fn from(cwd: &PathBuf) -> Self {
+        Source::Local(cwd.clone())
+    }
+}
+
+impl From<&str> for Source {
+    fn from(url: &str) -> Self {
+        Source::PullRequest(url.to_owned())
+    }
+}
+
 /// What the UI (and tests) can observe of one Session. It's persisted: a field missing from
 /// an older saved Session takes its `Default`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +244,20 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// Whether the agent is a co-Reviewer (a Pull Request takes no other): Rounds then carry
+    /// only the human's questions on its Drafts, with the roles reversed.
+    pub fn is_co_review(&self) -> bool {
+        self.pull_request.is_some() || self.agent == Some(Role::CoReviewer)
+    }
+
+    /// How many Comments and reopened Threads the next Round would carry.
+    pub fn to_hand_over(&self) -> usize {
+        let co_review = self.is_co_review();
+        let comments: usize =
+            self.threads.iter().map(|t| (0..t.comments.len()).filter(|&at| goes_out(co_review, t, at)).count()).sum();
+        comments + self.threads.iter().filter(|t| t.reopened && !co_review).count()
+    }
+
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
         match (self.view, &self.since_session_base, &self.since_last_round) {
@@ -437,7 +479,9 @@ impl Session {
     fn delivered(&mut self, outcome: &Outcome) {
         match outcome {
             Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
-            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } => self.finished = true,
+            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } | Outcome::Closed => {
+                self.finished = true
+            }
         }
     }
 
@@ -512,6 +556,32 @@ impl Session {
             reanchor(&mut threads, view.anchored_in());
             view.threads = threads;
         }
+    }
+}
+
+/// A Session's identity: the repository and branch of local work, or the Pull Request (with
+/// the URL it was asked by, for errors).
+enum SessionKey {
+    Local { repo: PathBuf, branch: String },
+    PullRequest(PullRequestRef, String),
+}
+
+impl SessionKey {
+    /// The position of its Session in `sessions`.
+    fn find(self, sessions: &[Session]) -> Result<usize, Error> {
+        let found = sessions.iter().position(|s| match &self {
+            SessionKey::Local { repo, branch } => {
+                s.view.pull_request.is_none() && &s.view.repo == repo && &s.view.branch == branch
+            }
+            SessionKey::PullRequest(pr, _) => s.view.pull_request.as_ref().is_some_and(|p| &p.id == pr),
+        });
+        if let Some(at) = found {
+            return Ok(at);
+        }
+        Err(match self {
+            SessionKey::Local { repo, branch } => Error::NoSessionHere { repo, branch },
+            SessionKey::PullRequest(_, url) => Error::NoPullRequestSession(url),
+        })
     }
 }
 
@@ -799,7 +869,8 @@ impl Service {
                 if session.waiter.is_some() {
                     return Err(Error::Busy);
                 }
-                session.join(Role::Author)?;
+                // A co-Reviewer that drafted on this work first co-reviews it.
+                session.join(session.view.agent.unwrap_or(Role::Author))?;
                 session.local = request.local;
                 session.refresh(changeset, since_session_base, true);
                 inner.wait_on(at, waiter);
@@ -808,30 +879,9 @@ impl Service {
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = match since_session_base {
-                    Some(_) => ChangesetView::SinceSessionBase,
-                    None => ChangesetView::Full,
-                };
                 let view = SessionView {
-                    id: id.clone(),
-                    repo,
-                    branch,
-                    pull_request: None,
-                    agent: Some(Role::Author),
-                    changeset,
-                    since_session_base,
-                    last_round: None,
-                    since_last_round: None,
-                    view,
-                    round: 1,
                     agent_waiting: true,
-                    threads: Vec::new(),
-                    turn: Turn::Human,
-                    ended: None,
-                    attention: false,
-                    viewed: BTreeSet::new(),
-                    changed_on_disk: BTreeSet::new(),
-                    pull_request_update: None,
+                    ..local_view(id.clone(), repo, branch, changeset, since_session_base, Role::Author)
                 };
                 inner.sessions.push(Session { view, waiter: Some(waiter), local: request.local, ..Session::default() });
                 let at = inner.sessions.len() - 1;
@@ -846,6 +896,74 @@ impl Service {
             call: Call { session: id, waiter: waiter_id, inner: Arc::downgrade(&self.inner) },
             outcome: rx,
         })
+    }
+
+    /// Agent, as co-Reviewer: opens a Thread in the Session of `source` with `comment`
+    /// (markdown, plus any suggestion) as an agent Draft, for the human to keep, edit, discard
+    /// or question. Opens the Session if needed, without taking the human's view; a Pull
+    /// Request's blocks on the Forge.
+    pub fn draft(
+        &self,
+        source: impl Into<Source>,
+        anchor: Anchor,
+        comment: impl Into<NewComment>,
+    ) -> Result<ThreadId, Error> {
+        let comment = comment.into();
+        check_comment(&anchor, &comment)?;
+        let id = match source.into() {
+            Source::PullRequest(url) => self.open_pull_request_session(&url, Some(Role::CoReviewer))?.0,
+            Source::Local(cwd) => self.open_local_co_review(&cwd)?,
+        };
+        let mut inner = self.lock();
+        let at = inner.position(&id)?;
+        let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        session.join(Role::CoReviewer)?;
+        let thread = session.open_thread(anchor, comment, Party::Agent)?;
+        inner.notify();
+        Ok(thread)
+    }
+
+    /// The Session of the local work at `cwd`, opened for a co-Reviewer if needed: it starts in
+    /// the agent's Turn, out of the human's way, until the agent's `review` call.
+    fn open_local_co_review(&self, cwd: &Path) -> Result<SessionId, Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let here = |s: &&Session| s.view.pull_request.is_none() && s.view.repo == repo && s.view.branch == branch;
+        let (settings, session_base) = {
+            let inner = self.lock();
+            if let Some(open) = inner.sessions.iter().find(here) {
+                return Ok(open.view.id.clone());
+            }
+            (inner.settings.clone(), inner.session_bases.get(&(repo.clone(), branch.clone())).cloned())
+        };
+        let options = LocalOptions::default();
+        let local = changeset::local(&repo, &options, &settings, session_base.as_deref())?;
+
+        let mut inner = self.lock();
+        // Another call may have opened it meanwhile.
+        if let Some(open) = inner.sessions.iter().find(here) {
+            return Ok(open.view.id.clone());
+        }
+        inner.next_id += 1;
+        let id = SessionId::new(format!("s{}", inner.next_id));
+        let view = local_view(
+            id.clone(),
+            repo.clone(),
+            branch.clone(),
+            local.full,
+            local.since_session_base,
+            Role::CoReviewer,
+        );
+        inner.sessions.push(Session {
+            view: SessionView { turn: Turn::Agent, ..view },
+            local: options,
+            ..Session::default()
+        });
+        inner.notify();
+        Ok(id)
     }
 
     /// Human: refreshes the Session's Changeset from disk, or for a Pull Request from its Forge
@@ -941,19 +1059,23 @@ impl Service {
             return Err(Error::NotYourTurn);
         }
         let number = session.view.round;
+        let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
         for thread in &mut session.view.threads {
+            let goes_out: Vec<bool> = (0..thread.comments.len()).map(|at| goes_out(co_review, thread, at)).collect();
             let drafts: Vec<Comment> = thread
                 .comments
                 .iter_mut()
-                .filter(|c| c.is_draft())
-                .map(|c| {
+                .zip(goes_out)
+                .filter(|(_, goes)| *goes)
+                .map(|(c, _)| {
                     c.round = Some(number);
                     c.clone()
                 })
                 .collect();
-            if !drafts.is_empty() || thread.reopened {
-                threads.push(Thread { comments: drafts, ..thread.clone() });
+            let reopened = thread.reopened && !co_review;
+            if !drafts.is_empty() || reopened {
+                threads.push(Thread { comments: drafts, reopened, ..thread.clone() });
                 thread.reopened = false;
             }
         }
@@ -1015,21 +1137,21 @@ impl Service {
         Ok(())
     }
 
-    /// Agent: replies to `thread` in the Session for the repository and branch at `cwd`. The
-    /// human sees it at once; it counts towards the Round being drafted.
-    pub fn reply(&self, cwd: &Path, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+    /// Agent: replies to `thread` in the Session of `source`. The human sees it at once; it
+    /// counts towards the Round being drafted.
+    pub fn reply(&self, source: impl Into<Source>, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
         }
-        self.agent_thread(cwd, thread, |round, thread| {
+        self.agent_thread(&source.into(), thread, |round, thread| {
             thread.comments.push(Comment { author: Party::Agent, body, round: Some(round), suggestion: None });
         })
     }
 
-    /// Agent: marks `thread` Resolved in the Session for the repository and branch at `cwd`.
-    pub fn resolve(&self, cwd: &Path, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_thread(cwd, thread, |_, thread| resolve(thread, Party::Agent))
+    /// Agent: marks `thread` Resolved in the Session of `source`.
+    pub fn resolve(&self, source: impl Into<Source>, thread: &ThreadId) -> Result<(), Error> {
+        self.agent_thread(&source.into(), thread, |_, thread| resolve(thread, Party::Agent))
     }
 
     /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
@@ -1083,7 +1205,7 @@ impl Service {
     }
 
     /// Runs `f` on the Session's Threads with the position of `thread`, a Thread the
-    /// co-Reviewer opened whose Draft the human hasn't kept.
+    /// co-Reviewer opened whose Draft the human hasn't kept, questioned or not.
     fn agent_draft<T>(
         &self,
         id: &SessionId,
@@ -1094,7 +1216,7 @@ impl Service {
         let at = inner.position(id)?;
         let threads = &mut inner.sessions[at].view.threads;
         let found = threads.iter().position(|t| &t.id == thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
-        if !matches!(threads[found].comments.as_slice(), [only] if only.is_agent_draft()) {
+        if !threads[found].comments.first().is_some_and(Comment::is_agent_draft) {
             return Err(Error::NotAnAgentDraft(thread.clone()));
         }
         let result = f(threads, found);
@@ -1111,22 +1233,39 @@ impl Service {
         Ok(())
     }
 
-    /// Runs `f` on a Thread the agent has received, in the Session for `cwd`, with the number
-    /// of the Round being drafted.
-    fn agent_thread(&self, cwd: &Path, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
-        let repo = git::toplevel(cwd)?;
-        let branch = git::branch(&repo)?;
+    /// Runs `f` on a Thread a Round brought the agent, in the Session of `source`, with the
+    /// number of the Round being drafted.
+    fn agent_thread(&self, source: &Source, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
+        let key = self.session_key(source)?;
         let mut inner = self.lock();
-        let Some(session) = inner.sessions.iter_mut().find(|s| s.view.repo == repo && s.view.branch == branch) else {
-            return Err(Error::NoSessionHere { repo, branch });
-        };
+        let at = key.find(&inner.sessions)?;
+        let session = &mut inner.sessions[at];
         let round = session.view.round;
-        // A Thread still all Drafts hasn't reached the agent, so it can't know its ID.
+        // Only a Round tells the agent about a Thread: one of its own Drafts nobody questioned,
+        // or one already on the Forge, isn't the agent's to answer.
         let found =
-            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| !c.is_draft()));
+            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| c.round.is_some()));
         f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
         inner.notify();
         Ok(())
+    }
+
+    /// What identifies the Session of `source`. Reads the repository, not holding the lock.
+    fn session_key(&self, source: &Source) -> Result<SessionKey, Error> {
+        Ok(match source {
+            Source::Local(cwd) => {
+                let repo = git::toplevel(cwd)?;
+                let branch = git::branch(&repo)?;
+                SessionKey::Local { repo, branch }
+            }
+            Source::PullRequest(url) => SessionKey::PullRequest(
+                self.forges
+                    .iter()
+                    .find_map(|forge| forge.recognise(url))
+                    .ok_or_else(|| Error::NotAPullRequest(url.clone()))?,
+                url.clone(),
+            ),
+        })
     }
 
     /// Human: ticks `path` as viewed, or unticks it.
@@ -1153,14 +1292,17 @@ impl Service {
     }
 
     /// Human: closes the Session without a Verdict and tells the agent to stop.
-    /// A Pull Request Session with no agent has no one to tell: abandoning it closes it.
+    /// A Pull Request Session with no agent has no one to tell, and a co-review of local work
+    /// has no Verdict: abandoning either closes it.
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
-        let agentless_pr = self
-            .lock()
-            .sessions
-            .iter()
-            .any(|s| &s.view.id == id && s.view.pull_request.is_some() && s.view.agent.is_none());
-        if agentless_pr {
+        let closes = self.lock().sessions.iter().any(|s| {
+            &s.view.id == id
+                && match s.view.pull_request {
+                    Some(_) => s.view.agent.is_none(),
+                    None => s.view.agent == Some(Role::CoReviewer),
+                }
+        });
+        if closes {
             return self.close(id);
         }
         self.end(id, Outcome::Abandoned)
@@ -1181,6 +1323,9 @@ impl Service {
         if outcome == Outcome::Approved && session.view.pull_request.is_some() {
             return Err(Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()));
         }
+        if outcome == Outcome::Approved && session.view.agent == Some(Role::CoReviewer) {
+            return Err(Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()));
+        }
         if outcome == Outcome::Approved && session.view.turn != Turn::Human {
             return Err(Error::NotYourTurn);
         }
@@ -1188,6 +1333,34 @@ impl Service {
         inner.reap();
         inner.notify();
         Ok(())
+    }
+}
+
+/// A new Session of the local work in `repo` on `branch`, with `agent` in it, in the human's
+/// Turn.
+fn local_view(
+    id: SessionId,
+    repo: PathBuf,
+    branch: String,
+    changeset: Changeset,
+    since_session_base: Option<Changeset>,
+    agent: Role,
+) -> SessionView {
+    let view = match since_session_base {
+        Some(_) => ChangesetView::SinceSessionBase,
+        None => ChangesetView::Full,
+    };
+    SessionView {
+        id,
+        repo,
+        branch,
+        agent: Some(agent),
+        changeset,
+        since_session_base,
+        view,
+        round: 1,
+        turn: Turn::Human,
+        ..SessionView::default()
     }
 }
 
@@ -1200,6 +1373,17 @@ fn check_comment(anchor: &Anchor, comment: &NewComment) -> Result<(), Error> {
         return Err(Error::InvalidSuggestion);
     }
     Ok(())
+}
+
+/// Whether the next Round carries `thread`'s Comment at `at`: any Draft for an Author, and for
+/// a co-Reviewer only the human's questions, Draft replies in a Thread one of its Drafts opens.
+/// The human's other Drafts wait for Publish, and the agent's for the human to keep.
+fn goes_out(co_review: bool, thread: &Thread, at: usize) -> bool {
+    let comment = &thread.comments[at];
+    if !co_review {
+        return comment.is_draft();
+    }
+    at > 0 && comment.is_draft() && comment.author == Party::Human && thread.comments[0].is_agent_draft()
 }
 
 /// Marks `thread` Resolved by `by`; a reopening not yet handed over no longer needs telling.

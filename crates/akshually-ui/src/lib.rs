@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, InboxRow, InboxRowState, InboxView, NewComment, Outcome,
-    Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
+    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
 };
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -170,10 +170,15 @@ impl SessionTab {
         self.diff.set_annotations(notes);
     }
 
-    /// What the next Round carries: each Draft, and each Thread the human reopened.
+    /// What the next Round carries: each Draft, and each Thread the human reopened; for a
+    /// co-Reviewer, only the questions on its Drafts.
     fn to_hand_over(&self) -> usize {
-        let drafts = self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count();
-        drafts + self.session.threads.iter().filter(|t| t.reopened).count()
+        self.session.to_hand_over()
+    }
+
+    /// The human's Drafts, which Publish sends once kept.
+    fn drafts(&self) -> usize {
+        self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
     }
 
     fn title(&self) -> String {
@@ -845,7 +850,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch)).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
-        .child(Badge::new(format!("{} Drafts", tab.to_hand_over())).build(k))
+        .child(Badge::new(format!("{} Drafts", tab.drafts())).build(k))
         .child(
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -858,6 +863,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
                 .on_press(move |s: &mut State| s.act(&close_id, Service::close))
                 .build(k),
         )
+        .children(session.agent.is_some().then(|| hand_over_button(k, tab)))
         .child(
             Button::new("Publish…")
                 .variant(ButtonVariant::Submit)
@@ -865,6 +871,28 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
                 .on_press(move |s: &mut State| s.open_publish(publish_id.clone()))
                 .build(k),
         )
+}
+
+/// Hands the next Round over: in a co-review, the human's questions on the agent's Drafts.
+fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
+    let session = &tab.session;
+    let id = session.id.clone();
+    let count = tab.to_hand_over();
+    let label = match (session.is_co_review(), count) {
+        (true, 0) => "Hand over questions".to_owned(),
+        (true, n) => format!("Hand over questions ({n})"),
+        (false, 0) => "Hand over Round".to_owned(),
+        (false, n) => format!("Hand over Round ({n})"),
+    };
+    Button::new(label)
+        .variant(ButtonVariant::Submit)
+        .disabled(count == 0 || session.turn != Turn::Human || session.ended.is_some())
+        .on_press(move |s: &mut State| {
+            if let Err(error) = s.service.hand_over_round(&id) {
+                eprintln!("akshually: {error}");
+            }
+        })
+        .build(k)
 }
 
 /// The Publish dialog: what will be sent and what won't, the Verdict and the summary.
@@ -1039,22 +1067,27 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
     } else {
         "since Session base".to_owned()
     };
-    let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let (approve_id, abandon_id) = (session.id.clone(), session.id.clone());
     let take_back_id = session.id.clone();
-    let drafts = tab.to_hand_over();
     let yours = session.turn == Turn::Human;
+    let co_review = session.is_co_review();
     let turn = Badge::new(if yours { "Your Turn" } else { "Agent's Turn" });
-    // During the agent's Turn the Verdict waits: take the Turn back first (or abandon).
-    let decide = if yours {
+    // During the agent's Turn the Verdict waits: take the Turn back first (or abandon). A
+    // co-review of local work has no Verdict.
+    let decide = if yours && co_review {
+        None
+    } else if yours {
         Button::new("Approve")
             .variant(ButtonVariant::Contrast)
             .on_press(move |s: &mut State| s.act(&approve_id, Service::approve))
             .build(k)
+            .into()
     } else {
         Button::new("Take Turn back")
             .variant(ButtonVariant::Outline)
             .on_press(move |s: &mut State| s.act(&take_back_id, Service::take_turn_back))
             .build(k)
+            .into()
     };
     let views = [
         ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
@@ -1093,23 +1126,14 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 .build(k),
         )
         .child(
-            Button::new("Abandon")
+            // Closing a co-review of local work is its normal end, not Abandoned.
+            Button::new(if co_review { "Close" } else { "Abandon" })
                 .variant(ButtonVariant::Ghost)
                 .on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
                 .build(k),
         )
-        .child(decide)
-        .child(
-            Button::new(if drafts == 0 { "Hand over Round".to_owned() } else { format!("Hand over Round ({drafts})") })
-                .variant(ButtonVariant::Submit)
-                .disabled(drafts == 0 || !yours)
-                .on_press(move |s: &mut State| {
-                    if let Err(error) = s.service.hand_over_round(&hand_over_id) {
-                        eprintln!("akshually: {error}");
-                    }
-                })
-                .build(k),
-        )
+        .children(decide)
+        .child(hand_over_button(k, tab))
 }
 
 /// During the agent's Turn: what the human can still do. Once ended: that the agent hasn't
@@ -1121,6 +1145,10 @@ fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
         }
         Some(Outcome::Published { verdict, url }) => {
             format!("Published with the Verdict {verdict}: {url}. Close this Session when you're done.")
+        }
+        Some(Outcome::Closed) => {
+            "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session."
+                .to_owned()
         }
         Some(Outcome::Abandoned | Outcome::Round(_)) => {
             "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
@@ -1294,9 +1322,7 @@ fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
 fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
     if thread.resolved.is_some() {
         resolved_row(k, thread, session)
-    } else if let [draft] = thread.comments.as_slice()
-        && draft.is_agent_draft()
-    {
+    } else if thread.comments.first().is_some_and(Comment::is_agent_draft) {
         agent_draft_card(k, s, thread, session, agent)
     } else {
         thread_card(k, thread, Some((s, session)))
@@ -1304,7 +1330,8 @@ fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: C
 }
 
 /// A co-Reviewer's Draft, dashed in the `agent` colour until the human keeps it, with Discard,
-/// Edit and Keep. Nothing reaches the Forge until it is kept.
+/// Question, Edit and Keep, and below it the questions about it and their answers. Nothing
+/// reaches the Forge until it is kept.
 fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
     let draft = &thread.comments[0];
     let mut card = card(k).border(1.0, agent).border_dash(4.0, 3.0).key(format!("agent-draft-{}", thread.id));
@@ -1325,17 +1352,29 @@ fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, age
     if let Some(suggestion) = &draft.suggestion {
         card = card.child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
     }
+    card = comments(k, card, thread, &thread.comments[1..]);
+    if s.reply.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id) {
+        return card.child(reply_composer(k, s));
+    }
     let on = |action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>| {
         let (session, id) = (session.clone(), thread.id.clone());
         move |s: &mut State| s.act_on_thread(&session, &id, action)
     };
     let (edit_session, edit_id) = (session.clone(), thread.id.clone());
+    let (question_session, question_id) = (session.clone(), thread.id.clone());
     card.child(
         row()
             .w_full()
             .gap(8.0)
             .child(row().grow(1.0))
             .child(Button::new("Discard").variant(ButtonVariant::Ghost).on_press(on(Service::discard_draft)).build(k))
+            .child(
+                // A question is a reply to the Draft, which the next Round hands to the agent.
+                Button::new("Question")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.open_reply(question_session.clone(), question_id.clone()))
+                    .build(k),
+            )
             .child(
                 Button::new("Edit")
                     .variant(ButtonVariant::Ghost)
@@ -1453,32 +1492,7 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    for comment in &thread.comments {
-        let who = match &comment.author {
-            Party::Human => "You",
-            Party::Agent => "Agent",
-            Party::Other(login) => login,
-        };
-        let when = match comment.round {
-            None if comment.is_draft() => "Draft · goes out with your next Round".to_owned(),
-            None => "on the Pull Request".to_owned(),
-            Some(round) => format!("Round {round}"),
-        };
-        card = card
-            .child(
-                row()
-                    .gap(8.0)
-                    .items_center()
-                    .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
-                    .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
-            )
-            .child(Markdown::new(comment.body.clone()).selectable(true).build(k));
-        if let Some(suggestion) = &comment.suggestion {
-            card = card
-                .child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
-                .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
-        }
-    }
+    card = comments(k, card, thread, &thread.comments);
     if thread.reopened {
         card = card.child(text("Reopened · goes out with your next Round").font(k.ty.small).color(k.c.text_faint));
     }
@@ -1504,6 +1518,37 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
                     .children(resolve_button(k, thread, session)),
             )
         };
+    }
+    card
+}
+
+/// `comments` of `thread` added to `card`, each under who wrote it and when.
+fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El {
+    for comment in comments {
+        let who = match &comment.author {
+            Party::Human => "You",
+            Party::Agent => "Agent",
+            Party::Other(login) => login.as_str(),
+        };
+        let when = match comment.round {
+            None if comment.is_draft() => "Draft · goes out with your next Round".to_owned(),
+            None => "on the Pull Request".to_owned(),
+            Some(round) => format!("Round {round}"),
+        };
+        card = card
+            .child(
+                row()
+                    .gap(8.0)
+                    .items_center()
+                    .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
+                    .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
+            )
+            .child(Markdown::new(comment.body.clone()).selectable(true).build(k));
+        if let Some(suggestion) = &comment.suggestion {
+            card = card
+                .child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
+                .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
+        }
     }
     card
 }

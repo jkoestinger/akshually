@@ -4,25 +4,29 @@ use std::fmt::Write;
 
 use akshually_core::{Anchor, Outcome, Round, Side, Thread};
 
-/// What `review --format markdown` prints for `outcome`.
-pub fn outcome_markdown(outcome: &Outcome) -> String {
+/// What `review --format markdown` prints for `outcome`; `pr` is the Pull Request the agent
+/// co-reviews, if any, which its commands must name.
+pub fn outcome_markdown(outcome: &Outcome, pr: Option<&str>) -> String {
     match outcome {
-        Outcome::Round(round) => round_markdown(round),
+        Outcome::Round(round) => round_markdown(round, pr),
         Outcome::Approved => "Approved.\n".to_owned(),
         Outcome::Abandoned => {
             "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n".to_owned()
         }
         Outcome::Published { verdict, url } => format!("Published with the Verdict {verdict}: {url}\n"),
+        Outcome::Closed => "Closed: the human finished with your co-review. There is nothing left to do.\n".to_owned(),
     }
 }
 
 /// A Round as markdown: one section per Thread, headed by its stable ID and Anchor, with the
 /// anchored code and then each Comment's markdown body.
-fn round_markdown(round: &Round) -> String {
+fn round_markdown(round: &Round, pr: Option<&str>) -> String {
     let count = round.threads.len();
+    let pr = pr.map(|url| format!(" --pr {url}")).unwrap_or_default();
     let mut out = format!(
         "# Round {}\n\nThe human handed over {count} Thread{}. Address each one, answer it with \
-         `akshually reply <thread> \"…\"` or `akshually resolve <thread>`, then run `akshually review` again.\n",
+         `akshually reply{pr} <thread> \"…\"` or `akshually resolve{pr} <thread>`, then run \
+         `akshually review{pr}` again.\n",
         round.number,
         if count == 1 { "" } else { "s" },
     );

@@ -6,12 +6,11 @@ use std::time::Duration;
 
 use super::{
     Call, ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Turn, Verdict, Waiter,
-    check_comment,
 };
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
-use crate::thread::{Anchor, Comment, ForgeThread, NewComment, Party, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId};
 use crate::{Changeset, Error};
 
 impl Service {
@@ -31,26 +30,6 @@ impl Service {
         inner.inbox.saved.looked_at(&pr);
         inner.notify_inbox();
         Ok(id)
-    }
-
-    /// Agent, as co-Reviewer: opens a Thread on the Pull Request at `url` with `comment`
-    /// (markdown, plus any suggestion) as an agent Draft, for the human to keep, edit or
-    /// discard. Opens the Pull Request's Session if needed, without taking the human's view.
-    /// Blocks on the Forge.
-    pub fn draft(&self, url: &str, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
-        let comment = comment.into();
-        check_comment(&anchor, &comment)?;
-        let (id, _) = self.open_pull_request_session(url, Some(Role::CoReviewer))?;
-        let mut inner = self.lock();
-        let at = inner.position(&id)?;
-        let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        session.join(Role::CoReviewer)?;
-        let thread = session.open_thread(anchor, comment, Party::Agent)?;
-        inner.notify();
-        Ok(thread)
     }
 
     /// Agent, as co-Reviewer: hands its Drafts on the Pull Request at `url` to the human, and
@@ -221,13 +200,18 @@ impl Service {
 
     /// Human: closes a Pull Request Session, Published or not; unpublished Drafts go with it.
     /// A co-Reviewer is told the Session was Abandoned, unless it is still to collect what the
-    /// human Published (`Error::Ended`).
+    /// human Published (`Error::Ended`). Closing a co-review of local work is its normal end,
+    /// which its co-Reviewer is told as Closed.
     pub fn close(&self, id: &SessionId) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
         if session.view.pull_request.is_none() {
-            return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
+            if session.view.agent != Some(Role::CoReviewer) {
+                return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
+            }
+            drop(inner);
+            return self.end(id, Outcome::Closed);
         }
         if session.publishing {
             return Err(Error::Publishing);
@@ -371,21 +355,26 @@ impl Drafts {
                 Some(forge) if forge.resolved && thread.resolved.is_none() => reopen.push(thread.clone()),
                 _ => {}
             }
-            let drafts: Vec<Comment> = thread.comments.iter().filter(|c| c.is_draft()).cloned().collect();
+            let mut drafts: Vec<Comment> = thread.comments.iter().filter(|c| c.is_draft()).cloned().collect();
             if drafts.is_empty() {
                 continue;
             }
-            let sendable = drafts.iter().all(|c| c.author == Party::Human)
-                && match thread.forge {
-                    // A reply: the Thread is there whatever became of its code.
-                    Some(_) => true,
-                    // The Forge refuses lines out of its diff, which a reload can leave a Draft on.
-                    None => {
-                        drafts.len() == thread.comments.len()
-                            && !thread.outdated
-                            && view.changeset.takes_comment_at(&thread.anchor)
+            let sendable = match thread.forge {
+                // A reply: the Thread is there whatever became of its code.
+                Some(_) => drafts.iter().all(|c| c.author == Party::Human),
+                // A new Thread sends its opening Draft: what follows it, questions to the
+                // co-Reviewer and their answers, stays here. The Forge refuses lines out of its
+                // diff, which a reload can leave a Draft on.
+                None => {
+                    let opening = thread.comments.first().filter(|c| c.is_draft() && c.author == Party::Human);
+                    let sendable =
+                        opening.is_some() && !thread.outdated && view.changeset.takes_comment_at(&thread.anchor);
+                    if sendable {
+                        drafts = opening.into_iter().cloned().collect();
                     }
-                };
+                    sendable
+                }
+            };
             let list = if sendable { &mut kept } else { &mut discarded };
             list.push(Thread { comments: drafts, ..thread.clone() });
         }
