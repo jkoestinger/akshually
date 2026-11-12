@@ -11,6 +11,7 @@ mod paths;
 mod reanchor;
 mod service;
 mod settings;
+mod store;
 mod thread;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};

@@ -10,11 +10,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
+use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
-/// Identifies a Session for as long as the app runs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Identifies a Session, across restarts too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -47,10 +48,11 @@ pub enum Outcome {
 }
 
 /// Whose move a Session is waiting on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Turn {
     /// The agent waits on the human: a `review` call is blocked.
+    #[default]
     Human,
     /// The human handed over a Round; the agent is working on it.
     Agent,
@@ -89,8 +91,10 @@ impl ReviewRequest {
     }
 }
 
-/// What the UI (and tests) can observe of one Session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the UI (and tests) can observe of one Session. It's persisted: a field missing from
+/// an older saved Session takes its `Default`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
     /// The working tree root: each worktree is its own Session.
@@ -141,7 +145,7 @@ impl SessionView {
 }
 
 /// Which of a Session's Changesets the human is looking at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
@@ -149,6 +153,7 @@ pub enum ChangesetView {
     /// Only the changes since the last Round (the default from Round 2 on).
     SinceLastRound,
     /// The whole Changeset.
+    #[default]
     Full,
 }
 
@@ -177,14 +182,28 @@ impl PendingReview {
 
 type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 
+/// A Session as the service keeps it, and as the store saves it: every field but the waiter
+/// survives a restart, and a field missing from an older saved Session takes its `Default`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Session {
     view: SessionView,
-    /// The agent's blocked `review` call, if any.
+    /// The agent's blocked `review` call, if any. A restart drops it; the agent's next
+    /// `review` attaches to the restored Session.
+    #[serde(skip)]
     waiter: Option<Sender<Outcome>>,
     /// Threads opened so far, for numbering the next one.
     threads_opened: u32,
     /// Rounds handed over while no `review` call waited, oldest first.
     queued: Vec<Round>,
+}
+
+/// A Session base as saved: `session_bases` keys by a tuple, which JSON can't.
+#[derive(Serialize, Deserialize)]
+struct SessionBase {
+    repo: PathBuf,
+    branch: String,
+    tree: String,
 }
 
 #[derive(Default)]
@@ -200,6 +219,8 @@ struct Inner {
     /// Whether the human is looking at akshually's window.
     window_focused: bool,
     notifier: Option<Box<dyn Notifier>>,
+    /// Where Sessions are saved; `None` keeps them in memory only.
+    store: Option<Store>,
 }
 
 impl Inner {
@@ -231,7 +252,29 @@ impl Inner {
         self.sessions.iter().map(|s| s.view.clone()).collect()
     }
 
-    fn notify(&self) {
+    /// Saves the Sessions and Session bases, if the service has a store.
+    fn save(&mut self) {
+        let Some(store) = &mut self.store else { return };
+        let mut bases: Vec<SessionBase> = self
+            .session_bases
+            .iter()
+            .map(|((repo, branch), tree)| SessionBase {
+                repo: repo.clone(),
+                branch: branch.clone(),
+                tree: tree.clone(),
+            })
+            .collect();
+        bases.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        let saved = store.sync(self.sessions.iter().map(|s| (&s.view.id, s))).and_then(|()| store.sync_bases(&bases));
+        // The change already happened in memory; a failed save shouldn't undo it.
+        if let Err(error) = saved {
+            eprintln!("akshually: couldn't save Sessions: {error}");
+        }
+    }
+
+    /// Publishes a change: saves it, then tells subscribers.
+    fn notify(&mut self) {
+        self.save();
         if self.subscribers.is_empty() {
             return;
         }
@@ -249,8 +292,21 @@ pub struct Service {
 }
 
 impl Service {
+    /// A service that keeps its Sessions in memory only.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A service that saves its Sessions under `state_dir` (never inside a repository) and
+    /// restores the ones saved there by an earlier run.
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let (store, mut sessions, bases) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
+        sessions.sort_by_key(|s| id_number(&s.view.id));
+        let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
+        let bases: Vec<SessionBase> = bases;
+        let session_bases = bases.into_iter().map(|b| ((b.repo, b.branch), b.tree)).collect();
+        let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
+        Ok(Service { inner: Mutex::new(inner) })
     }
 
     /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
@@ -319,7 +375,9 @@ impl Service {
         let repo = git::toplevel(cwd)?;
         let branch = git::branch(&repo)?;
         let base = changeset::snapshot(&repo)?;
-        self.lock().session_bases.insert((repo, branch), base);
+        let mut inner = self.lock();
+        inner.session_bases.insert((repo, branch), base);
+        inner.save();
         Ok(())
     }
 
@@ -411,7 +469,7 @@ impl Service {
                     attention: false,
                     viewed: BTreeSet::new(),
                 };
-                inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
+                inner.sessions.push(Session { view, waiter: Some(tx), ..Session::default() });
                 let at = inner.sessions.len() - 1;
                 inner.became_humans_turn(at);
                 id
@@ -535,4 +593,9 @@ impl Service {
         inner.notify();
         Ok(())
     }
+}
+
+/// The `n` of a Session id `sn`.
+fn id_number(id: &SessionId) -> Option<u64> {
+    id.as_str().strip_prefix('s')?.parse().ok()
 }
