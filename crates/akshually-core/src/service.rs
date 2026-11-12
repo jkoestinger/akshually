@@ -1,6 +1,6 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, Notification, Notifier, Settings, git};
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,16 +108,34 @@ pub struct SessionView {
     pub attention: bool,
     /// The agent's changes since the Session base, when it ran `start` first.
     pub since_session_base: Option<Changeset>,
+    /// The full Changeset as it was when the last Round was handed over; `None` before the
+    /// first handover.
+    pub last_round: Option<Changeset>,
+    /// What changed since `last_round`, with the last Round's code as the old side.
+    pub since_last_round: Option<Changeset>,
     /// Which Changeset the human is looking at.
     pub view: ChangesetView,
+    /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
+    pub viewed: BTreeSet<String>,
 }
 
 impl SessionView {
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
-        match (self.view, &self.since_session_base) {
-            (ChangesetView::SinceSessionBase, Some(since)) => since,
+        match (self.view, &self.since_session_base, &self.since_last_round) {
+            (ChangesetView::SinceSessionBase, Some(since), _) => since,
+            (ChangesetView::SinceLastRound, _, Some(since)) => since,
             _ => &self.changeset,
+        }
+    }
+
+    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
+    /// where the old side is that Round's code rather than a base and files the agent left
+    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    pub fn anchored_in(&self) -> &Changeset {
+        match self.view {
+            ChangesetView::SinceLastRound => &self.changeset,
+            _ => self.shown(),
         }
     }
 }
@@ -128,6 +146,8 @@ impl SessionView {
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
     SinceSessionBase,
+    /// Only the changes since the last Round (the default from Round 2 on).
+    SinceLastRound,
     /// The whole Changeset.
     Full,
 }
@@ -308,7 +328,17 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            let before = session.anchored_in().clone();
+            session.view = view;
+            // Threads follow the Changeset they are anchored in.
+            if session.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut session.threads);
+                reanchor(&mut threads, session.anchored_in());
+                session.threads = threads;
+            }
+        }
         inner.notify();
         Ok(())
     }
@@ -332,8 +362,23 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                let before = session.view.anchored_in().clone();
+                for file in changeset.since(&session.view.changeset).files {
+                    session.view.viewed.remove(&file.path);
+                }
                 session.view.changeset = changeset;
                 session.view.since_session_base = since_session_base;
+                session.view.since_last_round =
+                    session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
+                if session.view.since_last_round.is_some() {
+                    session.view.view = ChangesetView::SinceLastRound;
+                }
+                // Threads follow the Changeset they are anchored in.
+                if session.view.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.view.threads);
+                    reanchor(&mut threads, session.view.anchored_in());
+                    session.view.threads = threads;
+                }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
                     if session.view.turn != Turn::Human {
@@ -357,11 +402,14 @@ impl Service {
                     branch,
                     changeset,
                     since_session_base,
+                    last_round: None,
+                    since_last_round: None,
                     view,
                     round: 1,
                     threads: Vec::new(),
                     turn: Turn::Human,
                     attention: false,
+                    viewed: BTreeSet::new(),
                 };
                 inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
                 let at = inner.sessions.len() - 1;
@@ -373,21 +421,30 @@ impl Service {
         Ok(PendingReview { session: id, outcome: rx })
     }
 
-    /// Human: opens a Thread at `anchor` with `body` (markdown) as a Draft, which goes out
-    /// with the next Round.
-    pub fn comment(&self, id: &SessionId, anchor: Anchor, body: impl Into<String>) -> Result<ThreadId, Error> {
-        let body = body.into();
+    /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
+    /// Draft, which goes out with the next Round.
+    pub fn comment(&self, id: &SessionId, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
+        let NewComment { body, suggestion } = comment.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
+        }
+        if suggestion.is_some() && !matches!(anchor, Anchor::Lines { side: Side::New, .. }) {
+            return Err(Error::InvalidSuggestion);
         }
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        let excerpt = anchor.excerpt(session.view.shown()).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
-        let comment = Comment { author: Party::Human, body, round: None };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        let comment = Comment { author: Party::Human, body, round: None, suggestion };
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            outdated: false,
+        });
         inner.notify();
         Ok(thread)
     }
@@ -419,6 +476,9 @@ impl Service {
         }
         session.view.round += 1;
         session.view.turn = Turn::Agent;
+        session.view.since_last_round =
+            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
+        session.view.last_round = Some(session.view.changeset.clone());
         let round = Round { number, threads };
         match session.waiter.take() {
             // A waiter that went away gives the Round back, for the next call.
@@ -431,6 +491,23 @@ impl Service {
         }
         inner.notify();
         Ok(number)
+    }
+
+    /// Human: ticks `path` as viewed, or unticks it.
+    pub fn mark_viewed(&self, id: &SessionId, path: &str, viewed: bool) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let view = &mut inner.sessions[at].view;
+        if !view.changeset.files.iter().any(|f| f.path == path) {
+            return Err(Error::NotInChangeset(path.to_owned()));
+        }
+        if viewed {
+            view.viewed.insert(path.to_owned());
+        } else {
+            view.viewed.remove(path);
+        }
+        inner.notify();
+        Ok(())
     }
 
     /// Human: approves the Session, which ends it and returns the Verdict to the agent.
