@@ -25,6 +25,31 @@ pub struct FileChange {
     pub new: Option<String>,
 }
 
+impl Changeset {
+    /// What changed between `earlier` (a Round snapshot) and this Changeset: one file per path
+    /// whose new side differs, with `earlier`'s new side as `old`. A file missing from one of
+    /// the two is taken to be at the base there, so both should share the same base.
+    pub fn since(&self, earlier: &Changeset) -> Changeset {
+        let mut files: Vec<FileChange> = Vec::new();
+        for now in &self.files {
+            let then = match earlier.files.iter().find(|f| f.path == now.path) {
+                Some(then) => &then.new,
+                None => &now.old,
+            };
+            if then != &now.new {
+                files.push(FileChange { path: now.path.clone(), old: then.clone(), new: now.new.clone() });
+            }
+        }
+        for then in &earlier.files {
+            if !self.files.iter().any(|f| f.path == then.path) && then.new != then.old {
+                files.push(FileChange { path: then.path.clone(), old: then.new.clone(), new: then.old.clone() });
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Changeset { base: self.base.clone(), files }
+    }
+}
+
 /// The local Source's Changeset for `repo`: HEAD against its merge-base with the default
 /// branch, plus uncommitted changes (staged or not) to tracked files.
 pub(crate) fn local(repo: &Path) -> Result<Changeset, Error> {

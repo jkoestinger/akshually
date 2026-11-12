@@ -29,4 +29,6 @@ pub enum Error {
     EmptyComment,
     #[error("there are no Drafts to hand over")]
     NoDrafts,
+    #[error("{0} isn't in the Changeset")]
+    NotInChangeset(String),
 }

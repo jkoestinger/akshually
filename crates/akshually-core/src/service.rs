@@ -1,5 +1,6 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -70,6 +71,24 @@ pub struct SessionView {
     pub round: u32,
     /// In the order they were opened.
     pub threads: Vec<Thread>,
+    /// The Changeset as it was when the last Round was handed over; `None` before the first.
+    pub last_round: Option<Changeset>,
+    /// Whether the view shows only the changes since `last_round` rather than the full
+    /// Changeset. On by default whenever the agent hands back after a Round.
+    pub since_last_round: bool,
+    /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
+    pub viewed: BTreeSet<String>,
+}
+
+impl SessionView {
+    /// The Changeset the view shows: the changes since the last Round when
+    /// `since_last_round` is on, otherwise the full Changeset.
+    pub fn shown(&self) -> Changeset {
+        match (&self.last_round, self.since_last_round) {
+            (Some(snapshot), true) => self.changeset.since(snapshot),
+            _ => self.changeset.clone(),
+        }
+    }
 }
 
 /// A `review` call waiting for the human. Dropping it stops waiting.
@@ -179,7 +198,11 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                for file in changeset.since(&session.view.changeset).files {
+                    session.view.viewed.remove(&file.path);
+                }
                 session.view.changeset = changeset;
+                session.view.since_last_round = session.view.last_round.is_some();
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
                 } else {
@@ -190,7 +213,17 @@ impl Service {
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = SessionView { id: id.clone(), repo, branch, changeset, round: 1, threads: Vec::new() };
+                let view = SessionView {
+                    id: id.clone(),
+                    repo,
+                    branch,
+                    changeset,
+                    round: 1,
+                    threads: Vec::new(),
+                    last_round: None,
+                    since_last_round: false,
+                    viewed: BTreeSet::new(),
+                };
                 inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
                 id
             }
@@ -244,6 +277,7 @@ impl Service {
             return Err(Error::NoDrafts);
         }
         session.view.round += 1;
+        session.view.last_round = Some(session.view.changeset.clone());
         let round = Round { number, threads };
         match session.waiter.take() {
             // A waiter that went away gives the Round back, for the next call.
@@ -256,6 +290,34 @@ impl Service {
         }
         inner.notify();
         Ok(number)
+    }
+
+    /// Human: shows only the changes since the last Round (`true`) or the full Changeset.
+    /// Before the first Round there's only the full Changeset.
+    pub fn show_since_last_round(&self, id: &SessionId, on: bool) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let view = &mut inner.sessions[at].view;
+        view.since_last_round = on && view.last_round.is_some();
+        inner.notify();
+        Ok(())
+    }
+
+    /// Human: ticks `path` as viewed, or unticks it.
+    pub fn mark_viewed(&self, id: &SessionId, path: &str, viewed: bool) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let view = &mut inner.sessions[at].view;
+        if !view.changeset.files.iter().any(|f| f.path == path) {
+            return Err(Error::NotInChangeset(path.to_owned()));
+        }
+        if viewed {
+            view.viewed.insert(path.to_owned());
+        } else {
+            view.viewed.remove(path);
+        }
+        inner.notify();
+        Ok(())
     }
 
     /// Human: approves the Session, which ends it and returns the Verdict to the agent.

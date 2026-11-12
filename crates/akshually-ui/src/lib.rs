@@ -9,7 +9,7 @@ use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, 
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
-use rune_kit::{Badge, Button, ButtonVariant, Kit, TextArea};
+use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, SegmentedControl, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -72,26 +72,34 @@ struct Composer {
 
 struct SessionTab {
     session: SessionView,
+    /// What the diff shows: the full Changeset or the changes since the last Round.
+    shown: Changeset,
     diff: DiffState,
 }
 
 impl SessionTab {
     fn new(session: SessionView) -> Self {
-        let diff = DiffState::new(file_diffs(&session.changeset));
-        let mut tab = SessionTab { session, diff };
+        let shown = session.shown();
+        let diff = DiffState::new(file_diffs(&shown));
+        let mut tab = SessionTab { session, shown, diff };
         tab.annotate(None);
         tab
     }
 
     /// Puts each Thread, and the composer when it's on this Session, under its last line.
     fn annotate(&mut self, composer: Option<&Composer>) {
-        let changeset = &self.session.changeset;
+        let changeset = &self.shown;
+        // Since the last Round, the old side is the last Round's code, not the base's.
+        let old_side_shown = !self.session.since_last_round;
         let mut notes: Vec<Annotation> = self
             .session
             .threads
             .iter()
             .filter_map(|t| {
                 let Anchor::Lines { path, side, end, .. } = &t.anchor;
+                if *side == Side::Old && !old_side_shown {
+                    return None;
+                }
                 let file = changeset.files.iter().position(|f| &f.path == path)?;
                 Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
             })
@@ -171,8 +179,10 @@ impl State {
             .map(|session| match old.iter().position(|t| t.session.id == session.id) {
                 Some(at) => {
                     let mut tab = old.swap_remove(at);
-                    if tab.session.changeset != session.changeset {
-                        tab.diff.set_files(file_diffs(&session.changeset));
+                    let shown = session.shown();
+                    if tab.shown != shown {
+                        tab.diff.set_files(file_diffs(&shown));
+                        tab.shown = shown;
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -202,7 +212,11 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
-        let Some(anchor) = anchor_for(&tab.session.changeset, range) else { return };
+        if tab.session.since_last_round && range.end.side == diff::Side::Old {
+            // Those lines are the last Round's code, which a Thread can't anchor to.
+            return;
+        }
+        let Some(anchor) = anchor_for(&tab.shown, range) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
         self.composer_text = TextEdit::new("");
@@ -234,7 +248,11 @@ impl State {
 
     /// Runs a human action on the service; the service's update then refreshes the view.
     fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
-        if let Err(error) = action(&self.service, id) {
+        self.act_with(|svc| action(svc, id));
+    }
+
+    fn act_with(&self, action: impl FnOnce(&Service) -> Result<(), akshually_core::Error>) {
+        if let Err(error) = action(&self.service) {
             eprintln!("akshually: {error}");
         }
     }
@@ -290,6 +308,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .child(text(format!("→ {base}")).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(row().grow(1.0))
+        .child(view_toggle(k, session))
         .child(
             Button::new("Abandon")
                 .variant(ButtonVariant::Ghost)
@@ -315,6 +334,29 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         )
 }
 
+/// "Since last Round" or "Full Changeset", from Round 2 on.
+fn view_toggle(k: &Kit, session: &SessionView) -> El {
+    if session.last_round.is_none() {
+        return row();
+    }
+    let id = session.id.clone();
+    SegmentedControl::new(&["Since last Round", "Full Changeset"], Some(usize::from(!session.since_last_round)))
+        .fit()
+        .on_pick(move |s: &mut State, i, _| s.act_with(|svc| svc.show_since_last_round(&id, i == 0)))
+        .build(k)
+}
+
+fn viewed_tick(k: &Kit, s: &State, file: usize) -> El {
+    let Some(tab) = s.active_tab() else { return row() };
+    let Some(path) = tab.shown.files.get(file).map(|f| f.path.clone()) else { return row() };
+    let viewed = tab.session.viewed.contains(&path);
+    let id = tab.session.id.clone();
+    Checkbox::new(viewed)
+        .label("Viewed")
+        .on_toggle(move |s: &mut State| s.act_with(|svc| svc.mark_viewed(&id, &path, !viewed)))
+        .build(k)
+}
+
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
@@ -326,6 +368,10 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     .annotation({
         let k = k.clone();
         move |s: &State, a: &Annotation| annotation(&k, s, a)
+    })
+    .header_actions({
+        let k = k.clone();
+        move |s: &State, file: usize| viewed_tick(&k, s, file)
     })
     .on_comment(|s: &mut State, range: LineRange, _: &mut Tx| s.compose(range))
     .build(s, k)
@@ -411,6 +457,9 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// `--scene session`: a sample Session, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
+    // Round 1 had `src/session.rs` as it was at the base, and `src/round.rs` already.
+    let mut last_round = changeset.clone();
+    last_round.files[0].new = last_round.files[0].old.clone();
     let session = SessionView {
         id: SessionId::new("sample"),
         repo: "/home/me/akshually".into(),
@@ -421,6 +470,9 @@ fn scene_session(s: &mut State) {
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
         ],
+        last_round: Some(last_round),
+        since_last_round: true,
+        viewed: ["src/round.rs".to_owned()].into(),
     };
     s.apply(vec![session]);
 }
