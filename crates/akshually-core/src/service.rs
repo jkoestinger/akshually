@@ -583,7 +583,9 @@ impl Service {
             anchor,
             excerpt,
             comments: vec![comment],
+            resolved: None,
             outdated: false,
+            reopened: false,
         });
         inner.notify();
         Ok(thread)
@@ -607,8 +609,9 @@ impl Service {
                     c.clone()
                 })
                 .collect();
-            if !drafts.is_empty() {
+            if !drafts.is_empty() || thread.reopened {
                 threads.push(Thread { comments: drafts, ..thread.clone() });
+                thread.reopened = false;
             }
         }
         if threads.is_empty() {
@@ -633,6 +636,76 @@ impl Service {
         }
         inner.notify();
         Ok(number)
+    }
+
+    /// Agent: replies to `thread` in the Session for the repository and branch at `cwd`. The
+    /// human sees it at once; it counts towards the Round being drafted.
+    pub fn reply(&self, cwd: &Path, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.agent_thread(cwd, thread, |round, thread| {
+            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round), suggestion: None });
+        })
+    }
+
+    /// Agent: marks `thread` Resolved in the Session for the repository and branch at `cwd`.
+    pub fn resolve(&self, cwd: &Path, thread: &ThreadId) -> Result<(), Error> {
+        self.agent_thread(cwd, thread, |_, thread| resolve(thread, Party::Agent))
+    }
+
+    /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
+    /// next Round under that Thread.
+    pub fn reply_in_thread(&self, id: &SessionId, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.human_thread(id, thread, |t| {
+            t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
+        })
+    }
+
+    /// Human: marks `thread` Resolved, whoever opened it.
+    pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| resolve(t, Party::Human))
+    }
+
+    /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
+    pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| {
+            if t.resolved.take().is_some() {
+                t.reopened = true;
+            }
+        })
+    }
+
+    fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);
+        f(found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Runs `f` on a Thread the agent has received, in the Session for `cwd`, with the number
+    /// of the Round being drafted.
+    fn agent_thread(&self, cwd: &Path, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let mut inner = self.lock();
+        let Some(session) = inner.sessions.iter_mut().find(|s| s.view.repo == repo && s.view.branch == branch) else {
+            return Err(Error::NoSessionHere { repo, branch });
+        };
+        let round = session.view.round;
+        // A Thread still all Drafts hasn't reached the agent, so it can't know its ID.
+        let found =
+            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| !c.is_draft()));
+        f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
     }
 
     /// Human: ticks `path` as viewed, or unticks it.
@@ -677,6 +750,12 @@ impl Service {
         inner.notify();
         Ok(())
     }
+}
+
+/// Marks `thread` Resolved by `by`; a reopening not yet handed over no longer needs telling.
+fn resolve(thread: &mut Thread, by: Party) {
+    thread.resolved = Some(by);
+    thread.reopened = false;
 }
 
 /// The paths whose change differs between two Changesets, including files in only one of them.

@@ -68,6 +68,9 @@ struct State {
     /// The Comment being written, at most one in the window.
     composer: Option<Composer>,
     composer_text: TextEdit,
+    /// The Thread a reply is being written in, at most one in the window.
+    reply: Option<(SessionId, ThreadId)>,
+    reply_text: TextEdit,
 }
 
 /// A Comment being written, before it becomes a Draft.
@@ -118,8 +121,10 @@ impl SessionTab {
         self.diff.set_annotations(notes);
     }
 
-    fn drafts(&self) -> usize {
-        self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
+    /// What the next Round carries: each Draft, and each Thread the human reopened.
+    fn to_hand_over(&self) -> usize {
+        let drafts = self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count();
+        drafts + self.session.threads.iter().filter(|t| t.reopened).count()
     }
 
     fn title(&self) -> String {
@@ -209,8 +214,15 @@ fn bytes(n: u64) -> String {
 
 impl State {
     fn new(service: Arc<Service>) -> Self {
-        let mut state =
-            State { service, tabs: Vec::new(), active: None, composer: None, composer_text: TextEdit::new("") };
+        let mut state = State {
+            service,
+            tabs: Vec::new(),
+            active: None,
+            composer: None,
+            composer_text: TextEdit::new(""),
+            reply: None,
+            reply_text: TextEdit::new(""),
+        };
         let sessions = state.service.sessions();
         state.apply(sessions);
         state
@@ -240,6 +252,9 @@ impl State {
             .collect();
         if self.composer.as_ref().is_some_and(|c| !self.tabs.iter().any(|t| t.session.id == c.session)) {
             self.composer = None;
+        }
+        if self.reply.as_ref().is_some_and(|(session, _)| !self.tabs.iter().any(|t| &t.session.id == session)) {
+            self.close_reply();
         }
         self.annotate();
         if self.active_tab().is_none() {
@@ -320,6 +335,26 @@ impl State {
         }
     }
 
+    /// Opens the reply composer in `thread`.
+    fn open_reply(&mut self, session: SessionId, thread: ThreadId) {
+        self.reply = Some((session, thread));
+        self.reply_text = TextEdit::new("");
+    }
+
+    fn close_reply(&mut self) {
+        self.reply = None;
+        self.reply_text = TextEdit::new("");
+    }
+
+    /// Turns the reply composer's text into a Draft in its Thread.
+    fn save_reply(&mut self) {
+        let Some((session, thread)) = &self.reply else { return };
+        match self.service.reply_in_thread(session, thread, self.reply_text.text.clone()) {
+            Ok(()) => self.close_reply(),
+            Err(error) => eprintln!("akshually: {error}"),
+        }
+    }
+
     /// Expands or collapses an Outdated Thread.
     fn toggle_outdated(&mut self, session: &SessionId, thread: &ThreadId) {
         let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == session) else { return };
@@ -342,6 +377,18 @@ impl State {
     /// Runs a human action on the service; the service's update then refreshes the view.
     fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
         if let Err(error) = action(&self.service, id) {
+            eprintln!("akshually: {error}");
+        }
+    }
+
+    /// `act`, for a human action on one Thread.
+    fn act_on_thread(
+        &self,
+        id: &SessionId,
+        thread: &ThreadId,
+        action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>,
+    ) {
+        if let Err(error) = action(&self.service, id, thread) {
             eprintln!("akshually: {error}");
         }
     }
@@ -414,7 +461,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         "since Session base".to_owned()
     };
     let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
-    let drafts = tab.drafts();
+    let drafts = tab.to_hand_over();
     let views = [
         ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
         ("Since Session base", ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
@@ -562,7 +609,7 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
     }
     let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
     for thread in threads {
-        list = list.child(thread_card(k, thread));
+        list = list.child(thread_view(k, s, thread, tab.session.id.clone()));
     }
     if composing {
         list = list.child(composer(k, s));
@@ -574,18 +621,79 @@ fn annotation(k: &Kit, s: &State, a: &Annotation) -> El {
     if a.id == COMPOSER {
         return composer(k, s);
     }
-    let thread = s.active_tab().and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id));
-    match thread {
-        Some(thread) => thread_card(k, thread),
+    let tab = s.active_tab();
+    match tab.and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id).map(|th| (t, th))) {
+        Some((tab, thread)) => thread_view(k, s, thread, tab.session.id.clone()),
         None => col(),
     }
+}
+
+/// A Thread of `session`: its card, or one line while it's Resolved.
+fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId) -> El {
+    if thread.resolved.is_some() {
+        resolved_row(k, thread, session)
+    } else {
+        thread_card(k, thread, Some((s, session)))
+    }
+}
+
+/// Reopen for a Resolved Thread, Resolve for one that has reached the agent; nothing for a
+/// Thread still all Drafts.
+fn resolve_button(k: &Kit, thread: &Thread, session: SessionId) -> Option<El> {
+    let id = thread.id.clone();
+    if thread.resolved.is_some() {
+        let reopen = move |s: &mut State| s.act_on_thread(&session, &id, Service::reopen_thread);
+        Some(Button::new("Reopen").variant(ButtonVariant::Ghost).on_press(reopen).build(k))
+    } else if thread.comments.iter().any(|c| !c.is_draft()) {
+        let resolve = move |s: &mut State| s.act_on_thread(&session, &id, Service::resolve_thread);
+        Some(Button::new("Resolve").variant(ButtonVariant::Ghost).on_press(resolve).build(k))
+    } else {
+        None
+    }
+}
+
+/// `Resolved by agent · `, or nothing for an open Thread.
+fn resolved_by(thread: &Thread) -> &'static str {
+    match thread.resolved {
+        Some(Party::Agent) => "✓ Resolved by agent · ",
+        Some(Party::Human) => "✓ Resolved by you · ",
+        None => "",
+    }
+}
+
+/// A Resolved Thread, collapsed to one line with a way to reopen it.
+fn resolved_row(k: &Kit, thread: &Thread, session: SessionId) -> El {
+    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let count = thread.comments.len();
+    row()
+        .w_full()
+        .max_w(720.0)
+        .px(12.0)
+        .py(6.0)
+        .gap(8.0)
+        .items_center()
+        .radius(8.0)
+        .border(1.0, k.c.border_weak)
+        .child(
+            text(format!(
+                "{}{} · “{first}” · {count} Comment{}",
+                resolved_by(thread),
+                thread.id,
+                if count == 1 { "" } else { "s" }
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_faint),
+        )
+        .child(row().grow(1.0))
+        .children(resolve_button(k, thread, session))
 }
 
 fn card(k: &Kit) -> El {
     col().w_full().max_w(720.0).padding(12.0).gap(8.0).radius(8.0).fill(k.c.layer_01).border(1.0, k.c.border_weak)
 }
 
-fn thread_card(k: &Kit, thread: &Thread) -> El {
+/// A Thread's Comments, with its Reply and Resolve controls when `actions` gives the Session.
+fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -> El {
     let mut card = card(k);
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
@@ -614,7 +722,70 @@ fn thread_card(k: &Kit, thread: &Thread) -> El {
                 .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
         }
     }
+    if thread.reopened {
+        card = card.child(text("Reopened · goes out with your next Round").font(k.ty.small).color(k.c.text_faint));
+    }
+    // A Thread still all Drafts goes out whole with the next Round: nothing to reply to yet.
+    let sent = thread.comments.iter().any(|c| !c.is_draft());
+    if let Some((s, session)) = actions.filter(|_| sent) {
+        let replying = s.reply.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id);
+        card = if replying {
+            card.child(reply_composer(k, s))
+        } else {
+            let (reply_session, id) = (session.clone(), thread.id.clone());
+            card.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .child(row().grow(1.0))
+                    .child(
+                        Button::new("Reply")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(move |s: &mut State| s.open_reply(reply_session.clone(), id.clone()))
+                            .build(k),
+                    )
+                    .children(resolve_button(k, thread, session)),
+            )
+        };
+    }
     card
+}
+
+/// The reply being written in a Thread: a Draft until the Round is handed over.
+fn reply_composer(k: &Kit, s: &State) -> El {
+    col()
+        .key("reply-composer")
+        .w_full()
+        .gap(8.0)
+        .child(
+            TextArea::new(&s.reply_text)
+                .placeholder("Reply…")
+                .width(None)
+                .auto_grow(2, 12)
+                .on_edit(|s: &mut State| &mut s.reply_text)
+                .on_submit(|s: &mut State, _| s.save_reply())
+                .build(k),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(text("Markdown · a Draft until you hand over the Round").font(k.ty.small).color(k.c.text_faint))
+                .child(row().grow(1.0))
+                .child(
+                    Button::new("Discard")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut State| s.close_reply())
+                        .build(k),
+                )
+                .child(
+                    Button::new("Save Draft")
+                        .variant(ButtonVariant::Submit)
+                        .on_press(|s: &mut State| s.save_reply())
+                        .build(k),
+                ),
+        )
 }
 
 /// What a File or Review Thread is on; line Threads sit on their lines instead.
@@ -659,11 +830,12 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             .gap(8.0)
             .items_center()
             .child(
-                text(format!("Outdated · {} · {place} · “{first}” · {count}", thread.id))
+                text(format!("Outdated · {}{} · {place} · “{first}” · {count}", resolved_by(thread), thread.id))
                     .font(k.ty.small)
                     .color(k.c.text_muted),
             )
             .child(row().grow(1.0))
+            .children(resolve_button(k, thread, tab.session.id.clone()))
             .child(
                 Button::new(if expanded { "Hide" } else { "Show" })
                     .variant(ButtonVariant::Ghost)
@@ -682,7 +854,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
                         .child(text(thread.excerpt.trim_end().to_owned()).font(k.ty.mono).color(k.c.text_muted)),
                 );
             }
-            card = card.child(thread_card(k, thread));
+            card = card.child(thread_card(k, thread, None));
         }
         list = list.child(card).pb(8.0);
     }
@@ -778,8 +950,9 @@ fn scene_session(s: &mut State) {
     s.apply(vec![session, unseen, working]);
 }
 
-/// `--scene threads`: Review, file and suggestion Threads, with markdown bodies, under the
-/// banner offering files changed on disk.
+/// `--scene threads`: Review, file and suggestion Threads, with markdown bodies, an agent
+/// reply, a human reply Draft and a Thread the agent resolved, under the banner offering files
+/// changed on disk.
 fn scene_threads(s: &mut State) {
     use akshually_core::Comment;
     let comment = |body: &str, suggestion: Option<&str>| Comment {
@@ -793,7 +966,9 @@ fn scene_threads(s: &mut State) {
         anchor,
         excerpt: excerpt.into(),
         comments: vec![comment],
+        resolved: None,
         outdated: false,
+        reopened: false,
     };
     let session = SessionView {
         id: SessionId::new("sample"),
@@ -823,19 +998,37 @@ fn scene_threads(s: &mut State) {
                 "    let snapshot = self.changeset.snapshot()?;\n",
                 comment("Name it for what it holds:", Some("    let before = self.changeset.snapshot()?;\n")),
             ),
+            thread(
+                "T4",
+                Anchor::lines(Side::New, "src/session.rs", 1..=1),
+                "",
+                comment("Rename `hand_over_round` to `hand_over`?", None),
+            ),
         ],
     };
+    let mut session = session;
+    let agent = |body: &str| Comment { author: Party::Agent, body: body.into(), round: Some(2), suggestion: None };
+    for t in &mut session.threads[2..] {
+        t.comments[0].round = Some(1);
+    }
+    session.threads[2].comments.push(agent("Done: it's `before` now."));
+    let reply = Comment { author: Party::Human, body: "And the doc comment?".into(), round: None, suggestion: None };
+    session.threads[2].comments.push(reply);
+    session.threads[3].comments.push(agent("Renamed."));
+    session.threads[3].resolved = Some(Party::Agent);
     s.apply(vec![session]);
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
-    use akshually_core::{Comment, ThreadId};
+    use akshually_core::Comment;
     Thread {
         id: ThreadId::new(id),
         anchor: Anchor::lines(Side::New, "src/session.rs", lines),
         excerpt: String::new(),
         comments: vec![Comment { author: Party::Human, body: body.into(), round, suggestion: None }],
+        resolved: None,
         outdated: false,
+        reopened: false,
     }
 }
 

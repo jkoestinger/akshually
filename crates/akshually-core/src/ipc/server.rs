@@ -81,6 +81,12 @@ impl Server {
         let result = match request {
             Request::Review { cwd, local } => self.review(cwd, local),
             Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
+            Request::Reply { cwd, thread, body } => {
+                self.service.reply(&cwd, &thread, body).map(|()| serde_json::json!({})).map_err(failed)
+            }
+            Request::Resolve { cwd, thread } => {
+                self.service.resolve(&cwd, &thread).map(|()| serde_json::json!({})).map_err(failed)
+            }
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {
                 Err(ErrorReply::new(ErrorCode::Forbidden, "this app was not started for tests"))
             }
