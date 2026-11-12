@@ -1,6 +1,6 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::store::Store;
-use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, Settings, git};
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+use crate::{Error, Settings, git, reanchor};
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +45,17 @@ pub enum Outcome {
     Approved,
     /// The human closed the Session without a Verdict; the agent should stop.
     Abandoned,
+}
+
+/// Whose move a Session is waiting on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Turn {
+    /// The agent waits on the human: a `review` call is blocked.
+    #[default]
+    Human,
+    /// The human handed over a Round; the agent is working on it.
+    Agent,
 }
 
 /// An agent asking for review of its local work.
@@ -95,18 +106,40 @@ pub struct SessionView {
     pub round: u32,
     /// In the order they were opened.
     pub threads: Vec<Thread>,
+    pub turn: Turn,
+    /// The Session became the human's Turn while another tab was displayed, and its tab
+    /// hasn't been opened since.
+    pub attention: bool,
     /// The agent's changes since the Session base, when it ran `start` first.
     pub since_session_base: Option<Changeset>,
+    /// The full Changeset as it was when the last Round was handed over; `None` before the
+    /// first handover.
+    pub last_round: Option<Changeset>,
+    /// What changed since `last_round`, with the last Round's code as the old side.
+    pub since_last_round: Option<Changeset>,
     /// Which Changeset the human is looking at.
     pub view: ChangesetView,
+    /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
+    pub viewed: BTreeSet<String>,
 }
 
 impl SessionView {
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
-        match (self.view, &self.since_session_base) {
-            (ChangesetView::SinceSessionBase, Some(since)) => since,
+        match (self.view, &self.since_session_base, &self.since_last_round) {
+            (ChangesetView::SinceSessionBase, Some(since), _) => since,
+            (ChangesetView::SinceLastRound, _, Some(since)) => since,
             _ => &self.changeset,
+        }
+    }
+
+    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
+    /// where the old side is that Round's code rather than a base and files the agent left
+    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    pub fn anchored_in(&self) -> &Changeset {
+        match self.view {
+            ChangesetView::SinceLastRound => &self.changeset,
+            _ => self.shown(),
         }
     }
 }
@@ -117,6 +150,8 @@ impl SessionView {
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
     SinceSessionBase,
+    /// Only the changes since the last Round (the default from Round 2 on).
+    SinceLastRound,
     /// The whole Changeset.
     #[default]
     Full,
@@ -179,11 +214,25 @@ struct Inner {
     /// Session bases from `start`, by repository and branch, kept until the Session ends.
     session_bases: HashMap<(PathBuf, String), String>,
     subscribers: Vec<Subscriber>,
+    /// The Session whose tab the human has open.
+    displayed: Option<SessionId>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
 }
 
 impl Inner {
+    /// The Session at `at` became the human's Turn. It never takes the view: unless it's
+    /// displayed it gets attention. With nothing displayed, there's no view to take, so it's
+    /// displayed instead.
+    fn became_humans_turn(&mut self, at: usize) {
+        let view = &mut self.sessions[at].view;
+        view.turn = Turn::Human;
+        match &self.displayed {
+            None => self.displayed = Some(view.id.clone()),
+            Some(displayed) => view.attention = displayed != &view.id,
+        }
+    }
+
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
         self.sessions.iter().position(|s| &s.view.id == id).ok_or_else(|| Error::UnknownSession(id.clone()))
     }
@@ -278,6 +327,24 @@ impl Service {
         Some(inner.sessions[at].view.clone())
     }
 
+    /// The Session whose tab the human has open, if any.
+    pub fn displayed(&self) -> Option<SessionId> {
+        self.lock().displayed.clone()
+    }
+
+    /// Human: opens the Session's tab, which clears its attention.
+    pub fn display(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        if inner.displayed.as_ref() == Some(id) && !inner.sessions[at].view.attention {
+            return Ok(());
+        }
+        inner.displayed = Some(id.clone());
+        inner.sessions[at].view.attention = false;
+        inner.notify();
+        Ok(())
+    }
+
     /// Agent: snapshots the working tree of the repository containing `cwd` as the Session
     /// base, so the next `review` on this branch shows only the changes made after it.
     pub fn start(&self, cwd: &Path) -> Result<(), Error> {
@@ -295,7 +362,17 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            let before = session.anchored_in().clone();
+            session.view = view;
+            // Threads follow the Changeset they are anchored in.
+            if session.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut session.threads);
+                reanchor(&mut threads, session.anchored_in());
+                session.threads = threads;
+            }
+        }
         inner.notify();
         Ok(())
     }
@@ -319,14 +396,32 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                let before = session.view.anchored_in().clone();
+                for file in changeset.since(&session.view.changeset).files {
+                    session.view.viewed.remove(&file.path);
+                }
                 session.view.changeset = changeset;
                 session.view.since_session_base = since_session_base;
+                session.view.since_last_round =
+                    session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
+                if session.view.since_last_round.is_some() {
+                    session.view.view = ChangesetView::SinceLastRound;
+                }
+                // Threads follow the Changeset they are anchored in.
+                if session.view.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.view.threads);
+                    reanchor(&mut threads, session.view.anchored_in());
+                    session.view.threads = threads;
+                }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
+                    if session.view.turn != Turn::Human {
+                        inner.became_humans_turn(at);
+                    }
                 } else {
                     let _ = tx.send(Outcome::Round(session.queued.remove(0)));
                 }
-                session.view.id.clone()
+                inner.sessions[at].view.id.clone()
             }
             None => {
                 inner.next_id += 1;
@@ -341,11 +436,18 @@ impl Service {
                     branch,
                     changeset,
                     since_session_base,
+                    last_round: None,
+                    since_last_round: None,
                     view,
                     round: 1,
                     threads: Vec::new(),
+                    turn: Turn::Human,
+                    attention: false,
+                    viewed: BTreeSet::new(),
                 };
                 inner.sessions.push(Session { view, waiter: Some(tx), ..Session::default() });
+                let at = inner.sessions.len() - 1;
+                inner.became_humans_turn(at);
                 id
             }
         };
@@ -353,21 +455,30 @@ impl Service {
         Ok(PendingReview { session: id, outcome: rx })
     }
 
-    /// Human: opens a Thread at `anchor` with `body` (markdown) as a Draft, which goes out
-    /// with the next Round.
-    pub fn comment(&self, id: &SessionId, anchor: Anchor, body: impl Into<String>) -> Result<ThreadId, Error> {
-        let body = body.into();
+    /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
+    /// Draft, which goes out with the next Round.
+    pub fn comment(&self, id: &SessionId, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
+        let NewComment { body, suggestion } = comment.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
+        }
+        if suggestion.is_some() && !matches!(anchor, Anchor::Lines { side: Side::New, .. }) {
+            return Err(Error::InvalidSuggestion);
         }
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        let excerpt = anchor.excerpt(session.view.shown()).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
-        let comment = Comment { author: Party::Human, body, round: None };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        let comment = Comment { author: Party::Human, body, round: None, suggestion };
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            outdated: false,
+        });
         inner.notify();
         Ok(thread)
     }
@@ -398,6 +509,10 @@ impl Service {
             return Err(Error::NoDrafts);
         }
         session.view.round += 1;
+        session.view.turn = Turn::Agent;
+        session.view.since_last_round =
+            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
+        session.view.last_round = Some(session.view.changeset.clone());
         let round = Round { number, threads };
         match session.waiter.take() {
             // A waiter that went away gives the Round back, for the next call.
@@ -410,6 +525,23 @@ impl Service {
         }
         inner.notify();
         Ok(number)
+    }
+
+    /// Human: ticks `path` as viewed, or unticks it.
+    pub fn mark_viewed(&self, id: &SessionId, path: &str, viewed: bool) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let view = &mut inner.sessions[at].view;
+        if !view.changeset.files.iter().any(|f| f.path == path) {
+            return Err(Error::NotInChangeset(path.to_owned()));
+        }
+        if viewed {
+            view.viewed.insert(path.to_owned());
+        } else {
+            view.viewed.remove(path);
+        }
+        inner.notify();
+        Ok(())
     }
 
     /// Human: approves the Session, which ends it and returns the Verdict to the agent.
@@ -426,6 +558,9 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = inner.sessions.remove(at);
+        if inner.displayed.as_ref() == Some(id) {
+            inner.displayed = None;
+        }
         inner.session_bases.remove(&(session.view.repo.clone(), session.view.branch.clone()));
         if let Some(waiter) = session.waiter {
             // The agent may have gone away; the Session ends regardless.

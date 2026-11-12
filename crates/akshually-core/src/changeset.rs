@@ -34,6 +34,35 @@ pub struct FileChange {
     pub collapsed: Option<Collapsed>,
 }
 
+impl Changeset {
+    /// What changed between `earlier` (a Round snapshot) and this Changeset: one file per path
+    /// whose new side differs, with `earlier`'s new side as `old`. A file missing from one of
+    /// the two is taken to be at the base there, so both should share the same base.
+    pub fn since(&self, earlier: &Changeset) -> Changeset {
+        let mut files: Vec<FileChange> = Vec::new();
+        for now in &self.files {
+            let (then, then_size) = match earlier.files.iter().find(|f| f.path == now.path) {
+                Some(then) => (&then.new, then.binary.and_then(|b| b.new)),
+                None => (&now.old, now.binary.and_then(|b| b.old)),
+            };
+            if (then, then_size) != (&now.new, now.binary.and_then(|b| b.new)) {
+                let binary = now.binary.map(|b| BinarySizes { old: then_size, new: b.new });
+                files.push(FileChange { old: then.clone(), binary, ..now.clone() });
+            }
+        }
+        for then in &earlier.files {
+            if !self.files.iter().any(|f| f.path == then.path)
+                && (then.new != then.old || then.binary.is_some_and(|b| b.new != b.old))
+            {
+                let binary = then.binary.map(|b| BinarySizes { old: b.new, new: b.old });
+                files.push(FileChange { old: then.new.clone(), new: then.old.clone(), binary, ..then.clone() });
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Changeset { base: self.base.clone(), files }
+    }
+}
+
 impl FileChange {
     /// A text file's change, neither binary nor collapsed.
     pub fn text(path: impl Into<String>, old: Option<&str>, new: Option<&str>) -> Self {

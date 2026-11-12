@@ -70,6 +70,15 @@ impl TestRepo {
         self
     }
 
+    /// Adds a linked worktree of this repository on a new `branch`, created at the current
+    /// commit. Keep `self` alive while the worktree is in use.
+    pub fn worktree(&self, branch: &str) -> TestRepo {
+        let dir = tempfile::Builder::new().prefix("akwt").tempdir().expect("create worktree dir");
+        let path = dir.path().canonicalize().expect("canonicalize worktree dir");
+        self.git(&["worktree", "add", "--quiet", "-b", branch, path.to_str().expect("UTF-8 temp path")]);
+        TestRepo { _dir: dir, path }
+    }
+
     /// Runs git in the repository and returns its trimmed stdout, panicking on failure.
     pub fn git(&self, args: &[&str]) -> String {
         let out = Command::new("git")
