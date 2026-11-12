@@ -15,7 +15,7 @@
               ] }
             },
             {
-              "id": "PRRT_2", "isResolved": true, "isOutdated": false, "path": "old.txt", "subjectType": "LINE",
+              "id": "PRRT_2", "isResolved": true, "resolvedBy": { "login": "maria" }, "isOutdated": false, "path": "old.txt", "subjectType": "LINE",
               "line": 5, "originalLine": 5, "startLine": 3, "originalStartLine": 3,
               "diffSide": "LEFT", "startDiffSide": "LEFT",
               "comments": { "nodes": [

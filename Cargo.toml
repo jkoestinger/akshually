@@ -21,11 +21,14 @@ akshually-testkit = { path = "crates/akshually-testkit" }
 # Only akshually-ui may depend on it.
 rune = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f", features = ["markdown"] }
+rune-notify = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 mockito = "1.7"
+# Desktop notifications on Linux, where rune-notify does nothing.
+notify-rust = "4"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -6,12 +6,16 @@
 //! {"v":1,"ok":{"outcome":"approved"}}                // app → client
 //! {"v":1,"err":{"code":"version","message":"…"}}
 //! ```
+//!
+//! `review` is the one exception: once the CLI has printed the outcome, it sends
+//! `{"v":1,"op":"ack"}` on the same connection and the app replies `{"v":1,"ok":{}}`. A Round
+//! or Verdict never acknowledged (the CLI died before printing it) goes to the next `review`.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LocalOptions, SessionId, SessionView};
+use crate::{LocalOptions, SessionId, SessionView, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -25,8 +29,14 @@ pub enum Request {
         #[serde(flatten)]
         local: LocalOptions,
     },
+    /// After a `review` replied: the CLI printed the outcome. Replies `{}`.
+    Ack,
     /// Records the Session base; replies `{}` at once.
     Start { cwd: PathBuf },
+    /// The agent replies to a Thread in the Session for `cwd`. Replies `{}` at once.
+    Reply { cwd: PathBuf, thread: ThreadId, body: String },
+    /// The agent resolves a Thread in the Session for `cwd`. Replies `{}` at once.
+    Resolve { cwd: PathBuf, thread: ThreadId },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
@@ -72,6 +82,8 @@ pub enum ErrorCode {
     BadRequest,
     /// The review service refused or failed the request.
     Failed,
+    /// Another `review` call already waits on this Session.
+    Busy,
     /// A test-control request reached an app not started for tests.
     Forbidden,
 }

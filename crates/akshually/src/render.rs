@@ -2,14 +2,26 @@
 
 use std::fmt::Write;
 
-use akshually_core::{Anchor, Round, Side, Thread};
+use akshually_core::{Anchor, Outcome, Round, Side, Thread};
+
+/// What `review --format markdown` prints for `outcome`.
+pub fn outcome_markdown(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Round(round) => round_markdown(round),
+        Outcome::Approved => "Approved.\n".to_owned(),
+        Outcome::Abandoned => {
+            "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n".to_owned()
+        }
+    }
+}
 
 /// A Round as markdown: one section per Thread, headed by its stable ID and Anchor, with the
 /// anchored code and then each Comment's markdown body.
-pub fn round_markdown(round: &Round) -> String {
+fn round_markdown(round: &Round) -> String {
     let count = round.threads.len();
     let mut out = format!(
-        "# Round {}\n\nThe human handed over {count} Thread{}. Address each one, then run `akshually review` again.\n",
+        "# Round {}\n\nThe human handed over {count} Thread{}. Address each one, answer it with \
+         `akshually reply <thread> \"…\"` or `akshually resolve <thread>`, then run `akshually review` again.\n",
         round.number,
         if count == 1 { "" } else { "s" },
     );
@@ -20,7 +32,15 @@ pub fn round_markdown(round: &Round) -> String {
 }
 
 fn thread_markdown(out: &mut String, thread: &Thread) {
-    let _ = writeln!(out, "\n## {} · {}", thread.id, anchor_markdown(&thread.anchor));
+    let outdated = if thread.outdated { " · Outdated" } else { "" };
+    let reopened = if thread.reopened { " · Reopened" } else { "" };
+    let _ = writeln!(out, "\n## {} · {}{outdated}{reopened}", thread.id, anchor_markdown(&thread.anchor));
+    if thread.reopened {
+        out.push_str("\nThe human reopened this Thread: it isn't dealt with yet.\n");
+    }
+    if thread.outdated {
+        out.push_str("\nThis code is no longer in the Changeset; the Thread was written against it:\n");
+    }
     if let Anchor::Lines { .. } = thread.anchor {
         out.push('\n');
         code_block(out, &thread.excerpt);

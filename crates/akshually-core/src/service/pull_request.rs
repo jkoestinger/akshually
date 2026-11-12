@@ -1,6 +1,5 @@
 //! Pull Request Sessions: the Changeset and existing Threads come from a Forge adapter.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::{ChangesetView, Service, Session, SessionId, SessionView, Turn};
@@ -28,7 +27,9 @@ impl Service {
             let mut sessions = sessions.iter();
             sessions.find(|s| s.view.pull_request.as_ref().is_some_and(|p| p.id == pr)).map(|s| s.view.id.clone())
         };
-        if let Some(id) = open(&self.lock().sessions) {
+        // Bound first, so the lock is released before `display` takes it again.
+        let already = open(&self.lock().sessions);
+        if let Some(id) = already {
             self.display(&id)?;
             return Ok(id);
         }
@@ -59,19 +60,15 @@ impl Service {
             branch: pull_request.head_branch.clone(),
             pull_request: Some(pull_request),
             changeset,
-            since_session_base: None,
-            last_round: None,
-            since_last_round: None,
             view: ChangesetView::Full,
             round: 1,
             threads,
             // No agent: the human drafts until Publish.
             turn: Turn::Human,
-            attention: false,
-            viewed: BTreeSet::new(),
+            ..SessionView::default()
         };
         let threads_opened = view.threads.len() as u32;
-        inner.sessions.push(Session { view, waiter: None, threads_opened, queued: Vec::new() });
+        inner.sessions.push(Session { view, threads_opened, ..Session::default() });
         inner.displayed = Some(id.clone());
         inner.notify();
         Ok(id)
@@ -79,13 +76,15 @@ impl Service {
 }
 
 /// A Thread already on the Forge, as a Session Thread (numbered by the caller). The excerpt is
-/// the anchored code, or for an outdated Thread the diff the Forge kept for it.
+/// the anchored code, or for a Thread the Forge says is outdated, the diff it kept for it; such
+/// a Thread is Outdated here too.
 fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
     let anchor = match remote.anchor {
         RemoteAnchor::Lines { path, side, start, end } => Anchor::Lines { path, side, start, end },
         RemoteAnchor::File { path } => Anchor::File { path },
     };
     let current = if remote.outdated { None } else { anchor.excerpt(changeset).ok() };
+    let outdated = current.is_none();
     let excerpt = current.unwrap_or(remote.diff_hunk);
     let comments = remote
         .comments
@@ -93,5 +92,6 @@ fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
         // A suggestion stays in the body as the Forge's markdown.
         .map(|c| Comment { author: Party::Other(c.author), body: c.body, round: None, suggestion: None })
         .collect();
-    Thread { id: ThreadId::new(""), anchor, excerpt, comments }
+    let resolved = remote.resolved_by.map(Party::Other);
+    Thread { id: ThreadId::new(""), anchor, excerpt, comments, resolved, outdated, reopened: false }
 }

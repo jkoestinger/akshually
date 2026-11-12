@@ -44,6 +44,17 @@ sudo ln -sf /Applications/akshually.app/Contents/MacOS/akshually /usr/local/bin/
 
 Check either install with `akshually --version`.
 
+## Teach your agent
+
+`akshually agent-help` prints a guide for agents: the review loop, the commands and the exit codes. It is also an agent skill ([`skills/akshually/SKILL.md`](skills/akshually/SKILL.md)), so you can install it where your agent looks for skills, for example:
+
+```sh
+mkdir -p ~/.claude/skills/akshually
+akshually agent-help > ~/.claude/skills/akshually/SKILL.md
+```
+
+Agents without skills can run `akshually agent-help` themselves: tell them to, in your project's agent instructions.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.

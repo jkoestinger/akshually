@@ -147,12 +147,27 @@ pub fn working_tree(repo: &Path, untracked: bool) -> Result<String, GitError> {
     // Start from a copy of the real index, so git reuses its cached stats instead of hashing
     // every file, and what is staged (new files, removals) carries over.
     let real = PathBuf::from(git(repo, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?.trim());
-    match std::fs::copy(&real, &index) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
+    match std::fs::File::open(&real) {
+        Ok(real) => copy_index(&real, &index)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     git_with_index(repo, &index, &["add", if untracked { "--all" } else { "--update" }, "--", ":/"])?;
     Ok(git_with_index(repo, &index, &["write-tree"])?.trim().to_owned())
+}
+
+/// Copies the index `real` to `to`, keeping its mtime. Git trusts an entry whose stat matches
+/// the file on disk only when the entry is older than the index file (racy git): a copy with
+/// a fresh mtime would make git trust a same-size edit made in the same second as the last
+/// index write, and miss it.
+fn copy_index(real: &std::fs::File, to: &Path) -> Result<(), GitError> {
+    // Both from the one handle, so a concurrent rewrite of the index can't pair one
+    // version's contents with another's mtime.
+    let mtime = real.metadata()?.modified()?;
+    let mut copy = std::fs::File::create(to)?;
+    std::io::copy(&mut &*real, &mut copy)?;
+    copy.set_modified(mtime)?;
+    Ok(())
 }
 
 /// The commit HEAD points at.

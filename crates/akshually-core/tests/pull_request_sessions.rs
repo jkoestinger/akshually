@@ -6,7 +6,7 @@ use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
 };
 use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn};
-use akshually_testkit::TestRepo;
+use akshually_testkit::{TestDirs, TestRepo};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
 
@@ -53,7 +53,7 @@ impl ForgeAdapter for FakeForge {
                 id: "RT_1".into(),
                 anchor: RemoteAnchor::Lines { path: "login.rs".into(), side: Side::New, start: 2, end: 2 },
                 outdated: false,
-                resolved: false,
+                resolved_by: Some("maria".into()),
                 diff_hunk: "@@ -1 +1,3 @@\n-fn login() {}\n+fn login() {\n+    sso();\n".into(),
                 comments: vec![
                     RemoteComment { author: "lee".into(), body: "Which SSO provider?".into() },
@@ -64,7 +64,7 @@ impl ForgeAdapter for FakeForge {
                 id: "RT_2".into(),
                 anchor: RemoteAnchor::Lines { path: "login.rs".into(), side: Side::New, start: 9, end: 9 },
                 outdated: true,
-                resolved: false,
+                resolved_by: None,
                 diff_hunk: "@@ -1 +1,9 @@\n+    old_code();\n".into(),
                 comments: vec![RemoteComment { author: "lee".into(), body: "Gone now?".into() }],
             },
@@ -72,7 +72,7 @@ impl ForgeAdapter for FakeForge {
                 id: "RT_3".into(),
                 anchor: RemoteAnchor::File { path: "login.rs".into() },
                 outdated: false,
-                resolved: false,
+                resolved_by: None,
                 diff_hunk: String::new(),
                 comments: vec![RemoteComment { author: "sam".into(), body: "Split this file?".into() }],
             },
@@ -130,6 +130,8 @@ fn existing_threads_from_other_reviewers_are_shown_in_place() {
     assert_eq!(t.id.as_str(), "T1");
     assert_eq!(t.anchor, Anchor::lines(Side::New, "login.rs", 2..=2));
     assert_eq!(t.excerpt, "    sso();\n");
+    assert_eq!(t.resolved, Some(Party::Other("maria".into())), "resolved on the Forge");
+    assert!(!t.outdated);
     let comments: Vec<_> = t.comments.iter().map(|c| (c.author.clone(), c.body.as_str(), c.is_draft())).collect();
     assert_eq!(
         comments,
@@ -159,6 +161,7 @@ fn an_outdated_thread_keeps_the_code_it_was_written_against() {
 
     let t = &svc.session(&id).unwrap().threads[1];
     assert_eq!(t.excerpt, "@@ -1 +1,9 @@\n+    old_code();\n");
+    assert!(t.outdated);
 }
 
 #[test]
@@ -220,4 +223,43 @@ fn a_forge_failure_opens_no_session() {
 
     assert!(matches!(error, Error::Forge(ForgeError::NoCredentials { .. })), "{error:?}");
     assert!(svc.sessions().is_empty());
+}
+
+#[test]
+fn checking_the_disk_leaves_pull_request_sessions_alone() {
+    let (svc, _) = service();
+    let id = svc.open_pull_request(URL).unwrap();
+    let before = svc.session(&id).unwrap();
+
+    svc.check_disk();
+
+    assert_eq!(svc.session(&id).unwrap(), before);
+}
+
+#[test]
+fn a_pull_request_session_does_not_reload_from_disk() {
+    let (svc, _) = service();
+    let id = svc.open_pull_request(URL).unwrap();
+    let before = svc.session(&id).unwrap();
+
+    assert!(svc.reload(&id).is_err());
+    assert_eq!(svc.session(&id).unwrap(), before);
+}
+
+#[test]
+fn a_pull_request_session_survives_a_restart() {
+    let dirs = TestDirs::new();
+    let fetches = Arc::new(Mutex::new(0));
+    let svc = Service::open(dirs.state()).unwrap().with_forges(vec![Box::new(FakeForge { fetches: fetches.clone() })]);
+    let id = svc.open_pull_request(URL).unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "login.rs", 1..=3), "Needs a test.").unwrap();
+    let before = svc.session(&id).unwrap();
+    drop(svc);
+
+    let restored =
+        Service::open(dirs.state()).unwrap().with_forges(vec![Box::new(FakeForge { fetches: fetches.clone() })]);
+
+    assert_eq!(restored.session(&id), Some(before));
+    assert_eq!(restored.open_pull_request(URL).unwrap(), id);
+    assert_eq!(*fetches.lock().unwrap(), 1, "the restored Session is not fetched again");
 }

@@ -5,9 +5,9 @@ mod support;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Side};
-use akshually_testkit::{TestDirs, TestRepo};
-use support::{HostedApp, LaunchedApp, finish, still_running};
+use akshually_core::{Anchor, Party, Side};
+use akshually_testkit::{TestDirs, TestRepo, wait_until};
+use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -72,7 +72,8 @@ fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code
         String::from_utf8_lossy(&out.stdout),
         "# Round 1\n\
          \n\
-         The human handed over 2 Threads. Address each one, then run `akshually review` again.\n\
+         The human handed over 2 Threads. Address each one, answer it with `akshually reply <thread> \"…\"` \
+         or `akshually resolve <thread>`, then run `akshually review` again.\n\
          \n\
          ## T1 · lib.rs, new lines 2-3\n\
          \n\
@@ -93,6 +94,52 @@ fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code
          \n\
          Keep `a`.\n"
     );
+}
+
+#[test]
+fn review_format_json_prints_the_round_as_json() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
+    app.service.resolve_thread(&session.id, &akshually_core::ThreadId::new("T1")).unwrap();
+
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(
+        printed,
+        serde_json::json!({
+            "outcome": "round",
+            "number": 1,
+            "threads": [{
+                "id": "T1",
+                "anchor": {"kind": "lines", "path": "lib.rs", "side": "new", "start": 2, "end": 3},
+                "excerpt": "fn b() {}\nfn c() {}\n",
+                "comments": [{"author": "human", "body": "Why two?", "round": 1}],
+                "resolved": "human",
+                "outdated": false,
+                "reopened": false,
+            }],
+        })
+    );
+}
+
+#[test]
+fn review_format_json_prints_the_verdict_as_json() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    app.service.approve(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"outcome\":\"approved\"}\n");
 }
 
 #[test]
@@ -117,6 +164,49 @@ fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
     assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
     app.service.approve(&session.id).unwrap();
     assert_eq!(finish(second).status.code(), Some(EXIT_APPROVED));
+}
+
+/// Hands the `review` call in `repo` a Round with Thread T1, on new line 3.
+fn round_1_handed_over(app: &HostedApp, repo: &TestRepo) -> akshually_core::SessionId {
+    let call = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(call).status.code(), Some(EXIT_ROUND));
+    session.id
+}
+
+#[test]
+fn reply_and_resolve_act_on_the_session_for_this_branch_and_return_at_once() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+
+    let replied = finish(app.akshually(repo.path(), &["reply", "T1", "Dropped it."]).spawn().unwrap());
+    let resolved = finish(app.akshually(repo.path(), &["resolve", "T1"]).spawn().unwrap());
+
+    assert_eq!(replied.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&replied.stderr));
+    assert_eq!(resolved.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&resolved.stderr));
+    let thread = &app.service.session(&session).unwrap().threads[0];
+    assert_eq!(
+        thread.comments.last().map(|c| (c.author.clone(), c.body.as_str())),
+        Some((Party::Agent, "Dropped it."))
+    );
+    assert_eq!(thread.resolved, Some(Party::Agent));
+}
+
+#[test]
+fn reply_and_resolve_on_an_unknown_thread_exit_1_naming_it() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    round_1_handed_over(&app, &repo);
+
+    for args in [&["reply", "T7", "Done."][..], &["resolve", "T7"]] {
+        let out = finish(app.akshually(repo.path(), args).spawn().unwrap());
+
+        assert_eq!(out.status.code(), Some(EXIT_ERROR), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no Thread T7"), "{args:?}");
+    }
 }
 
 #[test]
@@ -285,4 +375,64 @@ fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
     let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_second_review_while_one_waits_exits_1_with_a_clear_message() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    let second = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+
+    assert_eq!(second.status.code(), Some(EXIT_ERROR));
+    assert!(second.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stderr),
+        "akshually: another `akshually review` is already waiting on this Session\n"
+    );
+    assert!(still_running(&mut first), "the first call stopped waiting");
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_APPROVED));
+}
+
+#[test]
+fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    first.kill().unwrap();
+    first.wait().unwrap();
+    wait_until(TIMEOUT, "the app to notice", || app.service.session(&session.id).filter(|s| !s.agent_waiting));
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("# Round 1\n"));
+    let mut third = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    assert!(still_running(&mut third), "the Round was delivered twice");
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(third).status.code(), Some(EXIT_APPROVED));
+}
+
+#[test]
+fn a_verdict_given_while_no_review_waits_goes_to_the_next_review() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    first.kill().unwrap();
+    first.wait().unwrap();
+    wait_until(TIMEOUT, "the app to notice", || app.service.session(&session.id).filter(|s| !s.agent_waiting));
+
+    app.service.approve(&session.id).unwrap();
+
+    let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Approved.\n");
+    assert!(app.service.sessions().is_empty(), "collected, the Session ends");
 }

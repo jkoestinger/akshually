@@ -3,21 +3,22 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::forge::{ForgeAdapter, PullRequest};
+use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
-use crate::{Error, Settings, git};
+use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 mod pull_request;
 
-/// Identifies a Session for as long as the app runs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Identifies a Session, across restarts too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -50,12 +51,14 @@ pub enum Outcome {
 }
 
 /// Whose move a Session is waiting on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Turn {
-    /// The agent waits on the human: a `review` call is blocked.
+    /// The agent asked for review: the human reads, comments and hands over a Round.
+    #[default]
     Human,
-    /// The human handed over a Round; the agent is working on it.
+    /// The human handed over a Round; the agent is working on it. The human can still read
+    /// and draft for the next one, or take the Turn back.
     Agent,
 }
 
@@ -66,11 +69,21 @@ pub struct ReviewRequest {
     pub cwd: PathBuf,
     /// Which local changes make up the Changeset.
     pub local: LocalOptions,
+    /// Whether the caller acknowledges what it receives (`PendingReview::ack`), as the CLI
+    /// channel does. Without, what the call receives counts as delivered at once.
+    pub ack: bool,
 }
 
 impl ReviewRequest {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default() }
+        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default(), ack: false }
+    }
+
+    /// Counts a Round or Verdict as delivered only once the caller acknowledges it: dropping
+    /// the call before that gives it to the next `review` call.
+    pub fn with_ack(mut self) -> Self {
+        self.ack = true;
+        self
     }
 
     /// Shows the changes since HEAD's merge-base with `base` instead of the default branch.
@@ -92,8 +105,10 @@ impl ReviewRequest {
     }
 }
 
-/// What the UI (and tests) can observe of one Session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the UI (and tests) can observe of one Session. It's persisted: a field missing from
+/// an older saved Session takes its `Default`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
     /// The working tree root: each worktree is its own Session. Empty for a Pull Request.
@@ -106,9 +121,15 @@ pub struct SessionView {
     pub changeset: Changeset,
     /// The Round being drafted: 1 until the first handover, then one more after each.
     pub round: u32,
+    /// Whether an agent's `review` call is connected and waiting for the human. A Round handed
+    /// over while none is waits for the next call.
+    pub agent_waiting: bool,
     /// In the order they were opened.
     pub threads: Vec<Thread>,
     pub turn: Turn,
+    /// The human approved or abandoned the Session while no agent's `review` call received it.
+    /// The Session stays until the next `review` call collects this, then ends.
+    pub ended: Option<Outcome>,
     /// The Session became the human's Turn while another tab was displayed, and its tab
     /// hasn't been opened since.
     pub attention: bool,
@@ -123,6 +144,10 @@ pub struct SessionView {
     pub view: ChangesetView,
     /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
     pub viewed: BTreeSet<String>,
+    /// Files that changed on disk during the human's Turn and differ from the Changeset shown.
+    /// They're offered as a reload, never applied: empty means nothing to reload.
+    #[serde(default)]
+    pub changed_on_disk: BTreeSet<String>,
 }
 
 impl SessionView {
@@ -134,10 +159,20 @@ impl SessionView {
             _ => &self.changeset,
         }
     }
+
+    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
+    /// where the old side is that Round's code rather than a base and files the agent left
+    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    pub fn anchored_in(&self) -> &Changeset {
+        match self.view {
+            ChangesetView::SinceLastRound => &self.changeset,
+            _ => self.shown(),
+        }
+    }
 }
 
 /// Which of a Session's Changesets the human is looking at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
@@ -145,47 +180,237 @@ pub enum ChangesetView {
     /// Only the changes since the last Round (the default from Round 2 on).
     SinceLastRound,
     /// The whole Changeset.
+    #[default]
     Full,
 }
 
-/// A `review` call waiting for the human. Dropping it stops waiting.
+/// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
+/// the next `review` call.
 pub struct PendingReview {
-    session: SessionId,
+    call: Call,
     outcome: Receiver<Outcome>,
 }
 
 impl PendingReview {
     pub fn session(&self) -> &SessionId {
-        &self.session
+        &self.call.session
     }
 
-    /// Blocks until the human acts. `None` if the Session stopped waiting for this call
-    /// without an outcome.
+    /// Blocks until the human acts, and acknowledges what it receives. `None` if the Session
+    /// stopped waiting for this call without an outcome.
     pub fn wait(self) -> Option<Outcome> {
-        self.outcome.recv().ok()
+        let outcome = self.receive();
+        if outcome.is_some() {
+            self.ack();
+        }
+        outcome
     }
 
     /// `wait`, giving up after `timeout`.
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome> {
-        self.outcome.recv_timeout(timeout).ok()
+        let outcome = self.outcome.recv_timeout(timeout).ok();
+        if outcome.is_some() {
+            self.ack();
+        }
+        outcome
+    }
+
+    /// Blocks until the human acts, without acknowledging what it receives. For a call made
+    /// `with_ack`, dropping it before `ack` gives the Round or Verdict to the next call.
+    pub fn receive(&self) -> Option<Outcome> {
+        self.outcome.recv().ok()
+    }
+
+    /// Confirms the agent got what this call received, which is then delivered for good: a
+    /// Verdict ends the Session.
+    pub fn ack(&self) {
+        let waiter = self.call.waiter;
+        self.call.with_session(|session| {
+            if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
+                let (_, outcome) = session.in_flight.take().expect("checked");
+                session.delivered(&outcome);
+            }
+        });
+    }
+
+    /// A handle that stops this call waiting from another thread, e.g. when the CLI process
+    /// behind it went away.
+    pub fn canceller(&self) -> CancelReview {
+        CancelReview(self.call.clone())
+    }
+}
+
+/// Stops a `review` call waiting: its `receive` returns `None`, and the Session takes the next
+/// `review` call.
+pub struct CancelReview(Call);
+
+impl CancelReview {
+    pub fn cancel(&self) {
+        self.0.release();
+    }
+}
+
+/// One `review` call on one Session, as seen from outside the service lock.
+#[derive(Clone)]
+struct Call {
+    session: SessionId,
+    waiter: u64,
+    inner: Weak<Mutex<Inner>>,
+}
+
+impl Call {
+    /// Frees the Session's waiter slot if this call holds it.
+    fn release(&self) {
+        let waiter = self.waiter;
+        self.with_session(|session| {
+            if session.waiter.as_ref().is_some_and(|w| w.id == waiter) {
+                session.waiter = None;
+            }
+        });
+    }
+
+    fn with_session(&self, f: impl FnOnce(&mut Session)) {
+        let Some(inner) = self.inner.upgrade() else { return };
+        let mut inner = lock(&inner);
+        let Ok(at) = inner.position(&self.session) else { return };
+        let session = &mut inner.sessions[at];
+        let waiting = session.view.agent_waiting;
+        f(session);
+        session.view.agent_waiting = session.waiter.is_some();
+        let changed = session.view.agent_waiting != waiting || session.finished;
+        inner.reap();
+        if changed {
+            inner.notify();
+        } else {
+            // Nothing to show, but an ack or a requeue changes what's saved.
+            inner.save();
+        }
+    }
+}
+
+impl Drop for PendingReview {
+    fn drop(&mut self) {
+        self.call.release();
+        let waiter = self.call.waiter;
+        self.call.with_session(|session| {
+            // Received but not acknowledged: the agent may never have seen it. It goes to the
+            // call waiting now, if any, or the next one.
+            if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
+                let (_, outcome) = session.in_flight.take().expect("checked");
+                session.queued.insert(0, outcome);
+                session.deliver();
+            }
+        });
     }
 }
 
 type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 
+/// The agent's blocked `review` call.
+struct Waiter {
+    id: u64,
+    outcome: Sender<Outcome>,
+    /// The call acknowledges what it receives.
+    ack: bool,
+}
+
+/// A Session as the service keeps it, and as the store saves it: every field but the waiter
+/// survives a restart, and a field missing from an older saved Session takes its `Default`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Session {
     view: SessionView,
-    /// The agent's blocked `review` call, if any.
-    waiter: Option<Sender<Outcome>>,
+    /// The agent's blocked `review` call, if any: at most one per Session. A restart drops
+    /// it; the agent's next `review` attaches to the restored Session.
+    #[serde(skip)]
+    waiter: Option<Waiter>,
     /// Threads opened so far, for numbering the next one.
     threads_opened: u32,
-    /// Rounds handed over while no `review` call waited, oldest first.
-    queued: Vec<Round>,
+    /// Rounds handed over, then the Verdict (or Abandoned), that no `review` call received
+    /// yet, oldest first.
+    queued: Vec<Outcome>,
+    /// What a `review` call received but hasn't acknowledged yet, and that call's id.
+    in_flight: Option<(u64, Outcome)>,
+    /// The `last_round` each Round not yet delivered replaced, by Round number, to restore if
+    /// the human withdraws it.
+    replaced_last_rounds: Vec<(u32, Option<Changeset>)>,
+    /// The agent has its Verdict (or Abandoned): the Session is over.
+    finished: bool,
+    /// What the agent's last `review` call asked for, to rebuild the Changeset from on reload.
+    local: LocalOptions,
+}
+
+impl Session {
+    /// Hands the oldest queued Round or Verdict to the waiting `review` call, if both exist.
+    fn deliver(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let Some(waiter) = self.waiter.take() else { return };
+        let outcome = self.queued.remove(0);
+        match waiter.outcome.send(outcome.clone()) {
+            Ok(()) => {
+                self.view.agent_waiting = false;
+                if matches!(outcome, Outcome::Round(_)) {
+                    self.view.turn = Turn::Agent;
+                }
+                if waiter.ack {
+                    self.in_flight = Some((waiter.id, outcome));
+                } else {
+                    self.delivered(&outcome);
+                }
+            }
+            // A waiter that went away without being dropped yet gives it back.
+            Err(mpsc::SendError(outcome)) => self.queued.insert(0, outcome),
+        }
+    }
+
+    /// The agent got `outcome` for good.
+    fn delivered(&mut self, outcome: &Outcome) {
+        match outcome {
+            Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
+            Outcome::Approved | Outcome::Abandoned => self.finished = true,
+        }
+    }
+
+    /// Takes a new full Changeset (and the changes since the Session base): clears viewed ticks
+    /// on files that changed, recomputes the changes since the last Round and re-anchors the
+    /// Threads. With `default_view`, from Round 2 the view resets to the changes since the last
+    /// Round, as on each re-attach.
+    fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
+        let view = &mut self.view;
+        let before = view.anchored_in().clone();
+        for file in changeset.since(&view.changeset).files {
+            view.viewed.remove(&file.path);
+        }
+        view.changeset = changeset;
+        view.since_session_base = since_session_base;
+        view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
+        view.changed_on_disk.clear();
+        if default_view && view.since_last_round.is_some() {
+            view.view = ChangesetView::SinceLastRound;
+        }
+        // Threads follow the Changeset they are anchored in.
+        if view.anchored_in() != &before {
+            let mut threads = std::mem::take(&mut view.threads);
+            reanchor(&mut threads, view.anchored_in());
+            view.threads = threads;
+        }
+    }
+}
+
+/// A Session base as saved: `session_bases` keys by a tuple, which JSON can't.
+#[derive(Serialize, Deserialize)]
+struct SessionBase {
+    repo: PathBuf,
+    branch: String,
+    tree: String,
 }
 
 #[derive(Default)]
 struct Inner {
     next_id: u64,
+    next_waiter: u64,
     sessions: Vec<Session>,
     settings: Settings,
     /// Session bases from `start`, by repository and branch, kept until the Session ends.
@@ -193,6 +418,11 @@ struct Inner {
     subscribers: Vec<Subscriber>,
     /// The Session whose tab the human has open.
     displayed: Option<SessionId>,
+    /// Whether the human is looking at akshually's window.
+    window_focused: bool,
+    notifier: Option<Box<dyn Notifier>>,
+    /// Where Sessions are saved; `None` keeps them in memory only.
+    store: Option<Store>,
 }
 
 impl Inner {
@@ -206,6 +436,25 @@ impl Inner {
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
         }
+        if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
+            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            notifier.notify(Notification {
+                session: view.id.clone(),
+                title: "Your Turn to review".into(),
+                body: format!("{repo} ({})", view.branch),
+            });
+        }
+    }
+
+    /// Removes the Sessions whose agent got their Verdict (or Abandoned).
+    fn reap(&mut self) {
+        while let Some(at) = self.sessions.iter().position(|s| s.finished) {
+            let session = self.sessions.remove(at);
+            if self.displayed.as_ref() == Some(&session.view.id) {
+                self.displayed = None;
+            }
+            self.session_bases.remove(&(session.view.repo, session.view.branch));
+        }
     }
 
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
@@ -216,7 +465,29 @@ impl Inner {
         self.sessions.iter().map(|s| s.view.clone()).collect()
     }
 
-    fn notify(&self) {
+    /// Saves the Sessions and Session bases, if the service has a store.
+    fn save(&mut self) {
+        let Some(store) = &mut self.store else { return };
+        let mut bases: Vec<SessionBase> = self
+            .session_bases
+            .iter()
+            .map(|((repo, branch), tree)| SessionBase {
+                repo: repo.clone(),
+                branch: branch.clone(),
+                tree: tree.clone(),
+            })
+            .collect();
+        bases.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        let saved = store.sync(self.sessions.iter().map(|s| (&s.view.id, s))).and_then(|()| store.sync_bases(&bases));
+        // The change already happened in memory; a failed save shouldn't undo it.
+        if let Err(error) = saved {
+            eprintln!("akshually: couldn't save Sessions: {error}");
+        }
+    }
+
+    /// Publishes a change: saves it, then tells subscribers.
+    fn notify(&mut self) {
+        self.save();
         if self.subscribers.is_empty() {
             return;
         }
@@ -227,21 +498,61 @@ impl Inner {
     }
 }
 
+fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[derive(Default)]
 pub struct Service {
     // One lock for Sessions and subscribers, so subscribers see changes in order.
-    inner: Mutex<Inner>,
+    // One lock for Sessions and subscribers, so subscribers see changes in order. Shared with
+    // each PendingReview, which frees its Session when dropped.
+    inner: Arc<Mutex<Inner>>,
     /// One per Forge host, asked in order which one serves a Pull Request URL.
     forges: Vec<Box<dyn ForgeAdapter>>,
 }
 
 impl Service {
+    /// A service that keeps its Sessions in memory only.
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// A service that saves its Sessions under `state_dir` (never inside a repository) and
+    /// restores the ones saved there by an earlier run.
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let (store, mut sessions, bases) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
+        sessions.sort_by_key(|s| id_number(&s.view.id));
+        let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
+        let bases: Vec<SessionBase> = bases;
+        let session_bases = bases.into_iter().map(|b| ((b.repo, b.branch), b.tree)).collect();
+        // No `review` call survives a restart: what one received without acknowledging it goes
+        // to the next.
+        for session in &mut sessions {
+            if let Some((_, outcome)) = session.in_flight.take() {
+                session.queued.insert(0, outcome);
+            }
+            session.view.agent_waiting = false;
+        }
+        let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
+        Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
+    }
+
+    /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
+    /// Turn while the window is unfocused. Without one, the service notifies no one.
+    pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
+        self.lock().notifier = Some(Box::new(notifier));
+        self
+    }
+
+    /// The UI: tells the service whether the human is looking at the window (unfocused until
+    /// told otherwise).
+    pub fn set_window_focused(&self, focused: bool) {
+        self.lock().window_focused = focused;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        lock(&self.inner)
     }
 
     /// Calls `f` with every Session after each change. `f` runs while the service is locked,
@@ -293,7 +604,9 @@ impl Service {
         let repo = git::toplevel(cwd)?;
         let branch = git::branch(&repo)?;
         let base = changeset::snapshot(&repo)?;
-        self.lock().session_bases.insert((repo, branch), base);
+        let mut inner = self.lock();
+        inner.session_bases.insert((repo, branch), base);
+        inner.save();
         Ok(())
     }
 
@@ -302,14 +615,26 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            let before = session.anchored_in().clone();
+            session.view = view;
+            // Threads follow the Changeset they are anchored in.
+            if session.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut session.threads);
+                reanchor(&mut threads, session.anchored_in());
+                session.threads = threads;
+            }
+        }
         inner.notify();
         Ok(())
     }
 
     /// Agent: asks for review of the local work in `request.cwd`, opening the Session for that
     /// repository and branch, or attaching to it. Returns once the Session shows the Changeset;
-    /// wait on the result for the human's answer.
+    /// wait on the result for the human's answer, or for a Round queued for the agent.
+    ///
+    /// Fails with `Busy` while another `review` call waits on the same Session.
     pub fn review(&self, request: ReviewRequest) -> Result<PendingReview, Error> {
         let repo = git::toplevel(&request.cwd)?;
         let branch = git::branch(&repo)?;
@@ -322,27 +647,24 @@ impl Service {
         let (tx, rx) = mpsc::channel();
 
         let mut inner = self.lock();
+        inner.next_waiter += 1;
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
+        let waiter_id = waiter.id;
         let existing = inner.sessions.iter().position(|s| s.view.repo == repo && s.view.branch == branch);
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
-                for file in changeset.since(&session.view.changeset).files {
-                    session.view.viewed.remove(&file.path);
+                if session.waiter.is_some() {
+                    return Err(Error::Busy);
                 }
-                session.view.changeset = changeset;
-                session.view.since_session_base = since_session_base;
-                session.view.since_last_round =
-                    session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
-                if session.view.since_last_round.is_some() {
-                    session.view.view = ChangesetView::SinceLastRound;
-                }
-                if session.queued.is_empty() {
-                    session.waiter = Some(tx);
-                    if session.view.turn != Turn::Human {
-                        inner.became_humans_turn(at);
-                    }
-                } else {
-                    let _ = tx.send(Outcome::Round(session.queued.remove(0)));
+                session.local = request.local;
+                session.refresh(changeset, since_session_base, true);
+                session.waiter = Some(waiter);
+                session.view.agent_waiting = true;
+                if !session.queued.is_empty() {
+                    session.deliver();
+                } else if session.view.turn != Turn::Human {
+                    inner.became_humans_turn(at);
                 }
                 inner.sessions[at].view.id.clone()
             }
@@ -364,19 +686,94 @@ impl Service {
                     since_last_round: None,
                     view,
                     round: 1,
+                    agent_waiting: true,
                     threads: Vec::new(),
                     turn: Turn::Human,
+                    ended: None,
                     attention: false,
                     viewed: BTreeSet::new(),
+                    changed_on_disk: BTreeSet::new(),
                 };
-                inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
+                inner.sessions.push(Session { view, waiter: Some(waiter), local: request.local, ..Session::default() });
                 let at = inner.sessions.len() - 1;
                 inner.became_humans_turn(at);
                 id
             }
         };
+        // A Verdict waiting for this call ends the Session.
+        inner.reap();
         inner.notify();
-        Ok(PendingReview { session: id, outcome: rx })
+        Ok(PendingReview {
+            call: Call { session: id, waiter: waiter_id, inner: Arc::downgrade(&self.inner) },
+            outcome: rx,
+        })
+    }
+
+    /// Human: refreshes the Session's Changeset from disk. Threads and Drafts are re-anchored by
+    /// content, or become Outdated.
+    pub fn reload(&self, id: &SessionId) -> Result<(), Error> {
+        let (repo, local, settings, session_base) = {
+            let inner = self.lock();
+            let session = &inner.sessions[inner.position(id)?];
+            if session.view.pull_request.is_some() {
+                return Err(Error::InvalidRequest("a Pull Request reloads from its Forge, not from disk".into()));
+            }
+            let key = (session.view.repo.clone(), session.view.branch.clone());
+            (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
+        };
+        let now = changeset::local(&repo, &local, &settings, session_base.as_deref())?;
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        inner.sessions[at].refresh(now.full, now.since_session_base, false);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Runs `check_disk` every `every` on a background thread, until the service is dropped.
+    pub fn watch_disk(self: &Arc<Self>, every: Duration) {
+        let service = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                let Some(service) = service.upgrade() else { return };
+                service.check_disk();
+            }
+        });
+    }
+
+    /// Looks for changes on disk in every local Session whose Turn is the human's, and offers
+    /// them as a reload (`SessionView::changed_on_disk`) without touching the Changeset. During
+    /// the agent's Turn there's nothing to offer: its next `review` refreshes the Changeset.
+    pub fn check_disk(&self) {
+        let (settings, checks) = {
+            let inner = self.lock();
+            let checks: Vec<_> = inner
+                .sessions
+                .iter()
+                // A Pull Request has no files on disk.
+                .filter(|s| s.view.turn == Turn::Human && s.view.pull_request.is_none())
+                .map(|s| {
+                    let key = (s.view.repo.clone(), s.view.branch.clone());
+                    (s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0)
+                })
+                .collect();
+            (inner.settings.clone(), checks)
+        };
+        for (id, local, session_base, repo) in checks {
+            // A repository that went away or broke has nothing to offer.
+            let Ok(now) = changeset::local(&repo, &local, &settings, session_base.as_deref()) else { continue };
+            let mut inner = self.lock();
+            let Ok(at) = inner.position(&id) else { continue };
+            let view = &mut inner.sessions[at].view;
+            if view.turn != Turn::Human {
+                continue;
+            }
+            let changed = changed_files(&view.changeset, &now.full);
+            if view.changed_on_disk != changed {
+                view.changed_on_disk = changed;
+                inner.notify();
+            }
+        }
     }
 
     /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
@@ -392,17 +789,19 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        // Since the last Round, the old side is that Round's code rather than a base, and
-        // files the agent left alone are hidden: Threads still anchor to the full Changeset.
-        let anchored_to = match session.view.view {
-            ChangesetView::SinceLastRound => &session.view.changeset,
-            _ => session.view.shown(),
-        };
-        let excerpt = anchor.excerpt(anchored_to).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None, suggestion };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            resolved: None,
+            outdated: false,
+            reopened: false,
+        });
         inner.notify();
         Ok(thread)
     }
@@ -413,6 +812,12 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        if session.view.turn != Turn::Human {
+            return Err(Error::NotYourTurn);
+        }
         let number = session.view.round;
         let mut threads = Vec::new();
         for thread in &mut session.view.threads {
@@ -425,8 +830,9 @@ impl Service {
                     c.clone()
                 })
                 .collect();
-            if !drafts.is_empty() {
+            if !drafts.is_empty() || thread.reopened {
                 threads.push(Thread { comments: drafts, ..thread.clone() });
+                thread.reopened = false;
             }
         }
         if threads.is_empty() {
@@ -434,21 +840,127 @@ impl Service {
         }
         session.view.round += 1;
         session.view.turn = Turn::Agent;
+        // The agent's next `review` refreshes the Changeset anyway.
+        session.view.changed_on_disk.clear();
         session.view.since_last_round =
             Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
-        session.view.last_round = Some(session.view.changeset.clone());
-        let round = Round { number, threads };
-        match session.waiter.take() {
-            // A waiter that went away gives the Round back, for the next call.
-            Some(waiter) => {
-                if let Err(mpsc::SendError(Outcome::Round(round))) = waiter.send(Outcome::Round(round)) {
-                    session.queued.push(round);
-                }
-            }
-            None => session.queued.push(round),
-        }
+        let replaced = session.view.last_round.replace(session.view.changeset.clone());
+        session.replaced_last_rounds.push((number, replaced));
+        session.queued.push(Outcome::Round(Round { number, threads }));
+        session.deliver();
         inner.notify();
         Ok(number)
+    }
+
+    /// Human: takes the Turn back from an agent that went quiet, to go on drafting, hand over
+    /// another Round, or abandon the Session.
+    pub fn take_turn_back(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        if session.view.turn == Turn::Human {
+            return Err(Error::AlreadyYourTurn);
+        }
+        // Rounds no agent received yet go back to being Drafts, for the human to keep editing,
+        // and the last Round is the one before them again.
+        let first = session.queued.iter().find_map(|o| match o {
+            Outcome::Round(round) => Some(round.number),
+            _ => None,
+        });
+        if let Some(first) = first {
+            session.queued.clear();
+            for comment in session.view.threads.iter_mut().flat_map(|t| &mut t.comments) {
+                if comment.author == Party::Human && comment.round.is_some_and(|n| n >= first) {
+                    comment.round = None;
+                }
+            }
+            session.view.round = first;
+            if let Some(at) = session.replaced_last_rounds.iter().position(|(n, _)| *n == first) {
+                // The withdrawn Rounds' entries go too.
+                let (_, last_round) = session.replaced_last_rounds.drain(at..).next().expect("found at `at`");
+                session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
+                session.view.last_round = last_round;
+                if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {
+                    session.view.view = ChangesetView::Full;
+                }
+            }
+        }
+        inner.became_humans_turn(at);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Agent: replies to `thread` in the Session for the repository and branch at `cwd`. The
+    /// human sees it at once; it counts towards the Round being drafted.
+    pub fn reply(&self, cwd: &Path, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.agent_thread(cwd, thread, |round, thread| {
+            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round), suggestion: None });
+        })
+    }
+
+    /// Agent: marks `thread` Resolved in the Session for the repository and branch at `cwd`.
+    pub fn resolve(&self, cwd: &Path, thread: &ThreadId) -> Result<(), Error> {
+        self.agent_thread(cwd, thread, |_, thread| resolve(thread, Party::Agent))
+    }
+
+    /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
+    /// next Round under that Thread.
+    pub fn reply_in_thread(&self, id: &SessionId, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        self.human_thread(id, thread, |t| {
+            t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
+        })
+    }
+
+    /// Human: marks `thread` Resolved, whoever opened it.
+    pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| resolve(t, Party::Human))
+    }
+
+    /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
+    pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
+        self.human_thread(id, thread, |t| {
+            if t.resolved.take().is_some() {
+                t.reopened = true;
+            }
+        })
+    }
+
+    fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);
+        f(found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Runs `f` on a Thread the agent has received, in the Session for `cwd`, with the number
+    /// of the Round being drafted.
+    fn agent_thread(&self, cwd: &Path, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let mut inner = self.lock();
+        let Some(session) = inner.sessions.iter_mut().find(|s| s.view.repo == repo && s.view.branch == branch) else {
+            return Err(Error::NoSessionHere { repo, branch });
+        };
+        let round = session.view.round;
+        // A Thread still all Drafts hasn't reached the agent, so it can't know its ID.
+        let found =
+            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| !c.is_draft()));
+        f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
     }
 
     /// Human: ticks `path` as viewed, or unticks it.
@@ -468,7 +980,8 @@ impl Service {
         Ok(())
     }
 
-    /// Human: approves the Session, which ends it and returns the Verdict to the agent.
+    /// Human: approves the Session, which ends it and returns the Verdict to the agent. Only
+    /// on the human's Turn: during the agent's, take the Turn back first.
     pub fn approve(&self, id: &SessionId) -> Result<(), Error> {
         self.end(id, Outcome::Approved)
     }
@@ -478,19 +991,44 @@ impl Service {
         self.end(id, Outcome::Abandoned)
     }
 
+    /// Gives the agent `outcome`, which ends the Session once delivered. With no `review` call
+    /// waiting, the Session keeps it for the next one.
     fn end(&self, id: &SessionId, outcome: Outcome) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let session = inner.sessions.remove(at);
-        if inner.displayed.as_ref() == Some(id) {
-            inner.displayed = None;
+        let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
         }
-        inner.session_bases.remove(&(session.view.repo.clone(), session.view.branch.clone()));
-        if let Some(waiter) = session.waiter {
-            // The agent may have gone away; the Session ends regardless.
-            let _ = waiter.send(outcome);
+        if outcome == Outcome::Approved && session.view.turn != Turn::Human {
+            return Err(Error::NotYourTurn);
         }
+        session.view.ended = Some(outcome.clone());
+        // It replaces any Round the agent hasn't received.
+        session.queued.clear();
+        session.queued.push(outcome);
+        session.deliver();
+        inner.reap();
         inner.notify();
         Ok(())
     }
+}
+
+/// Marks `thread` Resolved by `by`; a reopening not yet handed over no longer needs telling.
+fn resolve(thread: &mut Thread, by: Party) {
+    thread.resolved = Some(by);
+    thread.reopened = false;
+}
+
+/// The paths whose change differs between two Changesets, including files in only one of them.
+fn changed_files(then: &Changeset, now: &Changeset) -> BTreeSet<String> {
+    let differs = |a: &Changeset, b: &Changeset| {
+        a.files.iter().filter(|f| !b.files.contains(f)).map(|f| f.path.clone()).collect::<Vec<_>>()
+    };
+    differs(then, now).into_iter().chain(differs(now, then)).collect()
+}
+
+/// The `n` of a Session id `sn`.
+fn id_number(id: &SessionId) -> Option<u64> {
+    id.as_str().strip_prefix('s')?.parse().ok()
 }

@@ -325,7 +325,7 @@ const THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated path subjectType
+          id isResolved resolvedBy { login } isOutdated path subjectType
           line originalLine startLine originalStartLine diffSide
           comments(first: 100) { nodes { body author { login } diffHunk } }
         }
@@ -370,6 +370,7 @@ struct PageInfo {
 struct GqlThread {
     id: String,
     is_resolved: bool,
+    resolved_by: Option<GqlActor>,
     is_outdated: bool,
     path: String,
     subject_type: Option<String>,
@@ -425,7 +426,8 @@ impl GqlThread {
             id: self.id,
             anchor,
             outdated: self.is_outdated,
-            resolved: self.is_resolved,
+            // GitHub shows a deleted account as "ghost".
+            resolved_by: self.is_resolved.then(|| self.resolved_by.map_or_else(|| "ghost".to_owned(), |a| a.login)),
             diff_hunk,
             comments,
         }

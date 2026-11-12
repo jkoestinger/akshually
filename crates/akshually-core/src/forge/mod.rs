@@ -72,7 +72,8 @@ pub struct RemoteThread {
     pub anchor: RemoteAnchor,
     /// The Forge says the code it was written on has changed since.
     pub outdated: bool,
-    pub resolved: bool,
+    /// Who resolved it, while it's resolved.
+    pub resolved_by: Option<String>,
     /// The diff the Thread was written against, as the Forge shows it.
     pub diff_hunk: String,
     /// Oldest first.

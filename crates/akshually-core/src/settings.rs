@@ -15,11 +15,14 @@ pub struct Settings {
     pub untracked: bool,
     /// Forge hosts beyond github.com, each with an optional pasted token (`[[hosts]]`).
     pub hosts: Vec<HostConfig>,
+    /// Whether a Session that becomes the human's Turn while the window is unfocused shows an
+    /// OS desktop notification.
+    pub notifications: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { untracked: true, hosts: Vec::new() }
+        Settings { untracked: true, notifications: true, hosts: Vec::new() }
     }
 }
 
