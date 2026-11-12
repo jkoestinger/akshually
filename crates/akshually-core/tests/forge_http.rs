@@ -3,14 +3,23 @@
 //! both GitHub and GitLab through `ForgeAdapter`, with a mock server, a fake `gh` or `glab` and a
 //! controlled environment. Nothing here reaches the network or real credentials.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, GitLab, HostConfig, PullRequestRef,
 };
-use akshually_testkit::TestDirs;
+use akshually_testkit::{TestDirs, fake_cli};
 use mockito::{Matcher, Mock, Server, ServerGuard};
+
+/// The Pull Request the tests fetch on a Forge.
+struct Fetched {
+    repo: &'static str,
+    number: u64,
+    /// Its API path.
+    path: &'static str,
+    /// The fixture answering it, under `tests/fixtures`.
+    fixture: &'static str,
+}
 
 /// One Forge, as the shared tests drive it.
 struct Forge {
@@ -22,10 +31,7 @@ struct Forge {
     cli_args: &'static str,
     /// The environment variables that give `host` a token, the token's last.
     env: &'static [(&'static str, &'static str)],
-    /// The Pull Request the tests fetch, the API path it's at, and the fixture answering it.
-    pr: (&'static str, u64),
-    path: &'static str,
-    fixture: &'static str,
+    pull_request: Fetched,
     new: fn(HostConfig, CredentialSources) -> Box<dyn ForgeAdapter>,
 }
 
@@ -35,9 +41,12 @@ const GITHUB: Forge = Forge {
     cli: "gh",
     cli_args: "auth token --hostname github.com",
     env: &[("GITHUB_TOKEN", "from-env")],
-    pr: ("acme/web", 482),
-    path: "/repos/acme/web/pulls/482",
-    fixture: "github/pull.json",
+    pull_request: Fetched {
+        repo: "acme/web",
+        number: 482,
+        path: "/repos/acme/web/pulls/482",
+        fixture: "github/pull.json",
+    },
     new: |host, sources| Box::new(GitHub::new(host, sources)),
 };
 
@@ -47,9 +56,12 @@ const GITLAB: Forge = Forge {
     cli: "glab",
     cli_args: "config get token --host gitlab.example.com",
     env: &[("GITLAB_HOST", "gitlab.example.com"), ("GITLAB_TOKEN", "from-env")],
-    pr: ("platform/infra", 97),
-    path: "/projects/platform%2Finfra/merge_requests/97",
-    fixture: "gitlab/mr.json",
+    pull_request: Fetched {
+        repo: "platform/infra",
+        number: 97,
+        path: "/projects/platform%2Finfra/merge_requests/97",
+        fixture: "gitlab/mr.json",
+    },
     new: |host, sources| Box::new(GitLab::new(host, sources)),
 };
 
@@ -68,9 +80,11 @@ macro_rules! for_both_forges {
 for_both_forges!(
     the_token_comes_from_the_forge_s_cli_first,
     when_the_cli_has_no_token_for_the_host_the_environment_is_next,
+    without_the_cli_the_token_comes_from_the_environment,
     the_pasted_token_is_the_last_resort,
     with_no_token_anywhere_nothing_is_sent,
-    the_cli_is_asked_once_and_again_after_the_token_is_refused,
+    the_cli_is_asked_once_for_every_request,
+    a_refused_token_is_fetched_again_from_the_cli,
     a_refused_token_fails_the_inbox,
     a_missing_pull_request_is_not_found,
 );
@@ -121,23 +135,16 @@ impl<'f> Harness<'f> {
     /// The Forge's CLI, printing `token` when asked for `host`'s and failing otherwise, which
     /// counts its runs in `cli-runs`.
     fn fake_cli(&self, host: &str, token: &str) -> PathBuf {
-        let cli = self.dirs.path().join(self.forge.cli);
         let runs = self.dirs.path().join("cli-runs");
         let args = self.forge.cli_args.replace(self.forge.host, host);
-        let script = format!(
-            "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\necho run >> '{}'\nif [ \"$*\" = '{args}' ]; then echo '{token}'; exit 0; fi\n\
-             exit 1\n",
+        let body = format!(
+            "echo run >> '{}'
+if [ \"$*\" = '{args}' ]; then echo '{token}'; exit 0; fi
+exit 1
+",
             runs.display()
         );
-        std::fs::write(&cli, script).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A child forked by another test thread while the script was open for writing keeps it
-        // "busy" (ETXTBSY) until that child execs; wait for it to be runnable.
-        while let Err(e) = std::process::Command::new(&cli).arg("--probe").status() {
-            assert_eq!(e.raw_os_error(), Some(26), "can't run the fake {}: {e}", self.forge.cli);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        cli
+        fake_cli(&self.dirs.path().join(self.forge.cli), &body)
     }
 
     fn cli_runs(&self) -> usize {
@@ -146,10 +153,11 @@ impl<'f> Harness<'f> {
 
     /// `GET` the Pull Request, sent with `token`, answering it.
     fn pull_request(&mut self, token: &str) -> Mock {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(self.forge.fixture);
+        let fetched = &self.forge.pull_request;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fetched.fixture);
         let body = std::fs::read_to_string(&fixture).unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
         self.server
-            .mock("GET", self.forge.path)
+            .mock("GET", fetched.path)
             .match_header("authorization", format!("Bearer {token}").as_str())
             .with_header("content-type", "application/json")
             .with_body(body)
@@ -157,7 +165,8 @@ impl<'f> Harness<'f> {
     }
 
     fn pr_ref(&self) -> PullRequestRef {
-        PullRequestRef { host: self.forge.host.into(), repo: self.forge.pr.0.into(), number: self.forge.pr.1 }
+        let fetched = &self.forge.pull_request;
+        PullRequestRef { host: self.forge.host.into(), repo: fetched.repo.into(), number: fetched.number }
     }
 }
 
@@ -175,6 +184,16 @@ fn when_the_cli_has_no_token_for_the_host_the_environment_is_next(forge: &Forge)
     let mut h = Harness::new(forge);
     let mock = h.pull_request("from-env");
     let adapter = h.adapter(Some("pasted"), Some(("forge.other.com", "other-host")), forge.env);
+
+    adapter.pull_request(&h.pr_ref()).unwrap();
+
+    mock.assert();
+}
+
+fn without_the_cli_the_token_comes_from_the_environment(forge: &Forge) {
+    let mut h = Harness::new(forge);
+    let mock = h.pull_request("from-env");
+    let adapter = h.adapter(Some("pasted"), None, forge.env);
 
     adapter.pull_request(&h.pr_ref()).unwrap();
 
@@ -211,22 +230,28 @@ fn with_no_token_anywhere_nothing_is_sent(forge: &Forge) {
     assert!(message.contains(&paste), "{message}");
 }
 
-fn the_cli_is_asked_once_and_again_after_the_token_is_refused(forge: &Forge) {
+fn the_cli_is_asked_once_for_every_request(forge: &Forge) {
     let mut h = Harness::new(forge);
     let adapter = h.logged_in("token");
     h.pull_request("token");
+
     adapter.pull_request(&h.pr_ref()).unwrap();
     adapter.pull_request(&h.pr_ref()).unwrap();
+
     assert_eq!(h.cli_runs(), 1, "the token wasn't kept between requests");
+}
 
-    h.server.reset();
-    h.server.mock("GET", forge.path).with_status(401).with_body(r#"{"message":"401 Unauthorized"}"#).create();
+fn a_refused_token_is_fetched_again_from_the_cli(forge: &Forge) {
+    let mut h = Harness::new(forge);
+    let adapter = h.logged_in("token");
+    let refused = h.server.mock("GET", forge.pull_request.path).with_status(401).create();
     let error = adapter.pull_request(&h.pr_ref()).unwrap_err();
-    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
-    h.server.reset();
+    refused.remove();
     h.pull_request("token");
+
     adapter.pull_request(&h.pr_ref()).unwrap();
 
+    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
     assert_eq!(h.cli_runs(), 2, "the refused token wasn't fetched again");
 }
 
@@ -243,7 +268,7 @@ fn a_refused_token_fails_the_inbox(forge: &Forge) {
 fn a_missing_pull_request_is_not_found(forge: &Forge) {
     let mut h = Harness::new(forge);
     let adapter = h.logged_in("token");
-    h.server.mock("GET", forge.path).with_status(404).with_body(r#"{"message":"404 Not Found"}"#).create();
+    h.server.mock("GET", forge.pull_request.path).with_status(404).with_body(r#"{"message":"404 Not Found"}"#).create();
 
     let error = adapter.pull_request(&h.pr_ref()).unwrap_err();
 

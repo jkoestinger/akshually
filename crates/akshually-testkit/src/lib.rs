@@ -1,5 +1,6 @@
-//! Fixtures for akshually's tests, shared by seam A (the core review service) and seam B (the
-//! CLI contract). Nothing here knows about akshually itself, so both seams can use it.
+//! Fixtures for akshually's tests, shared by seam A (the core review service), seam B (the CLI
+//! contract) and seam C (the Forge adapters). Nothing here knows about akshually itself, so every
+//! seam can use it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -151,6 +152,25 @@ pub fn wait_until<T>(timeout: Duration, what: &str, mut check: impl FnMut() -> O
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// How long a fake CLI may stay unrunnable after it is written.
+const FAKE_CLI_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Writes a fake CLI (`gh`, `glab`) at `path`: an executable `sh` script running `body`, ready to
+/// run when this returns.
+pub fn fake_cli(path: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}")).expect("write the fake CLI");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make the fake CLI executable");
+    // A child forked by another test thread while the script was open for writing keeps it
+    // "busy" (ETXTBSY, 26) until that child execs; wait for it to be runnable.
+    wait_until(FAKE_CLI_TIMEOUT, "the fake CLI to be runnable", || match Command::new(path).arg("--probe").status() {
+        Ok(_) => Some(()),
+        Err(e) if e.raw_os_error() == Some(26) => None,
+        Err(e) => panic!("can't run the fake CLI {}: {e}", path.display()),
+    });
+    path.to_owned()
 }
 
 /// A local HTTP server answering each request on its own thread with `answer(path_and_query)`,

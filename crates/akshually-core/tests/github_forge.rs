@@ -3,7 +3,6 @@
 //! the same is in `forge_http.rs`. Nothing here reaches the network or real credentials.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use akshually_core::forge::{
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, adapters,
 };
 use akshually_core::{BinarySizes, FileChange, Hunk, Settings, Side};
-use akshually_testkit::{TestDirs, threaded_http_server};
+use akshually_testkit::{TestDirs, fake_cli, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 
 const TOKEN: &str = "gho_test";
@@ -24,20 +23,13 @@ fn fixture(name: &str) -> String {
 
 /// A `gh` that prints `token` for `auth token --hostname <host>` and fails otherwise.
 fn fake_gh(dir: &Path, host: &str, token: &str) -> PathBuf {
-    let gh = dir.join("gh");
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\nif [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi\n\
-         echo 'no oauth token' >&2\nexit 1\n"
+    let body = format!(
+        "if [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi
+echo 'no oauth token' >&2
+exit 1
+"
     );
-    std::fs::write(&gh, script).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // A child forked by another test thread while the script was open for writing keeps it
-    // "busy" (ETXTBSY) until that child execs; wait for it to be runnable.
-    while let Err(e) = std::process::Command::new(&gh).arg("--probe").status() {
-        assert_eq!(e.raw_os_error(), Some(26), "can't run the fake gh: {e}");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    gh
+    fake_cli(&dir.join("gh"), &body)
 }
 
 /// A mock GitHub API, and the adapter for one host pointed at it.
@@ -471,7 +463,7 @@ fn enterprise_hosts_take_the_enterprise_token_from_the_environment() {
 }
 
 #[test]
-fn an_enterprise_host_with_only_a_github_com_token_sends_nothing_and_names_gh_enterprise_token() {
+fn with_no_token_anywhere_nothing_is_sent() {
     let mut h = Harness::new();
     let mock = h.server.mock("GET", Matcher::Any).expect(0).create();
     let env = [("GITHUB_TOKEN", "github-com-token")];
@@ -482,7 +474,11 @@ fn an_enterprise_host_with_only_a_github_com_token_sends_nothing_and_names_gh_en
     mock.assert();
     assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "github.example.com"), "{error:?}");
     let message = error.to_string();
+    assert!(message.contains("gh auth login --hostname github.example.com"), "{message}");
     assert!(message.contains("GH_ENTERPRISE_TOKEN"), "{message}");
+    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"github\"\n\
+                 host = \"github.example.com\"\ntoken = \"<your token>\"";
+    assert!(message.contains(paste), "{message}");
 }
 
 // --- The Inbox ---

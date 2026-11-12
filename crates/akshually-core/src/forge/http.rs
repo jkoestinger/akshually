@@ -11,7 +11,8 @@ use url::Url;
 
 use super::{CredentialSources, ForgeError, HostConfig, PullRequestRef, REQUEST_TIMEOUT};
 
-/// The most of a file read for its contents: GitHub serves raw contents up to 100 MB.
+/// The most of a file read for its contents, on every Forge: GitHub's limit for raw contents,
+/// 100 MB.
 const MAX_FILE: u64 = 100 * 1024 * 1024;
 
 /// What one Forge's API does its own way, as far as the [`Client`] cares.
@@ -74,8 +75,8 @@ impl Client {
     }
 
     /// Sends `request` with the token, through `send`. Any status but 2xx and 304 (which
-    /// answers a conditional request: unchanged) is an error; a 401 forgets the token, so the
-    /// next request fetches it again. Blocks on the network.
+    /// answers a conditional request, as only GitHub's adapter sends: unchanged) is an error; a
+    /// 401 forgets the token, so the next request fetches it again. Blocks on the network.
     pub(super) fn send<B>(
         &self,
         request: RequestBuilder<B>,
@@ -109,8 +110,8 @@ impl Client {
             .map_err(|e| self.http(e))
     }
 
-    /// The request never got an answer.
-    pub(super) fn http(&self, error: impl std::fmt::Display) -> ForgeError {
+    /// The request never got an answer, or its body couldn't be read.
+    fn http(&self, error: impl std::fmt::Display) -> ForgeError {
         ForgeError::Http { host: self.host.host.clone(), message: error.to_string() }
     }
 

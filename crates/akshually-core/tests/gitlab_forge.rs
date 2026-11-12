@@ -3,7 +3,6 @@
 //! the same is in `forge_http.rs`. Nothing here reaches the network or real credentials.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use akshually_core::forge::{
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
 use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
-use akshually_testkit::{TestDirs, threaded_http_server};
+use akshually_testkit::{TestDirs, fake_cli, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value, json};
 
@@ -26,19 +25,14 @@ fn fixture(name: &str) -> String {
 /// A `glab` that prints `token` for `config get token --host <host>` and prints nothing
 /// otherwise (as glab does for an unset key).
 fn fake_glab(dir: &Path, host: &str, token: &str) -> PathBuf {
-    let glab = dir.join("glab");
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\nif [ \"$*\" = 'config get token --host {host}' ]; then echo '{token}'; fi\nexit 0\n"
-    );
-    std::fs::write(&glab, script).unwrap();
-    std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // A child forked by another test thread while the script was open for writing keeps it
-    // "busy" (ETXTBSY) until that child execs; wait for it to be runnable.
-    while let Err(e) = std::process::Command::new(&glab).arg("--probe").status() {
-        assert_eq!(e.raw_os_error(), Some(26), "can't run the fake glab: {e}");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    glab
+    fake_cli(
+        &dir.join("glab"),
+        &format!(
+            "if [ \"$*\" = 'config get token --host {host}' ]; then echo '{token}'; fi
+exit 0
+"
+        ),
+    )
 }
 
 /// A mock GitLab API, and the adapter for one host pointed at it.

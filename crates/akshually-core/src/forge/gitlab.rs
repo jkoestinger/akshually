@@ -9,12 +9,12 @@ use ureq::http::Response;
 use ureq::{Body, RequestBuilder};
 use url::Url;
 
-use super::http::{Client, Dialect, host_matches, not_found_as};
 use super::{
-    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment,
+    CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, epoch_seconds, fetch_files,
+    http::{Client, Dialect, host_matches, not_found_as},
+    with_suggestion,
 };
-use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
 use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitLab's maximum.
