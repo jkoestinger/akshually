@@ -5,8 +5,8 @@ mod support;
 
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Side};
-use akshually_testkit::{TestDirs, TestRepo};
-use support::{HostedApp, LaunchedApp, finish, still_running};
+use akshually_testkit::{TestDirs, TestRepo, wait_until};
+use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -205,4 +205,46 @@ fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
     let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_second_review_while_one_waits_exits_1_with_a_clear_message() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    let second = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+
+    assert_eq!(second.status.code(), Some(EXIT_ERROR));
+    assert!(second.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stderr),
+        "akshually: another `akshually review` is already waiting on this Session\n"
+    );
+    assert!(still_running(&mut first), "the first call stopped waiting");
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_APPROVED));
+}
+
+#[test]
+fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+
+    first.kill().unwrap();
+    first.wait().unwrap();
+    wait_until(TIMEOUT, "the app to notice", || app.service.session(&session.id).filter(|s| !s.agent_waiting));
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("# Round 1\n"));
+    let mut third = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    assert!(still_running(&mut third), "the Round was delivered twice");
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(third).status.code(), Some(EXIT_APPROVED));
 }

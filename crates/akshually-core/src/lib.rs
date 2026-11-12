@@ -12,7 +12,7 @@ mod thread;
 
 pub use changeset::{Changeset, FileChange};
 pub use paths::Paths;
-pub use service::{Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use service::{CancelReview, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn};
 pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,4 +29,10 @@ pub enum Error {
     EmptyComment,
     #[error("there are no Drafts to hand over")]
     NoDrafts,
+    #[error("it's the agent's Turn: take the Turn back first")]
+    NotYourTurn,
+    #[error("it's already your Turn")]
+    AlreadyYourTurn,
+    #[error("another `akshually review` is already waiting on this Session")]
+    Busy,
 }

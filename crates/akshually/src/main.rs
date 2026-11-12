@@ -3,6 +3,7 @@
 mod launch;
 mod render;
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -61,22 +62,29 @@ fn main() -> ExitCode {
 
 fn review() -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd)?;
+    // Printed and flushed before the app hears back, so a Round is acknowledged only once the
+    // agent can see it.
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, |outcome| {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(outcome_text(outcome).as_bytes())?;
+        stdout.flush()
+    })?;
     let code = match outcome {
-        Outcome::Round(round) => {
-            print!("{}", render::round_markdown(&round));
-            exit::ROUND
-        }
-        Outcome::Approved => {
-            println!("Approved.");
-            exit::APPROVED
-        }
-        Outcome::Abandoned => {
-            println!("Abandoned: the human closed this Session without a Verdict. Stop working on this change.");
-            exit::ABANDONED
-        }
+        Outcome::Round(_) => exit::ROUND,
+        Outcome::Approved => exit::APPROVED,
+        Outcome::Abandoned => exit::ABANDONED,
     };
     Ok(ExitCode::from(code))
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Round(round) => render::round_markdown(round),
+        Outcome::Approved => "Approved.\n".to_owned(),
+        Outcome::Abandoned => {
+            "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n".to_owned()
+        }
+    }
 }
 
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {

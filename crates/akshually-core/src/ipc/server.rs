@@ -2,10 +2,10 @@ use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{Paths, ReviewRequest, Service};
+use crate::{Outcome, Paths, ReviewRequest, Service};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
@@ -63,23 +63,66 @@ impl Server {
     }
 
     fn handle(&self, stream: UnixStream) {
+        let Ok(read) = stream.try_clone() else { return };
+        let mut reader = BufReader::new(read);
         let mut line = String::new();
-        if BufReader::new(&stream).read_line(&mut line).is_err() {
+        if reader.read_line(&mut line).is_err() {
             return;
         }
         let reply = match parse(&line) {
+            Ok(Request::Review { cwd }) => return self.review(cwd, &stream, reader),
             Ok(request) => self.answer(request),
             Err(error) => Reply::Err(error),
         };
-        let mut out = serde_json::to_string(&Envelope::new(reply)).expect("replies serialize");
-        out.push('\n');
         // The client may have gone away while waiting; nothing to do about it.
-        let _ = (&stream).write_all(out.as_bytes());
+        let _ = send(&stream, reply);
+    }
+
+    /// Serves a `review` call: waits for the human while watching the connection, so a CLI
+    /// that goes away frees the Session, and hands a Round over for good only once the CLI
+    /// acknowledges it.
+    fn review(&self, cwd: std::path::PathBuf, stream: &UnixStream, mut reader: BufReader<UnixStream>) {
+        let pending = match self.service.review(ReviewRequest::new(cwd)) {
+            Ok(pending) => pending,
+            Err(error) => {
+                let _ = send(stream, Reply::Err(failed(error)));
+                return;
+            }
+        };
+        // The CLI's next line is the ack; EOF before it means the CLI went away.
+        let (next_line, client) = mpsc::channel();
+        let cancel = pending.canceller();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = matches!(reader.read_line(&mut line), Ok(n) if n > 0);
+            if !read {
+                cancel.cancel();
+            }
+            let _ = next_line.send(read.then_some(line));
+        });
+
+        let Some(outcome) = pending.receive() else {
+            let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
+            return;
+        };
+        let round = matches!(outcome, Outcome::Round(_));
+        if send(stream, Reply::Ok(json(outcome))).is_err() || !round {
+            return;
+        }
+        // Without the ack, dropping `pending` queues the Round again.
+        if let Ok(Some(line)) = client.recv()
+            && matches!(parse(&line), Ok(Request::Ack))
+        {
+            pending.ack();
+            let _ = send(stream, Reply::Ok(serde_json::json!({})));
+        }
     }
 
     fn answer(&self, request: Request) -> Reply {
         let result = match request {
-            Request::Review { cwd } => self.review(cwd),
+            Request::Review { .. } | Request::Ack => {
+                Err(ErrorReply::new(ErrorCode::BadRequest, "`review` and `ack` need a connection of their own"))
+            }
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {
                 Err(ErrorReply::new(ErrorCode::Forbidden, "this app was not started for tests"))
             }
@@ -89,14 +132,6 @@ impl Server {
         match result {
             Ok(value) => Reply::Ok(value),
             Err(error) => Reply::Err(error),
-        }
-    }
-
-    fn review(&self, cwd: std::path::PathBuf) -> Result<serde_json::Value, ErrorReply> {
-        let pending = self.service.review(ReviewRequest::new(cwd)).map_err(failed)?;
-        match pending.wait() {
-            Some(outcome) => Ok(json(outcome)),
-            None => Err(ErrorReply::new(ErrorCode::Failed, "the Session stopped waiting for this call")),
         }
     }
 
@@ -125,8 +160,18 @@ fn parse(line: &str) -> Result<Request, ErrorReply> {
     Ok(envelope.body)
 }
 
+fn send(stream: &UnixStream, reply: Reply) -> io::Result<()> {
+    let mut out = serde_json::to_string(&Envelope::new(reply)).expect("replies serialize");
+    out.push('\n');
+    (&*stream).write_all(out.as_bytes())
+}
+
 fn failed(error: crate::Error) -> ErrorReply {
-    ErrorReply::new(ErrorCode::Failed, error.to_string())
+    let code = match error {
+        crate::Error::Busy => ErrorCode::Busy,
+        _ => ErrorCode::Failed,
+    };
+    ErrorReply::new(code, error.to_string())
 }
 
 fn json(value: impl serde::Serialize) -> serde_json::Value {
