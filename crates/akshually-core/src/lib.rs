@@ -22,8 +22,8 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PlacedThread, PublishPlan,
-    ReviewRequest, Role, Service, SessionId, SessionView, Source, SourceRef, ThreadRef, Turn, Verdict,
+    CancelReview, ChangesetView, DiffLayout, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PlacedThread,
+    PublishPlan, ReviewRequest, Role, Service, SessionId, SessionView, Source, SourceRef, ThreadRef, Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};

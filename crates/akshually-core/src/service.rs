@@ -15,6 +15,7 @@ use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, Thr
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 mod co_review;
+mod diff_layout;
 mod disk;
 mod drafts;
 mod handoff;
@@ -22,6 +23,7 @@ mod inbox;
 mod pull_request;
 mod threads;
 
+pub use diff_layout::DiffLayout;
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
@@ -573,6 +575,7 @@ struct Inner {
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
     inbox: inbox::InboxState,
+    diff_layout: DiffLayout,
 }
 
 impl Inner {
@@ -700,6 +703,7 @@ impl Service {
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
         inner.inbox.saved = store.load_inbox();
+        inner.diff_layout = store.load_diff_layout();
         inner.store = Some(store);
         Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
     }
