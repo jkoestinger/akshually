@@ -125,14 +125,22 @@ fn review(local: LocalOptions) -> Result<ExitCode> {
 }
 
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
-    let service = Arc::new(Service::new());
-    service.set_settings(Settings::load(&Settings::file_from_env())?);
+    let settings = Settings::load(&Settings::file_from_env())?;
     if !headless && akshually_ui::is_headless_run(&rune_args) {
         // A headless render (`--snap`, ...) of the UI alone: no socket, no state.
+        let service = Arc::new(Service::new());
+        service.set_settings(settings);
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let server = match Server::bind(&Paths::from_env(), service.clone()) {
+    let paths = Paths::from_env();
+    // Only reads the saved Sessions: it writes nothing until a Session changes, which a
+    // second instance never sees, since it quits below.
+    let service = Service::open(&paths.state)?;
+    // No window means nothing to notify about, and tests never show real notifications.
+    let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
+    service.set_settings(settings);
+    let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
         // Another instance serves the CLI already; leave it to that one.
         Err(BindError::AlreadyRunning) => return Ok(ExitCode::SUCCESS),

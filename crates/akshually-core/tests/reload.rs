@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use akshually_core::{Anchor, ChangesetView, ReviewRequest, Service, Side, ThreadId, Turn};
-use akshually_testkit::{TestRepo, wait_until};
+use akshually_testkit::{TestDirs, TestRepo, wait_until};
 
 /// A repository on branch `agent` whose `lib.rs` has uncommitted changes.
 fn agent_branch() -> TestRepo {
@@ -138,4 +138,21 @@ fn the_disk_watcher_offers_changes_without_being_asked() {
     wait_until(Duration::from_secs(10), "the change on disk to be offered", || {
         (svc.session(&id).unwrap().changed_on_disk == paths(&["other.rs"])).then_some(())
     });
+}
+
+#[test]
+fn a_restored_session_reloads_with_what_the_agents_review_asked_for() {
+    let repo = agent_branch();
+    let dirs = TestDirs::new();
+    let id = {
+        let svc = Service::open(dirs.state()).unwrap();
+        svc.review(ReviewRequest::new(repo.path()).untracked(false)).unwrap().session().clone()
+    };
+    let restored = Service::open(dirs.state()).unwrap();
+
+    repo.write("untracked.rs", "new\n").write("other.rs", "y\n");
+    restored.reload(&id).unwrap();
+
+    let files: Vec<_> = restored.session(&id).unwrap().changeset.files.into_iter().map(|f| f.path).collect();
+    assert_eq!(files, ["lib.rs", "other.rs"], "still without untracked files");
 }

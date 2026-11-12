@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use akshually_core::{
-    Anchor, BinarySizes, ChangesetView, Collapsed, FileChange, Outcome, Party, ReviewRequest, Round, Service, Settings,
-    Side, Thread,
+    Anchor, BinarySizes, ChangesetView, Collapsed, FileChange, Outcome, Party, ReviewRequest, Round, Service,
+    SessionId, Settings, Side, Thread,
 };
 use akshually_testkit::{TestDirs, TestRepo};
 
@@ -556,7 +556,7 @@ fn untracked_non_ignored_files_are_included_by_default() {
 fn the_untracked_setting_excludes_untracked_files() {
     let repo = repo_with_untracked_and_ignored_files();
     let svc = Service::new();
-    svc.set_settings(Settings { untracked: false });
+    svc.set_settings(Settings { untracked: false, ..Settings::default() });
 
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
@@ -567,7 +567,7 @@ fn the_untracked_setting_excludes_untracked_files() {
 fn a_review_call_overrides_the_untracked_setting() {
     let (repo, other) = (repo_with_untracked_and_ignored_files(), repo_with_untracked_and_ignored_files());
     let excluding = Service::new();
-    excluding.set_settings(Settings { untracked: false });
+    excluding.set_settings(Settings { untracked: false, ..Settings::default() });
     let including = Service::new();
 
     let included = excluding.review(ReviewRequest::new(repo.path()).untracked(true)).unwrap();
@@ -893,4 +893,156 @@ fn a_file_the_agent_reverted_since_the_last_round_shows_as_changed_back() {
 
     let session = svc.session(third.session()).unwrap();
     assert!(session.shown().files.contains(&change("other.rs", Some("fn o2() {}\n"), Some("fn o() {}\n"))));
+}
+
+// Persistence: Sessions survive restarts, shown by building a new service on the same state dir.
+
+/// Opens a Session on `repo`, hands Round 1 over to the agent, and leaves a Draft for Round 2.
+fn session_mid_review(svc: &Service, repo: &TestRepo) -> SessionId {
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why rename?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "Add a test for d").unwrap();
+    id
+}
+
+#[test]
+fn a_new_service_on_the_same_state_dir_restores_every_open_session() {
+    let dirs = TestDirs::new();
+    let (repo, other) = (agent_branch(), agent_branch());
+    let svc = Service::open(dirs.state()).unwrap();
+    let id = session_mid_review(&svc, &repo);
+    svc.mark_viewed(&id, "lib.rs", true).unwrap();
+    let _waiting = svc.review(ReviewRequest::new(other.path())).unwrap();
+    let before = svc.sessions();
+    assert!(before[0].last_round.is_some() && !before[0].viewed.is_empty() && before[1].attention);
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+
+    assert_eq!(restored.sessions(), before);
+}
+
+#[test]
+fn after_a_restart_the_agents_next_review_attaches_to_the_restored_session() {
+    let dirs = TestDirs::new();
+    let repo = agent_branch();
+    let svc = Service::open(dirs.state()).unwrap();
+    let id = session_mid_review(&svc, &repo);
+    let threads = svc.session(&id).unwrap().threads;
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+    let pending = restored.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(pending.session(), &id);
+    assert_eq!(restored.sessions().len(), 1);
+    assert_eq!(restored.session(&id).unwrap().threads, threads);
+    restored.hand_over_round(&id).unwrap();
+    let round2 = round(pending.wait_timeout(Duration::from_secs(1)));
+    assert_eq!((round2.number, round2.threads[0].id.as_str()), (2, "T2"));
+}
+
+#[test]
+fn a_round_queued_before_a_restart_goes_to_the_next_review() {
+    let dirs = TestDirs::new();
+    let repo = agent_branch();
+    let svc = Service::open(dirs.state()).unwrap();
+    let id = session_mid_review(&svc, &repo);
+    svc.hand_over_round(&id).unwrap();
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+    let pending = restored.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(round(pending.wait_timeout(Duration::from_secs(1))).number, 2);
+}
+
+#[test]
+fn sessions_opened_after_a_restart_get_new_ids_and_thread_ids_keep_counting() {
+    let dirs = TestDirs::new();
+    let (repo, other) = (agent_branch(), agent_branch());
+    let svc = Service::open(dirs.state()).unwrap();
+    let id = session_mid_review(&svc, &repo);
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+    let new = restored.review(ReviewRequest::new(other.path())).unwrap();
+    let thread = restored.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "three").unwrap();
+
+    assert_ne!(new.session(), &id);
+    assert_eq!(restored.sessions().len(), 2);
+    assert_eq!(thread.as_str(), "T3");
+}
+
+#[test]
+fn approved_and_abandoned_sessions_are_not_restored() {
+    let dirs = TestDirs::new();
+    let (approved, abandoned, open) = (agent_branch(), agent_branch(), agent_branch());
+    let svc = Service::open(dirs.state()).unwrap();
+    let approved = session_mid_review(&svc, &approved);
+    let abandoned = session_mid_review(&svc, &abandoned);
+    let open = session_mid_review(&svc, &open);
+    svc.approve(&approved).unwrap();
+    svc.abandon(&abandoned).unwrap();
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+
+    assert_eq!(restored.sessions().iter().map(|s| &s.id).collect::<Vec<_>>(), vec![&open]);
+}
+
+#[test]
+fn a_persisted_session_writes_nothing_inside_the_repository() {
+    let dirs = TestDirs::new();
+    let repo = agent_branch();
+    let everything = ["status", "--porcelain", "--ignored", "--untracked-files=all"];
+    let before = repo.git(&everything);
+    let svc = Service::open(dirs.state()).unwrap();
+
+    session_mid_review(&svc, &repo);
+    drop(svc);
+    Service::open(dirs.state()).unwrap().review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(repo.git(&everything), before);
+}
+
+#[test]
+fn a_session_base_recorded_before_a_restart_still_applies_to_the_first_review() {
+    let dirs = TestDirs::new();
+    let repo = human_work_in_progress();
+    Service::open(dirs.state()).unwrap().start(repo.path()).unwrap();
+    repo.write("agent.txt", "agent\n");
+
+    let restored = Service::open(dirs.state()).unwrap();
+    let pending = restored.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = restored.session(pending.session()).unwrap();
+    assert_eq!(session.view, ChangesetView::SinceSessionBase);
+    assert_eq!(session.shown().files, vec![change("agent.txt", None, Some("agent\n"))]);
+}
+
+#[test]
+fn a_restored_session_keeps_its_session_base_and_the_changeset_the_human_chose() {
+    let dirs = TestDirs::new();
+    let repo = human_work_in_progress();
+    let svc = Service::open(dirs.state()).unwrap();
+    svc.start(repo.path()).unwrap();
+    repo.write("agent.txt", "agent\n");
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    svc.show(&id, ChangesetView::Full).unwrap();
+    let before = svc.session(&id).unwrap();
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+    assert_eq!(restored.session(&id).unwrap(), before);
+    repo.write("agent.txt", "agent, again\n");
+    restored.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = restored.session(&id).unwrap();
+    assert_eq!(session.view, ChangesetView::Full);
+    let since = session.since_session_base.expect("the Session base survived").files;
+    assert_eq!(since, vec![change("agent.txt", None, Some("agent, again\n"))]);
 }
