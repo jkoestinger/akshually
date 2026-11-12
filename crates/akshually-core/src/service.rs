@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
-use crate::{Error, Settings, git, reanchor};
+use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,6 +216,9 @@ struct Inner {
     subscribers: Vec<Subscriber>,
     /// The Session whose tab the human has open.
     displayed: Option<SessionId>,
+    /// Whether the human is looking at akshually's window.
+    window_focused: bool,
+    notifier: Option<Box<dyn Notifier>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
 }
@@ -230,6 +233,14 @@ impl Inner {
         match &self.displayed {
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
+        }
+        if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
+            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            notifier.notify(Notification {
+                session: view.id.clone(),
+                title: "Your Turn to review".into(),
+                body: format!("{repo} ({})", view.branch),
+            });
         }
     }
 
@@ -296,6 +307,19 @@ impl Service {
         let session_bases = bases.into_iter().map(|b| ((b.repo, b.branch), b.tree)).collect();
         let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
         Ok(Service { inner: Mutex::new(inner) })
+    }
+
+    /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
+    /// Turn while the window is unfocused. Without one, the service notifies no one.
+    pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
+        self.lock().notifier = Some(Box::new(notifier));
+        self
+    }
+
+    /// The UI: tells the service whether the human is looking at the window (unfocused until
+    /// told otherwise).
+    pub fn set_window_focused(&self, focused: bool) {
+        self.lock().window_focused = focused;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

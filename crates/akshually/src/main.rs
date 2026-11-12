@@ -132,7 +132,9 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     let paths = Paths::from_env();
     // Only reads the saved Sessions: it writes nothing until a Session changes, which a
     // second instance never sees, since it quits below.
-    let service = Arc::new(Service::open(&paths.state)?);
+    let service = Service::open(&paths.state)?;
+    // No window means nothing to notify about, and tests never show real notifications.
+    let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);
     let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,

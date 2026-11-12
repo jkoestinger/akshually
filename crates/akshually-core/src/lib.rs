@@ -6,6 +6,7 @@
 mod changeset;
 pub mod git;
 pub mod ipc;
+mod notifier;
 mod paths;
 mod reanchor;
 mod service;
@@ -14,6 +15,7 @@ mod store;
 mod thread;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
+pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn};
