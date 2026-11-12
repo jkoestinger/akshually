@@ -60,6 +60,7 @@ impl Harness {
             None => self.dirs.path().join("no-glab-here"),
         };
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh: self.dirs.path().join("no-gh-here"),
             glab,
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -133,7 +134,12 @@ fn configured_gitlab_hosts_serve_their_own_urls() {
     let file = dirs.path().join("config.toml");
     std::fs::write(&file, "[[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\n").unwrap();
     let settings = Settings::load(&file).unwrap();
-    let sources = CredentialSources { gh: "/nonexistent".into(), glab: "/nonexistent".into(), env: HashMap::new() };
+    let sources = CredentialSources {
+        config: "/home/me/.config/akshually/config.toml".into(),
+        gh: "/nonexistent".into(),
+        glab: "/nonexistent".into(),
+        env: HashMap::new(),
+    };
 
     let forges = adapters(&settings.hosts, &sources);
 
@@ -514,7 +520,12 @@ fn with_no_token_anywhere_nothing_is_sent() {
     let error = h.fetch_with("gitlab.example.com", sources, None).unwrap_err();
 
     mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host } if host == "gitlab.example.com"), "{error:?}");
+    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "gitlab.example.com"), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("glab auth login --hostname gitlab.example.com"), "{message}");
+    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"gitlab\"\n\
+                 host = \"gitlab.example.com\"\ntoken = \"<your token>\"";
+    assert!(message.contains(paste), "{message}");
 }
 
 #[test]

@@ -76,7 +76,7 @@ impl GitHub {
         if cached.is_none() {
             *cached = self.credentials.github_token(&self.host);
         }
-        cached.clone().ok_or_else(|| ForgeError::NoCredentials { host: self.host.host.clone() })
+        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
     }
 
     /// `segments` appended to the REST base, each percent-encoded.

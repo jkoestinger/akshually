@@ -66,7 +66,7 @@ impl GitLab {
         if cached.is_none() {
             *cached = self.credentials.gitlab_token(&self.host);
         }
-        cached.clone().ok_or_else(|| ForgeError::NoCredentials { host: self.host.host.clone() })
+        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
     }
 
     /// `segments` appended to the REST base, each percent-encoded (so a project path's `/`

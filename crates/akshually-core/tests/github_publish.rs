@@ -27,7 +27,15 @@ impl Harness {
     fn github(&self) -> GitHub {
         let host = HostConfig { api_base: Some(self.server.url()), ..HostConfig::new(ForgeKind::GitHub, "github.com") };
         let env = HashMap::from([("GITHUB_TOKEN".to_owned(), TOKEN.to_owned())]);
-        GitHub::new(host, CredentialSources { gh: "/nonexistent/gh".into(), glab: "/nonexistent/glab".into(), env })
+        GitHub::new(
+            host,
+            CredentialSources {
+                config: "/home/me/.config/akshually/config.toml".into(),
+                gh: "/nonexistent/gh".into(),
+                glab: "/nonexistent/glab".into(),
+                env,
+            },
+        )
     }
 
     /// `GET /user`, answering the token's login.

@@ -71,6 +71,7 @@ impl Harness {
             None => self.dirs.path().join("no-gh-here"),
         };
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh,
             glab: "/nonexistent".into(),
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -166,7 +167,12 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
 
     let forges = adapters(
         &settings.hosts,
-        &CredentialSources { gh: "/nonexistent".into(), glab: "/nonexistent".into(), env: HashMap::new() },
+        &CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
+            gh: "/nonexistent".into(),
+            glab: "/nonexistent".into(),
+            env: HashMap::new(),
+        },
     );
 
     let url = "https://github.example.com/platform/infra/pull/97";
@@ -389,6 +395,7 @@ fn when_gh_has_no_token_for_the_host_the_environment_is_next() {
     let github = h.adapter(
         h.host("github.com"),
         CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
             gh,
             glab: "/nonexistent".into(),
             env: HashMap::from([("GITHUB_TOKEN".into(), "from-env".into())]),
@@ -419,7 +426,15 @@ fn enterprise_hosts_ask_gh_for_their_host_and_never_get_the_github_com_token() {
     let mock = h.get("/repos/acme/web/pulls/482", "ghe-from-gh", &fixture("pull.json"));
     let gh = fake_gh(h.dirs.path(), "github.example.com", "ghe-from-gh");
     let env = HashMap::from([("GITHUB_TOKEN".into(), "github-com-token".into())]);
-    let github = h.adapter(h.host("github.example.com"), CredentialSources { gh, glab: "/nonexistent".into(), env });
+    let github = h.adapter(
+        h.host("github.example.com"),
+        CredentialSources {
+            config: "/home/me/.config/akshually/config.toml".into(),
+            gh,
+            glab: "/nonexistent".into(),
+            env,
+        },
+    );
 
     github.pull_request(&ghe).unwrap();
 
@@ -449,7 +464,13 @@ fn with_no_token_anywhere_nothing_is_sent() {
     let error = github.pull_request(&PullRequestRef { host: "github.example.com".into(), ..pr_ref() }).unwrap_err();
 
     mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host } if host == "github.example.com"), "{error:?}");
+    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "github.example.com"), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("gh auth login --hostname github.example.com"), "{message}");
+    assert!(message.contains("GH_ENTERPRISE_TOKEN"), "{message}");
+    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"github\"\n\
+                 host = \"github.example.com\"\ntoken = \"<your token>\"";
+    assert!(message.contains(paste), "{message}");
 }
 
 #[test]

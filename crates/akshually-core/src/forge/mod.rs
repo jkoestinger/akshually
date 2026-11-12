@@ -246,12 +246,9 @@ pub struct RemoteComment {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
-    #[error(
-        "no credentials for {host}: log in with `gh auth login --hostname {host}` (GitHub) or \
-         `glab auth login --hostname {host}` (GitLab), set a token in the environment, or paste a token \
-         into akshually's config"
-    )]
-    NoCredentials { host: String },
+    /// No token for `host` from its Forge's CLI, the environment or `config`.
+    #[error("{}", no_credentials(host, *kind, config))]
+    NoCredentials { host: String, kind: ForgeKind, config: std::path::PathBuf },
     #[error("{host} refused the token (HTTP {status}); check it is valid and can read this repository")]
     Unauthorized { host: String, status: u16 },
     #[error("{0} doesn't exist, or the token can't see it")]
@@ -271,6 +268,22 @@ pub enum ForgeError {
          this review: submit or delete them there first"
     )]
     DraftsInBrowser { pr: String, count: usize },
+}
+
+/// How to give akshually a token for `host`: its Forge's CLI, the environment, or pasted into
+/// the config file at `config`, spelled out to copy.
+fn no_credentials(host: &str, kind: ForgeKind, config: &std::path::Path) -> String {
+    let (login, env, name) = match kind {
+        ForgeKind::GitHub if host.eq_ignore_ascii_case("github.com") => ("gh", "set GITHUB_TOKEN", "github"),
+        ForgeKind::GitHub => ("gh", "set GH_ENTERPRISE_TOKEN", "github"),
+        ForgeKind::GitLab => ("glab", "set GITLAB_TOKEN (with GITLAB_HOST for a host other than gitlab.com)", "gitlab"),
+    };
+    format!(
+        "no credentials for {host}: log in with `{login} auth login --hostname {host}`, {env}, or paste a token \
+         into {}:\n\n[[hosts]]\nkind = \"{name}\"\nhost = \"{host}\"\ntoken = \"<your token>\"\n\nthen restart \
+         akshually",
+        config.display()
+    )
 }
 
 /// The adapters for github.com and every configured host (`Settings::hosts`).

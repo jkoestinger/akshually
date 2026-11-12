@@ -216,7 +216,11 @@ fn a_forge_failure_opens_no_session() {
             Some(pr_ref())
         }
         fn pull_request(&self, _: &PullRequestRef) -> Result<PullRequest, ForgeError> {
-            Err(ForgeError::NoCredentials { host: "forge.test".into() })
+            Err(ForgeError::NoCredentials {
+                host: "forge.test".into(),
+                kind: ForgeKind::GitHub,
+                config: "config.toml".into(),
+            })
         }
         fn changeset(&self, _: &PullRequest) -> Result<Changeset, ForgeError> {
             unreachable!()
