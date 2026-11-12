@@ -11,7 +11,7 @@ use akshually_core::{
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
-use rune_kit::{Badge, Button, ButtonVariant, Kit, TextArea};
+use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -95,6 +95,10 @@ impl SessionTab {
             .iter()
             .filter_map(|t| {
                 let Anchor::Lines { path, side, end, .. } = &t.anchor;
+                if *side == Side::Old && self.session.view == ChangesetView::SinceLastRound {
+                    // That old side is the last Round's code, not the code the Thread is on.
+                    return None;
+                }
                 let file = changeset.files.iter().position(|f| &f.path == path)?;
                 Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
             })
@@ -259,6 +263,10 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
+        if tab.session.view == ChangesetView::SinceLastRound && range.end.side == diff::Side::Old {
+            // Those lines are the last Round's code, which a Thread can't anchor to.
+            return;
+        }
         let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
@@ -353,20 +361,27 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let shown = session.shown();
     let base = if shown == &session.changeset {
         format!("→ {}", &shown.base[..shown.base.len().min(8)])
+    } else if session.view == ChangesetView::SinceLastRound {
+        "since last Round".to_owned()
     } else {
         "since Session base".to_owned()
     };
     let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
     let drafts = tab.drafts();
-    let toggle = session.since_session_base.as_ref().map(|_| {
+    let views = [
+        ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
+        ("Since Session base", ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
+    ];
+    let toggle = views.iter().any(|(_, _, available)| *available).then(|| {
         let view_button = |label: &str, view: ChangesetView| {
             let id = session.id.clone();
             let variant = if session.view == view { ButtonVariant::Neutral } else { ButtonVariant::Ghost };
             Button::new(label).variant(variant).on_press(move |s: &mut State| s.show(&id, view)).build(k)
         };
-        row()
-            .gap(4.0)
-            .child(view_button("Since Session base", ChangesetView::SinceSessionBase))
+        views
+            .iter()
+            .filter(|(_, _, available)| *available)
+            .fold(row().gap(4.0), |toggle, (label, view, _)| toggle.child(view_button(label, *view)))
             .child(view_button("Full Changeset", ChangesetView::Full))
     });
     row()
@@ -419,8 +434,20 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     .key(format!("diff-{}", tab.session.id))
     .header_actions(move |s: &State, file: usize| {
         let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the active tab");
-        let note = tab.session.shown().files.get(file).and_then(file_note).unwrap_or_default();
-        text(note).font(kc.ty.small).color(kc.c.text_muted)
+        let Some(change) = tab.session.shown().files.get(file) else { return row() };
+        let note = file_note(change).unwrap_or_default();
+        let viewed = tab.session.viewed.contains(&change.path);
+        let (id, path) = (tab.session.id.clone(), change.path.clone());
+        row().gap(12.0).items_center().child(text(note).font(kc.ty.small).color(kc.c.text_muted)).child(
+            Checkbox::new(viewed)
+                .label("Viewed")
+                .on_toggle(move |s: &mut State| {
+                    if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
+                        eprintln!("akshually: {error}");
+                    }
+                })
+                .build(&kc),
+        )
     })
     .annotation({
         let k = k.clone();
@@ -517,7 +544,10 @@ fn scene_session(s: &mut State) {
         branch: "feat/round-snapshots".into(),
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
+        last_round: None,
+        since_last_round: None,
         view: ChangesetView::Full,
+        viewed: ["src/round.rs".to_owned()].into(),
         round: 2,
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
