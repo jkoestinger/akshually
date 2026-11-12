@@ -21,7 +21,7 @@ fn agents_in_two_worktrees_get_two_sessions_in_one_app_and_each_waits_for_its_ow
     let b = app.wait_for_session(two.path());
 
     assert_ne!(a.id, b.id);
-    assert_eq!((a.branch.as_str(), b.branch.as_str()), ("agent-one", "agent-two"));
+    assert_eq!((a.branch(), b.branch()), ("agent-one", "agent-two"));
     assert_eq!(app.service.displayed(), Some(a.id.clone()), "the second Session doesn't take the view");
     assert!(app.service.session(&b.id).unwrap().attention);
 

@@ -1,11 +1,12 @@
 //! Pull Request Sessions: the Changeset and existing Threads come from a Forge adapter.
 
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::handoff::{Call, Waiter};
-use super::{ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Turn, Verdict};
+use super::{
+    ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Source, Turn, Verdict,
+};
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
@@ -75,7 +76,7 @@ impl Service {
             .ok_or_else(|| Error::NotAPullRequest(url.to_owned()))?;
         let open = |sessions: &[Session]| {
             let mut sessions = sessions.iter();
-            sessions.find(|s| s.view.pull_request.as_ref().is_some_and(|p| p.id == pr)).map(|s| s.view.id.clone())
+            sessions.find(|s| s.view.pull_request().is_some_and(|p| p.id == pr)).map(|s| s.view.id.clone())
         };
         let found = |id: SessionId| -> Result<(SessionId, PullRequestRef), Error> {
             if agent.is_none() {
@@ -110,9 +111,7 @@ impl Service {
         let id = SessionId::new(format!("s{}", inner.next_id));
         let view = SessionView {
             id: id.clone(),
-            repo: PathBuf::new(),
-            branch: pull_request.head_branch.clone(),
-            pull_request: Some(pull_request),
+            source: Source::PullRequest(pull_request),
             changeset,
             view: ChangesetView::Full,
             round: 1,
@@ -205,7 +204,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        if session.view.pull_request.is_none() {
+        if session.view.pull_request().is_none() {
             if session.view.agent != Some(Role::CoReviewer) {
                 return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
             }
@@ -246,7 +245,7 @@ impl Service {
             .lock()
             .sessions
             .iter()
-            .filter_map(|s| Some((s.view.id.clone(), s.view.pull_request.clone()?)))
+            .filter_map(|s| Some((s.view.id.clone(), s.view.pull_request()?.clone())))
             .collect();
         for (id, pr) in open {
             // Not holding the lock: the Forge may take a while.
@@ -256,7 +255,7 @@ impl Service {
             let Ok(at) = inner.position(&id) else { continue };
             let view = &mut inner.sessions[at].view;
             // Reloaded meanwhile: the answer is about a head the Session no longer shows.
-            if view.pull_request.as_ref().map(|p| &p.head_sha) != Some(&pr.head_sha) {
+            if view.pull_request().map(|p| &p.head_sha) != Some(&pr.head_sha) {
                 continue;
             }
             if view.pull_request_update != update {
@@ -279,7 +278,7 @@ impl Service {
         let session = &mut inner.sessions[at];
         session.refresh(changeset, None, false);
         merge_threads(session, remote);
-        session.view.pull_request = Some(now);
+        session.view.source = Source::PullRequest(now);
         session.view.pull_request_update = None;
         inner.notify();
         Ok(())
@@ -305,7 +304,7 @@ impl Service {
 
 /// A Pull Request Session's Pull Request and Drafts, unless it has ended.
 fn drafts(view: &SessionView) -> Result<(PullRequest, Drafts), Error> {
-    let Some(pr) = view.pull_request.clone() else {
+    let Some(pr) = view.pull_request().cloned() else {
         return Err(Error::InvalidRequest(format!("Session {} isn't a Pull Request: only one is published", view.id)));
     };
     if view.ended.is_some() {

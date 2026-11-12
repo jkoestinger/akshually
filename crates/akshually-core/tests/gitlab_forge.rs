@@ -535,8 +535,8 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
     let id = svc.open_pull_request("https://gitlab.example.com/platform/infra/-/merge_requests/97/diffs").unwrap();
 
     let session = svc.session(&id).expect("the Session is open");
-    assert_eq!(session.pull_request, Some(rotate_creds()));
-    assert_eq!(session.branch, "rotate-creds");
+    assert_eq!(session.pull_request(), Some(&rotate_creds()));
+    assert_eq!(session.branch(), "rotate-creds");
     let paths: Vec<_> = session.changeset.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, ["docs/new.md", "src/a.rs"]);
     let thread = &session.threads[0];

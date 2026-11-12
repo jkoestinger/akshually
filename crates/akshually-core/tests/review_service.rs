@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use akshually_core::{
     Anchor, BinarySizes, ChangesetView, Collapsed, Error, FileChange, Outcome, Party, ReviewRequest, Round, Service,
-    SessionId, Settings, Side, Thread, ThreadId, Turn,
+    SessionId, Settings, Side, Source, Thread, ThreadId, Turn,
 };
 use akshually_testkit::{TestDirs, TestRepo};
 
@@ -34,8 +34,8 @@ fn review_opens_a_session_on_the_branch_against_its_merge_base_plus_uncommitted_
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
     let session = svc.session(pending.session()).expect("the Session is open");
-    assert_eq!(session.repo, repo.path());
-    assert_eq!(session.branch, "feature");
+    assert_eq!(session.repo(), Some(repo.path()));
+    assert_eq!(session.branch(), "feature");
     assert_eq!(
         session.changeset.files,
         vec![
@@ -56,7 +56,7 @@ fn review_from_a_subdirectory_reviews_the_whole_repository() {
     let pending = svc.review(ReviewRequest::new(repo.path().join("src"))).unwrap();
 
     let session = svc.session(pending.session()).unwrap();
-    assert_eq!(session.repo, repo.path());
+    assert_eq!(session.repo(), Some(repo.path()));
     assert_eq!(session.changeset.files, vec![change("src/lib.rs", Some("a\n"), Some("b\n"))]);
 }
 
@@ -1316,6 +1316,29 @@ fn a_new_service_on_the_same_state_dir_restores_every_open_session() {
     // No `review` call survives a restart.
     before.iter_mut().for_each(|s| s.agent_waiting = false);
     assert_eq!(restored.sessions(), before);
+}
+
+#[test]
+fn sessions_saved_with_a_repo_branch_and_pull_request_still_load_with_their_source() {
+    let dirs = TestDirs::new();
+    let sessions = dirs.state().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    // As saved before a Session had a Source: local work with its repo and branch, a Pull
+    // Request with an empty repo.
+    let local = r#"{"view":{"id":"s1","repo":"/work/app","branch":"feature","pull_request":null,"round":1}}"#;
+    let pr = r#"{"view":{"id":"s2","repo":"","branch":"sso","pull_request":{"id":{"host":"github.com",
+        "repo":"acme/web","number":482},"url":"https://github.com/acme/web/pull/482","title":"Add SSO login",
+        "author":"maria","head_branch":"sso","head_sha":"head1","base_sha":"base1"},"round":1}}"#;
+    std::fs::write(sessions.join("s1.json"), local).unwrap();
+    std::fs::write(sessions.join("s2.json"), pr).unwrap();
+
+    let svc = Service::open(dirs.state()).unwrap();
+
+    let s1 = svc.session(&SessionId::new("s1")).unwrap();
+    assert_eq!(s1.source, Source::Local { repo: "/work/app".into(), branch: "feature".into() });
+    let s2 = svc.session(&SessionId::new("s2")).unwrap();
+    let Source::PullRequest(pull_request) = &s2.source else { panic!("a Pull Request Session: {:?}", s2.source) };
+    assert_eq!((pull_request.url.as_str(), s2.branch()), ("https://github.com/acme/web/pull/482", "sso"));
 }
 
 #[test]

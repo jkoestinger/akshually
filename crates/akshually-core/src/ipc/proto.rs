@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Anchor, LocalOptions, SessionId, SessionView, Source, ThreadId};
+use crate::{Anchor, LocalOptions, SessionId, SessionView, SourceRef, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -82,10 +82,10 @@ pub enum HumanCommand {
 
 /// The Session an agent request names: the Pull Request `pr` if given, else the local work in
 /// `cwd`.
-pub fn source(cwd: PathBuf, pr: Option<String>) -> Source {
+pub fn source(cwd: PathBuf, pr: Option<String>) -> SourceRef {
     match pr {
-        Some(url) => Source::PullRequest(url),
-        None => Source::Local(cwd),
+        Some(url) => SourceRef::PullRequest(url),
+        None => SourceRef::Local(cwd),
     }
 }
 

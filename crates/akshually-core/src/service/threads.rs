@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Service, Session, SessionId, Source};
+use super::{Service, Session, SessionId, SourceRef};
 use crate::forge::PullRequestRef;
 use crate::thread::{Comment, Party, Thread, ThreadId};
 use crate::{Error, git};
@@ -18,10 +18,8 @@ impl SessionKey {
     /// The position of its Session in `sessions`.
     fn find(self, sessions: &[Session]) -> Result<usize, Error> {
         let found = sessions.iter().position(|s| match &self {
-            SessionKey::Local { repo, branch } => {
-                s.view.pull_request.is_none() && &s.view.repo == repo && &s.view.branch == branch
-            }
-            SessionKey::PullRequest(pr, _) => s.view.pull_request.as_ref().is_some_and(|p| &p.id == pr),
+            SessionKey::Local { repo, branch } => s.view.is_local(repo, branch),
+            SessionKey::PullRequest(pr, _) => s.view.pull_request().is_some_and(|p| &p.id == pr),
         });
         if let Some(at) = found {
             return Ok(at);
@@ -36,7 +34,7 @@ impl SessionKey {
 impl Service {
     /// Agent: replies to `thread` in the Session of `source`. The human sees it at once; it
     /// counts towards the Round being drafted.
-    pub fn reply(&self, source: impl Into<Source>, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+    pub fn reply(&self, source: impl Into<SourceRef>, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
@@ -47,7 +45,7 @@ impl Service {
     }
 
     /// Agent: marks `thread` Resolved in the Session of `source`.
-    pub fn resolve(&self, source: impl Into<Source>, thread: &ThreadId) -> Result<(), Error> {
+    pub fn resolve(&self, source: impl Into<SourceRef>, thread: &ThreadId) -> Result<(), Error> {
         self.agent_thread(&source.into(), thread, |_, thread| resolve(thread, Party::Agent))
     }
 
@@ -88,7 +86,12 @@ impl Service {
 
     /// Runs `f` on a Thread a Round brought the agent, in the Session of `source`, with the
     /// number of the Round being drafted.
-    fn agent_thread(&self, source: &Source, thread: &ThreadId, f: impl FnOnce(u32, &mut Thread)) -> Result<(), Error> {
+    fn agent_thread(
+        &self,
+        source: &SourceRef,
+        thread: &ThreadId,
+        f: impl FnOnce(u32, &mut Thread),
+    ) -> Result<(), Error> {
         let key = self.session_key(source)?;
         let mut inner = self.lock();
         let at = key.find(&inner.sessions)?;
@@ -104,14 +107,14 @@ impl Service {
     }
 
     /// What identifies the Session of `source`. Reads the repository, not holding the lock.
-    fn session_key(&self, source: &Source) -> Result<SessionKey, Error> {
+    fn session_key(&self, source: &SourceRef) -> Result<SessionKey, Error> {
         Ok(match source {
-            Source::Local(cwd) => {
+            SourceRef::Local(cwd) => {
                 let repo = git::toplevel(cwd)?;
                 let branch = git::branch(&repo)?;
                 SessionKey::Local { repo, branch }
             }
-            Source::PullRequest(url) => SessionKey::PullRequest(
+            SourceRef::PullRequest(url) => SessionKey::PullRequest(
                 self.forges
                     .iter()
                     .find_map(|forge| forge.recognise(url))

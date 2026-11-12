@@ -89,7 +89,7 @@ impl Inbox {
                 let session = sessions
                     .iter()
                     // A Published Session stays open until the human closes it.
-                    .find(|s| s.view.pull_request.as_ref().is_some_and(|p| p.id == item.id));
+                    .find(|s| s.view.pull_request().is_some_and(|p| p.id == item.id));
                 let state = match (session, self.seen(&item.id)) {
                     (Some(s), _) => InboxRowState::SessionOpen {
                         session: s.view.id.clone(),

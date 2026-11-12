@@ -78,7 +78,7 @@ fn an_agent_draft_opens_the_pull_request_with_the_agent_as_co_reviewer() {
     let sessions = svc.sessions();
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
-    assert_eq!(session.pull_request.as_ref().unwrap().url, URL);
+    assert_eq!(session.pull_request().unwrap().url, URL);
     assert_eq!(session.agent, Some(Role::CoReviewer));
     assert_eq!(session.turn, Turn::Agent, "the agent is still reviewing");
     let draft = &session.threads.iter().find(|t| t.id == thread).unwrap().comments[0];
@@ -322,7 +322,7 @@ fn a_draft_on_local_work_opens_its_session_with_the_agent_as_co_reviewer() {
     let sessions = svc.sessions();
     assert_eq!(sessions.len(), 1, "one Session per repository and branch");
     let session = &sessions[0];
-    assert_eq!((session.repo.as_path(), session.branch.as_str()), (repo.path(), "feature"));
+    assert_eq!((session.repo().unwrap(), session.branch()), (repo.path(), "feature"));
     assert_eq!((session.agent, session.turn), (Some(Role::CoReviewer), Turn::Agent));
     assert_eq!(session.changeset.files[0].path, "lib.rs");
     assert_eq!(session.threads[0].id, thread);

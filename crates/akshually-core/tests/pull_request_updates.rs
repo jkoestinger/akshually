@@ -128,11 +128,11 @@ fn a_push_is_offered_as_an_update_without_changing_the_diff() {
     svc.check_pull_requests();
 
     let session = svc.session(&id).unwrap();
-    let update = session.pull_request_update.expect("the push is offered");
+    let update = session.pull_request_update.clone().expect("the push is offered");
     assert_eq!(update.pull_request.head_sha, "head2");
     assert_eq!(update.commits, Some(2));
     assert_eq!(session.changeset, before, "the displayed diff stays as it was");
-    assert_eq!(session.pull_request.unwrap().head_sha, "head1");
+    assert_eq!(session.pull_request().unwrap().head_sha, "head1");
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn reloading_takes_the_push_and_re_anchors_drafts_and_threads() {
     svc.reload(&id).unwrap();
 
     let session = svc.session(&id).unwrap();
-    assert_eq!(session.pull_request.as_ref().unwrap().head_sha, "head2");
+    assert_eq!(session.pull_request().unwrap().head_sha, "head2");
     assert_eq!(session.pull_request_update, None, "nothing left to reload");
     assert_eq!(session.changeset.files[0].new.as_deref(), Some(pushed));
     let thread = |t| session.threads.iter().find(|th| th.id == t).unwrap();

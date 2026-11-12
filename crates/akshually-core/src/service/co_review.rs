@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use super::drafts::check_comment;
-use super::{Role, Service, Session, SessionId, SessionView, Source, Turn, local_view};
+use super::{Role, Service, Session, SessionId, SessionView, SourceRef, Turn, local_view};
 use crate::thread::{Anchor, NewComment, Party, ThreadId};
 use crate::{Error, LocalOptions, changeset, git};
 
@@ -15,15 +15,15 @@ impl Service {
     /// Request's blocks on the Forge.
     pub fn draft(
         &self,
-        source: impl Into<Source>,
+        source: impl Into<SourceRef>,
         anchor: Anchor,
         comment: impl Into<NewComment>,
     ) -> Result<ThreadId, Error> {
         let comment = comment.into();
         check_comment(&anchor, &comment)?;
         let id = match source.into() {
-            Source::PullRequest(url) => self.open_pull_request_session(&url, Some(Role::CoReviewer))?.0,
-            Source::Local(cwd) => self.open_local_co_review(&cwd)?,
+            SourceRef::PullRequest(url) => self.open_pull_request_session(&url, Some(Role::CoReviewer))?.0,
+            SourceRef::Local(cwd) => self.open_local_co_review(&cwd)?,
         };
         let mut inner = self.lock();
         let at = inner.position(&id)?;
@@ -42,7 +42,7 @@ impl Service {
     fn open_local_co_review(&self, cwd: &Path) -> Result<SessionId, Error> {
         let repo = git::toplevel(cwd)?;
         let branch = git::branch(&repo)?;
-        let here = |s: &&Session| s.view.pull_request.is_none() && s.view.repo == repo && s.view.branch == branch;
+        let here = |s: &&Session| s.view.is_local(&repo, &branch);
         let (settings, session_base) = {
             let inner = self.lock();
             if let Some(open) = inner.sessions.iter().find(here) {

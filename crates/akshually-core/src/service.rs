@@ -174,29 +174,80 @@ impl ReviewRequest {
     }
 }
 
-/// Where an agent call finds its Session: the local work in the repository (and branch) at a
-/// directory, or a Pull Request by URL. A path converts into the first, a URL into the second.
+/// Where an agent call finds its Session's [`Source`]: the local work in the repository (and
+/// branch) at a directory, or a Pull Request by URL. A path converts into the first, a URL into
+/// the second.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Source {
+pub enum SourceRef {
     Local(PathBuf),
     PullRequest(String),
 }
 
-impl From<&Path> for Source {
+impl From<&Path> for SourceRef {
     fn from(cwd: &Path) -> Self {
-        Source::Local(cwd.to_owned())
+        SourceRef::Local(cwd.to_owned())
     }
 }
 
-impl From<&PathBuf> for Source {
+impl From<&PathBuf> for SourceRef {
     fn from(cwd: &PathBuf) -> Self {
-        Source::Local(cwd.clone())
+        SourceRef::Local(cwd.clone())
     }
 }
 
-impl From<&str> for Source {
+impl From<&str> for SourceRef {
     fn from(url: &str) -> Self {
-        Source::PullRequest(url.to_owned())
+        SourceRef::PullRequest(url.to_owned())
+    }
+}
+
+/// Where a Session's Changeset comes from, which is the Session's identity: the local work on
+/// a branch of a working tree (each worktree is its own), or a Pull Request on a Forge.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    Local { repo: PathBuf, branch: String },
+    PullRequest(PullRequest),
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source::Local { repo: PathBuf::new(), branch: String::new() }
+    }
+}
+
+/// A `SessionView`'s Source as saved: `"source": {...}`. Sessions saved before it had one gave
+/// `repo`, `branch` and `pull_request` (with an empty `repo`) instead, which still load.
+mod saved_source {
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Source;
+    use crate::forge::PullRequest;
+
+    pub fn serialize<S: Serializer>(source: &Source, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Saved<'a> {
+            source: &'a Source,
+        }
+        Saved { source }.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Source, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Saved {
+            source: Option<Source>,
+            repo: PathBuf,
+            branch: String,
+            pull_request: Option<PullRequest>,
+        }
+        Ok(match Saved::deserialize(deserializer)? {
+            Saved { source: Some(source), .. } => source,
+            Saved { pull_request: Some(pr), .. } => Source::PullRequest(pr),
+            Saved { repo, branch, .. } => Source::Local { repo, branch },
+        })
     }
 }
 
@@ -206,12 +257,9 @@ impl From<&str> for Source {
 #[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
-    /// The working tree root: each worktree is its own Session. Empty for a Pull Request.
-    pub repo: PathBuf,
-    /// The branch under Review; a Pull Request's head branch.
-    pub branch: String,
-    /// The Pull Request under Review, which is the Session's identity; `None` for local work.
-    pub pull_request: Option<PullRequest>,
+    /// Where the Changeset comes from, which is the Session's identity.
+    #[serde(flatten, with = "saved_source")]
+    pub source: Source,
     /// The Session's agent, in its one role; `None` while only the human is in it.
     pub agent: Option<Role>,
     /// The full Changeset.
@@ -251,10 +299,39 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// The Pull Request under Review; `None` for local work.
+    pub fn pull_request(&self) -> Option<&PullRequest> {
+        match &self.source {
+            Source::PullRequest(pr) => Some(pr),
+            Source::Local { .. } => None,
+        }
+    }
+
+    /// The working tree root of the local work under Review; `None` for a Pull Request.
+    pub fn repo(&self) -> Option<&Path> {
+        match &self.source {
+            Source::Local { repo, .. } => Some(repo),
+            Source::PullRequest(_) => None,
+        }
+    }
+
+    /// The branch under Review: for a Pull Request, its head branch.
+    pub fn branch(&self) -> &str {
+        match &self.source {
+            Source::Local { branch, .. } => branch,
+            Source::PullRequest(pr) => &pr.head_branch,
+        }
+    }
+
+    /// Whether this is the Session of the local work in `repo` on `branch`.
+    pub(crate) fn is_local(&self, repo: &Path, branch: &str) -> bool {
+        matches!(&self.source, Source::Local { repo: r, branch: b } if r == repo && b == branch)
+    }
+
     /// Whether the agent is a co-Reviewer (a Pull Request takes no other): Rounds then carry
     /// only the human's questions on its Drafts, with the roles reversed.
     pub fn is_co_review(&self) -> bool {
-        self.pull_request.is_some() || self.agent == Some(Role::CoReviewer)
+        self.pull_request().is_some() || self.agent == Some(Role::CoReviewer)
     }
 
     /// The Changeset the human is looking at.
@@ -425,11 +502,11 @@ impl Inner {
             Some(displayed) => view.attention = displayed != &view.id,
         }
         if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
-            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            let repo = view.repo().map(|r| r.file_name().unwrap_or(r.as_os_str()).to_string_lossy());
             notifier.notify(Notification {
                 session: view.id.clone(),
                 title: "Your Turn to review".into(),
-                body: format!("{repo} ({})", view.branch),
+                body: format!("{} ({})", repo.unwrap_or_default(), view.branch()),
             });
         }
     }
@@ -441,7 +518,9 @@ impl Inner {
             if self.displayed.as_ref() == Some(&session.view.id) {
                 self.displayed = None;
             }
-            self.session_bases.remove(&(session.view.repo, session.view.branch));
+            if let Source::Local { repo, branch } = session.view.source {
+                self.session_bases.remove(&(repo, branch));
+            }
         }
     }
 
@@ -522,7 +601,7 @@ impl Service {
             }
             session.view.agent_waiting = false;
             // Saved before Sessions had roles: local work always has its Author.
-            if session.view.pull_request.is_none() && session.view.agent.is_none() {
+            if session.view.pull_request().is_none() && session.view.agent.is_none() {
                 session.view.agent = Some(Role::Author);
             }
         }
@@ -648,7 +727,7 @@ impl Service {
         inner.next_waiter += 1;
         let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
         let waiter_id = waiter.id;
-        let existing = inner.sessions.iter().position(|s| s.view.repo == repo && s.view.branch == branch);
+        let existing = inner.sessions.iter().position(|s| s.view.is_local(&repo, &branch));
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
@@ -713,9 +792,9 @@ impl Service {
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
         let closes = self.lock().sessions.iter().any(|s| {
             &s.view.id == id
-                && match s.view.pull_request {
-                    Some(_) => s.view.agent.is_none(),
-                    None => s.view.agent == Some(Role::CoReviewer),
+                && match s.view.source {
+                    Source::PullRequest(_) => s.view.agent.is_none(),
+                    Source::Local { .. } => s.view.agent == Some(Role::CoReviewer),
                 }
         });
         if closes {
@@ -736,7 +815,7 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        if outcome == Outcome::Approved && session.view.pull_request.is_some() {
+        if outcome == Outcome::Approved && session.view.pull_request().is_some() {
             return Err(Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()));
         }
         if outcome == Outcome::Approved && session.view.agent == Some(Role::CoReviewer) {
@@ -768,8 +847,7 @@ fn local_view(
     };
     SessionView {
         id,
-        repo,
-        branch,
+        source: Source::Local { repo, branch },
         agent: Some(agent),
         changeset,
         since_session_base,

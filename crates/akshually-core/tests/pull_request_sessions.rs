@@ -101,10 +101,10 @@ fn opening_a_pull_request_url_starts_a_session_with_its_changeset() {
     let id = svc.open_pull_request(URL).unwrap();
 
     let session = svc.session(&id).expect("the Session is open");
-    let pr = session.pull_request.expect("a Pull Request Session");
+    let pr = session.pull_request().expect("a Pull Request Session").clone();
     assert_eq!(pr.id, pr_ref());
     assert_eq!(pr.title, "Add SSO login");
-    assert_eq!(session.branch, "sso");
+    assert_eq!(session.branch(), "sso");
     assert_eq!(session.changeset.base, "basesha");
     assert_eq!(session.changeset.files[0].path, "login.rs");
     assert_eq!(session.turn, Turn::Human);

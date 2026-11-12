@@ -8,7 +8,7 @@ use std::sync::Arc;
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
-    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
+    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, Turn, Verdict,
 };
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -182,17 +182,15 @@ impl SessionTab {
     }
 
     fn title(&self) -> String {
-        if let Some(pr) = &self.session.pull_request {
+        if let Some(pr) = self.session.pull_request() {
             // GitLab numbers merge requests `!97`, and only its URLs have `/-/merge_requests/`.
             let sigil = if pr.url.contains("/-/merge_requests/") { '!' } else { '#' };
             return format!("{} {sigil}{}", pr.id.repo, pr.id.number);
         }
-        let repo = self
-            .session
-            .repo
-            .file_name()
-            .map_or_else(|| self.session.repo.display().to_string(), |n| n.to_string_lossy().into_owned());
-        format!("{repo} · {}", self.session.branch)
+        let repo = self.session.repo().map(|repo| {
+            repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into_owned())
+        });
+        format!("{} · {}", repo.unwrap_or_default(), self.session.branch())
     }
 }
 
@@ -848,7 +846,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .items_center()
         .fill(k.c.layer_01)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
-        .child(text(format!("{} · {} → {base}", pr.author, session.branch)).font(k.ty.mono).color(k.c.text_muted))
+        .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
         .child(Badge::new(format!("{} Drafts", tab.drafts())).build(k))
         .child(
@@ -899,7 +897,7 @@ fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
 fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
     let Some(publish) = &s.publish else { return };
     let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
-    let Some(pr) = &tab.session.pull_request else { return };
+    let Some(pr) = tab.session.pull_request() else { return };
     let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0);
     if let Some(plan) = &publish.plan {
         let mut list = col().key("publish-drafts").w_full().gap(8.0);
@@ -1056,7 +1054,7 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
-    if let Some(pr) = &session.pull_request {
+    if let Some(pr) = session.pull_request() {
         return pull_request_header(k, tab, pr);
     }
     let shown = session.shown();
@@ -1113,7 +1111,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .gap(12.0)
         .items_center()
         .fill(k.c.layer_01)
-        .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
+        .child(text(session.branch().to_owned()).font(k.ty.mono).color(k.c.text_base))
         .child(text(base).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
@@ -1711,7 +1709,7 @@ fn composer(k: &Kit, s: &State) -> El {
 /// Why the Forge would refuse a Comment at `anchor` in `session`, if it would.
 fn outside_diff(session: &SessionView, anchor: &Anchor) -> Option<String> {
     let Anchor::Lines { path, side, start, end } = anchor else { return None };
-    let refused = session.pull_request.is_some() && !session.changeset.takes_comment_at(anchor);
+    let refused = session.pull_request().is_some() && !session.changeset.takes_comment_at(anchor);
     let (path, side, start, end) = (path.clone(), *side, *start, *end);
     refused.then(|| akshually_core::Error::OutsideDiff { path, side, start, end }.to_string())
 }
@@ -1734,9 +1732,7 @@ fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {
         id: SessionId::new("sample"),
-        repo: "/home/me/akshually".into(),
-        branch: "feat/round-snapshots".into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "feat/round-snapshots".into() },
         agent: Some(Role::Author),
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
@@ -1763,8 +1759,7 @@ fn scene_session(s: &mut State) {
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
-        branch: branch.into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: branch.into() },
         round: 1,
         threads: Vec::new(),
         turn,
@@ -1800,9 +1795,7 @@ fn scene_threads(s: &mut State) {
     };
     let session = SessionView {
         id: SessionId::new("sample"),
-        repo: "/home/me/akshually".into(),
-        branch: "feat/round-snapshots".into(),
-        pull_request: None,
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "feat/round-snapshots".into() },
         agent: Some(Role::Author),
         changeset: sample_changeset(),
         since_session_base: None,
@@ -1927,8 +1920,7 @@ fn scene_publish(s: &mut State) {
     answered.forge = Some(akshually_core::ForgeThread { id: "PRRT_5".into(), resolved: false });
     let session = SessionView {
         id: SessionId::new("pr"),
-        branch: "sso".into(),
-        pull_request: Some(pr),
+        source: Source::PullRequest(pr),
         changeset: sample_changeset(),
         round: 1,
         threads: vec![suggested.clone(), sample_thread("T3", 5..=5, "Should this return the error as is?", None)],

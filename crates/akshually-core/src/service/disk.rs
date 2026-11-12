@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Service, SessionId, Turn};
+use super::{Service, SessionId, Source, Turn};
 use crate::{Changeset, Error, changeset};
 
 impl Service {
@@ -15,11 +15,14 @@ impl Service {
         let (repo, local, settings, session_base) = {
             let inner = self.lock();
             let session = &inner.sessions[inner.position(id)?];
-            if let Some(pr) = session.view.pull_request.clone() {
-                drop(inner);
-                return self.reload_pull_request(id, &pr);
-            }
-            let key = (session.view.repo.clone(), session.view.branch.clone());
+            let key = match &session.view.source {
+                Source::PullRequest(pr) => {
+                    let pr = pr.clone();
+                    drop(inner);
+                    return self.reload_pull_request(id, &pr);
+                }
+                Source::Local { repo, branch } => (repo.clone(), branch.clone()),
+            };
             (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
         };
         let now = changeset::local(&repo, &local, &settings, session_base.as_deref())?;
@@ -51,11 +54,12 @@ impl Service {
             let checks: Vec<_> = inner
                 .sessions
                 .iter()
-                // A Pull Request has no files on disk.
-                .filter(|s| s.view.turn == Turn::Human && s.view.pull_request.is_none())
-                .map(|s| {
-                    let key = (s.view.repo.clone(), s.view.branch.clone());
-                    (s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0)
+                .filter(|s| s.view.turn == Turn::Human)
+                .filter_map(|s| {
+                    // A Pull Request has no files on disk.
+                    let Source::Local { repo, branch } = &s.view.source else { return None };
+                    let key = (repo.clone(), branch.clone());
+                    Some((s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0))
                 })
                 .collect();
             (inner.settings.clone(), checks)

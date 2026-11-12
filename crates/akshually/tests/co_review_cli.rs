@@ -182,7 +182,7 @@ fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_
     assert_eq!(stdout(&drafted), "T1\n");
     let child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
     let session = wait_until(TIMEOUT, "the co-Reviewer to wait", || {
-        app.service.sessions().into_iter().find(|s| s.repo == repo.path() && s.agent_waiting)
+        app.service.sessions().into_iter().find(|s| s.repo() == Some(repo.path()) && s.agent_waiting)
     });
     app.service.reply_in_thread(&session.id, &ThreadId::new("T1"), "Name it what?").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
