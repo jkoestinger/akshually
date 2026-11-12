@@ -535,3 +535,77 @@ fn a_refused_token_fails_the_inbox() {
 
     assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
 }
+
+// --- New pushes ---
+
+#[test]
+fn no_update_while_the_head_is_unchanged() {
+    let mut h = Harness::new();
+    let mock = h.get("/repos/acme/web/pulls/482", TOKEN, &fixture("pull.json"));
+
+    let update = h.github().update(&sso_pull_request()).unwrap();
+
+    mock.assert();
+    assert_eq!(update, None);
+}
+
+#[test]
+fn a_new_head_is_an_update_counting_the_commits_pushed() {
+    let mut h = Harness::new();
+    h.get("/repos/acme/web/pulls/482", TOKEN, &fixture("pull-pushed.json"));
+    let compare = h.get("/repos/acme/web/compare/head1...head2", TOKEN, &fixture("compare-pushed.json"));
+
+    let update = h.github().update(&sso_pull_request()).unwrap().expect("an update");
+
+    compare.assert();
+    assert_eq!(update.pull_request, PullRequest { head_sha: "head2".into(), ..sso_pull_request() });
+    assert_eq!(update.commits, Some(2));
+}
+
+#[test]
+fn a_force_push_is_an_update_without_a_commit_count() {
+    let mut h = Harness::new();
+    h.get("/repos/acme/web/pulls/482", TOKEN, &fixture("pull-pushed.json"));
+    h.server
+        .mock("GET", "/repos/acme/web/compare/head1...head2")
+        .with_status(404)
+        .with_body(r#"{"message":"Not Found"}"#)
+        .create();
+
+    let update = h.github().update(&sso_pull_request()).unwrap().expect("an update");
+
+    assert_eq!(update.pull_request.head_sha, "head2");
+    assert_eq!(update.commits, None);
+}
+
+#[test]
+fn polling_again_asks_only_whether_the_pull_request_changed() {
+    let mut h = Harness::new();
+    let github = h.github();
+    let first = h
+        .server
+        .mock("GET", "/repos/acme/web/pulls/482")
+        .match_header("if-none-match", Matcher::Missing)
+        .with_header("etag", "\"etag1\"")
+        .with_body(fixture("pull-pushed.json"))
+        .expect(1)
+        .create();
+    let compare = h.get("/repos/acme/web/compare/head1...head2", TOKEN, &fixture("compare-pushed.json")).expect(1);
+    let unchanged = h
+        .server
+        .mock("GET", "/repos/acme/web/pulls/482")
+        .match_header("if-none-match", "\"etag1\"")
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .with_status(304)
+        .expect(1)
+        .create();
+
+    let polled = github.update(&sso_pull_request()).unwrap();
+    let again = github.update(&sso_pull_request()).unwrap();
+
+    first.assert();
+    unchanged.assert();
+    compare.assert();
+    assert_eq!(again, polled);
+    assert_eq!(again.unwrap().commits, Some(2));
+}

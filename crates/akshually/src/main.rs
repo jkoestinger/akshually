@@ -19,6 +19,9 @@ const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
 
 /// How often the app looks for changes on disk in Sessions waiting on the human.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// How often open Pull Requests are polled for pushes. Each poll is a conditional request,
+/// which GitHub doesn't count against the rate limit while nothing changed.
+const PUSH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the app refreshes the Inbox: 2 search requests per GitHub host each time, well
 /// within GitHub's 30 searches a minute.
@@ -213,6 +216,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         service.watch_disk(DISK_CHECK_INTERVAL);
         // The headless app (tests) never asks the Forges on its own.
         service.watch_inbox(INBOX_REFRESH_INTERVAL);
+        // Offers pushes to open Pull Requests as reloads (the banner).
+        service.watch_pull_requests(PUSH_CHECK_INTERVAL);
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
     }
     Ok(ExitCode::SUCCESS)

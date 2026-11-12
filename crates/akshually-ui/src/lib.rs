@@ -468,6 +468,21 @@ impl State {
         }
     }
 
+    /// Reloads a Pull Request Session from its Forge off the UI thread (the Forge may be slow);
+    /// the service's update then refreshes the view.
+    fn reload_pull_request(&self, id: &SessionId) {
+        let (service, id) = (self.service.clone(), id.clone());
+        let reload = move || {
+            if let Err(error) = service.reload(&id) {
+                eprintln!("akshually: {error}");
+            }
+        };
+        match self.handle {
+            Some(_) => drop(std::thread::spawn(reload)),
+            None => reload(),
+        }
+    }
+
     /// `act`, for a human action on one Thread.
     fn act_on_thread(
         &self,
@@ -522,6 +537,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(session_header(k, tab))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
+            .child(push_banner(k, tab))
             .child(general_threads(k, s, tab))
             .child(outdated_threads(k, tab))
             .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab))),
@@ -702,14 +718,13 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         )
 }
 
-/// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
-/// working indicator during the agent's Turn.
 /// The tab's marker: attention when the Session became the human's Turn unseen, a dot when
-/// files changed on disk, a quiet working indicator during the agent's Turn.
+/// files changed on disk or the Pull Request received pushes, a quiet working indicator during
+/// the agent's Turn.
 fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
     if session.attention {
         Some(TabItemStatus::Attention)
-    } else if !session.changed_on_disk.is_empty() {
+    } else if !session.changed_on_disk.is_empty() || session.pull_request_update.is_some() {
         Some(TabItemStatus::Unread)
     } else if session.turn == Turn::Agent {
         Some(TabItemStatus::Busy)
@@ -859,6 +874,44 @@ fn disk_banner(k: &Kit, tab: &SessionTab) -> El {
                 Button::new("Reload")
                     .variant(ButtonVariant::Ghost)
                     .on_press(move |s: &mut State| s.act(&id, Service::reload))
+                    .build(k),
+            ),
+    )
+}
+
+/// Offers the commits pushed to the Pull Request since it was fetched as a reload; the diff
+/// stays as it is until the human takes it.
+fn push_banner(k: &Kit, tab: &SessionTab) -> El {
+    let Some(update) = &tab.session.pull_request_update else { return col() };
+    let who = &update.pull_request.author;
+    let what = match update.commits {
+        Some(1) => format!("{who} pushed 1 commit"),
+        Some(n) => format!("{who} pushed {n} commits"),
+        None => format!("{who} pushed new commits"),
+    };
+    let id = tab.session.id.clone();
+    row().key("push-banner").w_full().px(16.0).py(8.0).child(
+        row()
+            .w_full()
+            .px(16.0)
+            .py(4.0)
+            .gap(12.0)
+            .items_center()
+            .radius(6.0)
+            .fill(k.c.layer_01)
+            .border(1.0, k.c.warning.border)
+            .child(
+                text(format!(
+                    "{what} since you opened this Pull Request. Your Drafts are kept; some may become Outdated."
+                ))
+                .font(k.ty.ui)
+                .color(k.c.text_base),
+            )
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Reload")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.reload_pull_request(&id))
                     .build(k),
             ),
     )
@@ -1253,6 +1306,7 @@ fn scene_session(s: &mut State) {
         turn: Turn::Human,
         attention: false,
         changed_on_disk: Default::default(),
+        pull_request_update: None,
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
@@ -1306,6 +1360,7 @@ fn scene_threads(s: &mut State) {
         ended: None,
         attention: false,
         changed_on_disk: ["src/round.rs".to_owned(), "src/session.rs".to_owned()].into(),
+        pull_request_update: None,
         round: 1,
         threads: vec![
             thread(

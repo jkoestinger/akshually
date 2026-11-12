@@ -1,6 +1,7 @@
 //! The GitHub adapter, for github.com and GitHub Enterprise Server: REST for the Pull Request
 //! and its files, GraphQL for review Threads (REST lacks their resolved state).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use url::Url;
 
 use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
+    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread,
 };
 use super::{epoch_seconds, file_change};
 use crate::{Changeset, Side};
@@ -31,6 +32,18 @@ pub struct GitHub {
     /// Resolved on first use; forgotten when the host refuses it, so a fresh login is picked up.
     token: Mutex<Option<String>>,
     agent: ureq::Agent,
+    /// The last `update` answer per Pull Request, to poll again conditionally.
+    polls: Mutex<HashMap<PullRequestRef, Polled>>,
+}
+
+/// What polling a Pull Request for pushes answered last.
+struct Polled {
+    /// The Pull Request's ETag then: GitHub answers 304 while it's unchanged, which doesn't
+    /// count against the rate limit.
+    etag: String,
+    /// The head the poll compared against.
+    since: String,
+    update: Option<PullRequestUpdate>,
 }
 
 impl GitHub {
@@ -54,7 +67,7 @@ impl GitHub {
             .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        GitHub { host, api, graphql, credentials, token: Mutex::new(None), agent }
+        GitHub { host, api, graphql, credentials, token: Mutex::new(None), agent, polls: Mutex::default() }
     }
 
     fn token(&self) -> Result<String, ForgeError> {
@@ -84,7 +97,8 @@ impl GitHub {
             .header("X-GitHub-Api-Version", "2022-11-28");
         let mut response = send(request).map_err(|e| self.http(e))?;
         let status = response.status().as_u16();
-        if (200..300).contains(&status) {
+        // 304 answers a conditional request: unchanged.
+        if (200..300).contains(&status) || status == 304 {
             return Ok(response);
         }
         let host = self.host.host.clone();
@@ -153,12 +167,76 @@ impl GitHub {
             .map_err(|e| self.http(e))
     }
 
+    fn lock_polls(&self) -> std::sync::MutexGuard<'_, HashMap<PullRequestRef, Polled>> {
+        self.polls.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pull_url(&self, pr: &PullRequestRef) -> Url {
+        self.endpoint(&repo_segments(pr, &["pulls", &pr.number.to_string()]))
+    }
+
+    /// A 404 names the Pull Request.
+    fn not_found_as(&self, error: ForgeError, pr: &PullRequestRef) -> ForgeError {
+        match error {
+            ForgeError::NotFound(_) => ForgeError::NotFound(pr.to_string()),
+            e => e,
+        }
+    }
+
+    /// How many commits `new` is ahead of `old`; `None` when GitHub can't say, as after a
+    /// force-push whose old head is gone.
+    fn commits_between(&self, pr: &PullRequestRef, old: &str, new: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Compare {
+            ahead_by: u32,
+        }
+        let range = format!("{old}...{new}");
+        let url = self.endpoint(&repo_segments(pr, &["compare", &range]));
+        self.get_json::<Compare>(url.as_str()).ok().map(|c| c.ahead_by)
+    }
+
     fn http(&self, error: impl std::fmt::Display) -> ForgeError {
         ForgeError::Http { host: self.host.host.clone(), message: error.to_string() }
     }
 
     fn unexpected(&self, error: impl std::fmt::Display) -> ForgeError {
         ForgeError::Unexpected { host: self.host.host.clone(), message: error.to_string() }
+    }
+}
+
+/// A Pull Request as GitHub's REST API answers it.
+#[derive(Deserialize)]
+struct Pull {
+    html_url: String,
+    title: String,
+    user: User,
+    head: Ref,
+    base: Ref,
+}
+
+#[derive(Deserialize)]
+struct User {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct Ref {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+}
+
+impl Pull {
+    fn into_pull_request(self, pr: &PullRequestRef) -> PullRequest {
+        PullRequest {
+            id: pr.clone(),
+            url: self.html_url,
+            title: self.title,
+            author: self.user.login,
+            head_branch: self.head.name,
+            head_sha: self.head.sha,
+            base_sha: self.base.sha,
+        }
     }
 }
 
@@ -205,39 +283,8 @@ impl ForgeAdapter for GitHub {
     }
 
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError> {
-        #[derive(Deserialize)]
-        struct Pull {
-            html_url: String,
-            title: String,
-            user: User,
-            head: Ref,
-            base: Ref,
-        }
-        #[derive(Deserialize)]
-        struct User {
-            login: String,
-        }
-        #[derive(Deserialize)]
-        struct Ref {
-            #[serde(rename = "ref")]
-            name: String,
-            sha: String,
-        }
-        let number = pr.number.to_string();
-        let url = self.endpoint(&repo_segments(pr, &["pulls", &number]));
-        let pull: Pull = self.get_json(url.as_str()).map_err(|e| match e {
-            ForgeError::NotFound(_) => ForgeError::NotFound(pr.to_string()),
-            e => e,
-        })?;
-        Ok(PullRequest {
-            id: pr.clone(),
-            url: pull.html_url,
-            title: pull.title,
-            author: pull.user.login,
-            head_branch: pull.head.name,
-            head_sha: pull.head.sha,
-            base_sha: pull.base.sha,
-        })
+        let pull: Pull = self.get_json(self.pull_url(pr).as_str()).map_err(|e| self.not_found_as(e, pr))?;
+        Ok(pull.into_pull_request(pr))
     }
 
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
@@ -296,6 +343,43 @@ impl ForgeAdapter for GitHub {
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Changeset { base, files })
+    }
+
+    fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
+        let id = &pr.id;
+        // Bound first, so the lock is released before the request.
+        let etag = self.lock_polls().get(id).filter(|p| p.since == pr.head_sha).map(|p| p.etag.clone());
+        let mut request = self.agent.get(self.pull_url(id).as_str());
+        if let Some(etag) = &etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let mut response = self
+            .send(request, "application/vnd.github+json", RequestBuilder::call)
+            .map_err(|e| self.not_found_as(e, id))?;
+        if response.status().as_u16() == 304 {
+            let polled = self.lock_polls().get(id).filter(|p| p.since == pr.head_sha).map(|p| p.update.clone());
+            if let Some(update) = polled {
+                return Ok(update);
+            }
+            return Err(self.unexpected("304 Not Modified to a request that wasn't conditional"));
+        }
+        let etag = response.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let pull: Pull = response.body_mut().read_json().map_err(|e| self.unexpected(e))?;
+        let now = pull.into_pull_request(id);
+        let update = (now.head_sha != pr.head_sha).then(|| PullRequestUpdate {
+            commits: self.commits_between(id, &pr.head_sha, &now.head_sha),
+            pull_request: now,
+        });
+        let mut polls = self.lock_polls();
+        match etag {
+            Some(etag) => {
+                polls.insert(id.clone(), Polled { etag, since: pr.head_sha.clone(), update: update.clone() });
+            }
+            None => {
+                polls.remove(id);
+            }
+        }
+        Ok(update)
     }
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {

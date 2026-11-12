@@ -1,0 +1,9 @@
+{
+  "number": 482,
+  "html_url": "https://github.com/acme/web/pull/482",
+  "title": "Add SSO login",
+  "user": { "login": "maria" },
+  "state": "open",
+  "head": { "ref": "sso", "sha": "head2" },
+  "base": { "ref": "main", "sha": "base1" }
+}

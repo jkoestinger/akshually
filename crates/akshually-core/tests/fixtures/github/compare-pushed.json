@@ -1,0 +1,7 @@
+{
+  "status": "ahead",
+  "ahead_by": 2,
+  "behind_by": 0,
+  "total_commits": 2,
+  "merge_base_commit": { "sha": "head1" }
+}

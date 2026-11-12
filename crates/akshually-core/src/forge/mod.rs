@@ -36,6 +36,13 @@ pub trait ForgeAdapter: Send + Sync {
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
 
+    /// What was pushed to the Pull Request since `pr` was fetched: `None` while its head is
+    /// still `pr.head_sha`. Cheap enough to poll; adapters may answer from a conditional request.
+    fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
+        let now = self.pull_request(&pr.id)?;
+        Ok((now.head_sha != pr.head_sha).then_some(PullRequestUpdate { pull_request: now, commits: None }))
+    }
+
     /// The human's Inbox on this host: open Pull Requests where they are a requested reviewer
     /// or an assignee, each listed once (as reviewer when both). A host without one has none.
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
@@ -99,6 +106,15 @@ pub(crate) fn epoch_seconds(time: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
+}
+
+/// New commits on a Pull Request, offered as a reload until the human takes them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestUpdate {
+    /// The Pull Request at its new head.
+    pub pull_request: PullRequest,
+    /// How many commits the new head is ahead of the old one, when the Forge says.
+    pub commits: Option<u32>,
 }
 
 /// Names one Pull Request: a Pull Request Session's identity.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::forge::{ForgeAdapter, PullRequest};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
@@ -151,6 +151,9 @@ pub struct SessionView {
     /// They're offered as a reload, never applied: empty means nothing to reload.
     #[serde(default)]
     pub changed_on_disk: BTreeSet<String>,
+    /// New commits pushed to the Pull Request since its Changeset was fetched. Offered as a
+    /// reload, never applied: `None` means nothing to reload.
+    pub pull_request_update: Option<PullRequestUpdate>,
 }
 
 impl SessionView {
@@ -702,6 +705,7 @@ impl Service {
                     attention: false,
                     viewed: BTreeSet::new(),
                     changed_on_disk: BTreeSet::new(),
+                    pull_request_update: None,
                 };
                 inner.sessions.push(Session { view, waiter: Some(waiter), local: request.local, ..Session::default() });
                 let at = inner.sessions.len() - 1;
@@ -718,14 +722,15 @@ impl Service {
         })
     }
 
-    /// Human: refreshes the Session's Changeset from disk. Threads and Drafts are re-anchored by
-    /// content, or become Outdated.
+    /// Human: refreshes the Session's Changeset from disk, or for a Pull Request from its Forge
+    /// (blocking on it). Threads and Drafts are re-anchored by content, or become Outdated.
     pub fn reload(&self, id: &SessionId) -> Result<(), Error> {
         let (repo, local, settings, session_base) = {
             let inner = self.lock();
             let session = &inner.sessions[inner.position(id)?];
-            if session.view.pull_request.is_some() {
-                return Err(Error::InvalidRequest("a Pull Request reloads from its Forge, not from disk".into()));
+            if let Some(pr) = session.view.pull_request.clone() {
+                drop(inner);
+                return self.reload_pull_request(id, &pr);
             }
             let key = (session.view.repo.clone(), session.view.branch.clone());
             (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
