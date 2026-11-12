@@ -1,0 +1,12 @@
+{
+  "data": {
+    "node": {
+      "comments": {
+        "pageInfo": { "hasNextPage": true, "endCursor": "COMMENTS2" },
+        "nodes": [
+          { "body": "Clearer.", "author": { "login": "maria" }, "diffHunk": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" }
+        ]
+      }
+    }
+  }
+}
