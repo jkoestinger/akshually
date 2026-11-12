@@ -74,6 +74,13 @@ impl Inbox {
         self.seen.push(Seen { pr: pr.clone(), updated_at });
     }
 
+    /// The human Published a review of `pr`: the update that makes on the Forge is theirs, so
+    /// it doesn't make the row Updated.
+    pub(super) fn published(&mut self, pr: &PullRequestRef) {
+        self.seen.retain(|s| &s.pr != pr);
+        self.seen.push(Seen { pr: pr.clone(), updated_at: now() });
+    }
+
     fn view(&self, sessions: &[Session]) -> InboxView {
         let rows = self
             .items
@@ -81,7 +88,8 @@ impl Inbox {
             .map(|item| {
                 let session = sessions
                     .iter()
-                    .find(|s| s.view.ended.is_none() && s.view.pull_request.as_ref().is_some_and(|p| p.id == item.id));
+                    // A Published Session stays open until the human closes it.
+                    .find(|s| s.view.pull_request.as_ref().is_some_and(|p| p.id == item.id));
                 let state = match (session, self.seen(&item.id)) {
                     (Some(s), _) => InboxRowState::SessionOpen {
                         session: s.view.id.clone(),

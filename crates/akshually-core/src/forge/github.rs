@@ -7,16 +7,17 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use ureq::http::Response;
 use ureq::{Body, RequestBuilder};
 use url::Url;
 
 use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread,
+    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
 use super::{epoch_seconds, file_change};
-use crate::{Changeset, Side};
+use crate::{Changeset, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
@@ -413,6 +414,36 @@ impl ForgeAdapter for GitHub {
         }
         Ok(items)
     }
+
+    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        #[derive(Deserialize)]
+        struct User {
+            login: String,
+        }
+        let viewer: User = self.get_json(self.endpoint(&["user"]).as_str())?;
+        // Authors can't approve their own Pull Request, nor request changes on it.
+        Ok(if viewer.login.eq_ignore_ascii_case(&pr.author) { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
+    }
+
+    /// A pending review, then each Thread in it, then the Verdict submits it. A failure on the
+    /// way deletes the pending review, so nothing is half-published.
+    fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
+        let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
+        let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
+        let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, variables)?;
+        let pr_id =
+            data.pointer("/repository/pullRequest/id").ok_or_else(|| ForgeError::NotFound(pr.id.to_string()))?;
+        let input = json!({ "pullRequestId": pr_id, "commitOID": pr.head_sha });
+        let data: Value = self.graphql(START_REVIEW, json!({ "input": input }))?;
+        let review_id = self.string_at(&data, "/addPullRequestReview/pullRequestReview/id")?;
+        let submitted = self.fill_and_submit(&review_id, review);
+        if submitted.is_err() {
+            // Best effort: the error that stopped Publish is the one to report.
+            let input = json!({ "pullRequestReviewId": review_id });
+            let _ = self.graphql::<Value>(DELETE_REVIEW, json!({ "input": input }));
+        }
+        submitted
+    }
 }
 
 impl GitHub {
@@ -466,6 +497,84 @@ impl GitHub {
             .collect()
     }
 }
+
+impl GitHub {
+    /// Adds `review`'s Threads to the pending review `review_id`, then submits it with the
+    /// Verdict and body, returning the review's web page.
+    fn fill_and_submit(&self, review_id: &str, review: &Review) -> Result<String, ForgeError> {
+        for comment in &review.comments {
+            let mut input = match &comment.anchor {
+                RemoteAnchor::Lines { path, side, start, end } => {
+                    let side = match side {
+                        Side::Old => "LEFT",
+                        Side::New => "RIGHT",
+                    };
+                    let mut input = json!({ "path": path, "subjectType": "LINE", "line": end, "side": side });
+                    if start < end {
+                        input["startLine"] = json!(start);
+                        input["startSide"] = json!(side);
+                    }
+                    input
+                }
+                RemoteAnchor::File { path } => json!({ "path": path, "subjectType": "FILE" }),
+            };
+            input["pullRequestReviewId"] = json!(review_id);
+            input["body"] = json!(match &comment.suggestion {
+                Some(code) => with_suggestion(&comment.body, code),
+                None => comment.body.clone(),
+            });
+            let data: Value = self.graphql(ADD_THREAD, json!({ "input": input }))?;
+            self.string_at(&data, "/addPullRequestReviewThread/thread/id")?;
+        }
+        let event = match review.verdict {
+            Verdict::Approve => "APPROVE",
+            Verdict::RequestChanges => "REQUEST_CHANGES",
+            // akshually's feedback is GitHub's "Comment".
+            Verdict::Feedback => "COMMENT",
+        };
+        let input = json!({ "pullRequestReviewId": review_id, "event": event, "body": review.body });
+        let data: Value = self.graphql(SUBMIT_REVIEW, json!({ "input": input }))?;
+        self.string_at(&data, "/submitPullRequestReview/pullRequestReview/url")
+    }
+
+    /// The string at `pointer` in a GraphQL answer.
+    fn string_at(&self, data: &Value, pointer: &str) -> Result<String, ForgeError> {
+        data.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| self.unexpected(format!("GraphQL answered no {pointer}")))
+    }
+}
+
+/// `body` followed by GitHub's native suggestion of `code` for the commented lines, in a fence
+/// longer than any backtick run in `code`. Empty `code` suggests deleting the lines.
+fn with_suggestion(body: &str, code: &str) -> String {
+    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    let newline = if code.is_empty() || code.ends_with('\n') { "" } else { "\n" };
+    let block = format!("{fence}suggestion\n{code}{newline}{fence}");
+    if body.is_empty() { block } else { format!("{body}\n\n{block}") }
+}
+
+const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } }
+}";
+
+const START_REVIEW: &str = "mutation($input: AddPullRequestReviewInput!) {
+  addPullRequestReview(input: $input) { pullRequestReview { id } }
+}";
+
+const ADD_THREAD: &str = "mutation($input: AddPullRequestReviewThreadInput!) {
+  addPullRequestReviewThread(input: $input) { thread { id } }
+}";
+
+const SUBMIT_REVIEW: &str = "mutation($input: SubmitPullRequestReviewInput!) {
+  submitPullRequestReview(input: $input) { pullRequestReview { url } }
+}";
+
+const DELETE_REVIEW: &str = "mutation($input: DeletePullRequestReviewInput!) {
+  deletePullRequestReview(input: $input) { pullRequestReview { id } }
+}";
 
 const THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {

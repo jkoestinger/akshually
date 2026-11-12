@@ -4,8 +4,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteThread};
-use akshually_core::{Anchor, Changeset, FileChange, Service, Side};
+use akshually_core::forge::{
+    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteThread, Review,
+};
+use akshually_core::{Anchor, Changeset, FileChange, Service, Side, Verdict};
 use akshually_testkit::{TestDirs, wait_until};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -90,6 +92,13 @@ impl ForgeAdapter for FakeForge {
         };
         let now = self.current();
         Ok((now.head_sha != pr.head_sha).then_some(PullRequestUpdate { pull_request: now, commits }))
+    }
+    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        unreachable!("not published here")
+    }
+
+    fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
+        unreachable!("not published here")
     }
 }
 

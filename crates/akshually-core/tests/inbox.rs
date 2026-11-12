@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, ForgeKind, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread,
+    ForgeAdapter, ForgeError, ForgeKind, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, FileChange, InboxRowState, ReviewRequest, Service, Side};
+use akshually_core::{Anchor, Changeset, FileChange, InboxRowState, ReviewRequest, Service, Side, Verdict};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 
 /// One Forge host whose Inbox the test sets, serving each listed Pull Request.
@@ -78,6 +78,14 @@ impl ForgeAdapter for FakeForge {
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
         *self.asked.lock().unwrap() += 1;
         self.inbox.lock().unwrap().clone().map_err(|message| ForgeError::Http { host: self.host.into(), message })
+    }
+
+    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        Ok(Verdict::ALL.to_vec())
+    }
+
+    fn publish(&self, pr: &PullRequest, _: &Review) -> Result<String, ForgeError> {
+        Ok(format!("{}#review", pr.url))
     }
 }
 
@@ -164,6 +172,25 @@ fn an_open_session_shows_on_its_row_with_its_draft_count() {
 }
 
 #[test]
+fn a_published_session_stays_on_its_row_until_closed_and_its_own_review_is_no_update() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Assignee, 100)]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+    let id = svc.open_pull_request(&svc.inbox().rows[0].item.url).unwrap();
+    svc.comment(&id, Anchor::file("a.rs"), "Split it.").unwrap();
+
+    svc.publish(&id, Verdict::RequestChanges, "").unwrap();
+    assert_eq!(listed(&svc)[0].2, InboxRowState::SessionOpen { session: id.clone(), drafts: 0 });
+
+    svc.close(&id).unwrap();
+    // The review just Published updated the Pull Request on the Forge.
+    github.lists(vec![github.item(1, InboxRole::Assignee, 200)]);
+    svc.refresh_inbox();
+    assert_eq!(listed(&svc)[0].2, InboxRowState::Seen);
+}
+
+#[test]
 fn a_pull_request_looked_at_is_seen_until_it_is_updated() {
     let github = FakeForge::new("github.com");
     github.lists(vec![github.item(1, InboxRole::Reviewer, 100)]);
@@ -171,7 +198,7 @@ fn a_pull_request_looked_at_is_seen_until_it_is_updated() {
     svc.refresh_inbox();
     let id = svc.open_pull_request(&svc.inbox().rows[0].item.url).unwrap();
 
-    svc.abandon(&id).unwrap();
+    svc.close(&id).unwrap();
     assert!(svc.session(&id).is_none(), "closing a Pull Request Session ends it");
     assert_eq!(listed(&svc)[0].2, InboxRowState::Seen);
 
