@@ -308,21 +308,33 @@ fn a_binary_file_is_summarised_by_size() {
     assert_eq!(file.hunks, None, "GitHub gave no patch to take hunks from");
 }
 
+/// Mocks the GraphQL query for the page of Threads after `after`, with `body` as its answer.
+fn threads_page(server: &mut ServerGuard, after: serde_json::Value, body: &str) -> Mock {
+    server
+        .mock("POST", "/graphql")
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .match_body(Matcher::PartialJson(serde_json::json!({
+            "variables": { "owner": "acme", "repo": "web", "number": 482, "after": after }
+        })))
+        .with_body(body)
+        .create()
+}
+
+/// Mocks the GraphQL query for Thread `id`'s Comments after `after`, with `body` as its answer.
+fn comments_page(server: &mut ServerGuard, id: &str, after: &str, body: &str) -> Mock {
+    server
+        .mock("POST", "/graphql")
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .match_body(Matcher::PartialJson(serde_json::json!({ "variables": { "id": id, "after": after } })))
+        .with_body(body)
+        .create()
+}
+
 #[test]
 fn fetches_existing_threads_through_every_page() {
     let mut h = Harness::new();
-    let page = |after: serde_json::Value, body: &str, server: &mut ServerGuard| {
-        server
-            .mock("POST", "/graphql")
-            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
-            .match_body(Matcher::PartialJson(serde_json::json!({
-                "variables": { "owner": "acme", "repo": "web", "number": 482, "after": after }
-            })))
-            .with_body(body)
-            .create()
-    };
-    let first = page(serde_json::Value::Null, &fixture("threads-1.json"), &mut h.server);
-    let second = page("CURSOR1".into(), &fixture("threads-2.json"), &mut h.server);
+    let first = threads_page(&mut h.server, serde_json::Value::Null, &fixture("threads-1.json"));
+    let second = threads_page(&mut h.server, "CURSOR1".into(), &fixture("threads-2.json"));
 
     let threads = h.github().threads(&sso_pull_request()).unwrap();
 
@@ -365,6 +377,51 @@ fn fetches_existing_threads_through_every_page() {
                 comments: vec![comment("sam", "Link this from the README.")],
             },
         ]
+    );
+}
+
+#[test]
+fn a_thread_s_comments_are_fetched_through_every_page() {
+    let mut h = Harness::new();
+    let first = threads_page(&mut h.server, serde_json::Value::Null, &fixture("thread-comments-1.json"));
+    let second = comments_page(&mut h.server, "PRRT_9", "COMMENTS1", &fixture("thread-comments-2.json"));
+    let third = comments_page(&mut h.server, "PRRT_9", "COMMENTS2", &fixture("thread-comments-3.json"));
+
+    let threads = h.github().threads(&sso_pull_request()).unwrap();
+
+    first.assert();
+    second.assert();
+    third.assert();
+    let comment = |author: &str, body: &str| RemoteComment { author: author.into(), body: body.into() };
+    assert_eq!(
+        threads,
+        vec![RemoteThread {
+            id: "PRRT_9".into(),
+            anchor: RemoteAnchor::Lines { path: "src/a.rs".into(), side: Side::New, start: 1, end: 1 },
+            outdated: false,
+            resolved_by: None,
+            diff_hunk: "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}".into(),
+            comments: vec![
+                comment("lee", "Why the rename?"),
+                comment("maria", "Clearer."),
+                comment("lee", "Fair enough.")
+            ],
+        }]
+    );
+}
+
+#[test]
+fn a_failed_query_for_a_thread_s_further_comments_fails_the_threads() {
+    let mut h = Harness::new();
+    threads_page(&mut h.server, serde_json::Value::Null, &fixture("thread-comments-1.json"));
+    let failed = r#"{"data":null,"errors":[{"message":"Something went wrong while executing your query."}]}"#;
+    comments_page(&mut h.server, "PRRT_9", "COMMENTS1", failed);
+
+    let result = h.github().threads(&sso_pull_request());
+
+    assert!(
+        matches!(&result, Err(ForgeError::Api { message, .. }) if message.contains("Something went wrong")),
+        "expected the follow-up's error, got {result:?}"
     );
 }
 

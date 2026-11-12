@@ -1,0 +1,12 @@
+{
+  "data": {
+    "node": {
+      "comments": {
+        "pageInfo": { "hasNextPage": false, "endCursor": "COMMENTS3" },
+        "nodes": [
+          { "body": "Fair enough.", "author": { "login": "lee" }, "diffHunk": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" }
+        ]
+      }
+    }
+  }
+}
