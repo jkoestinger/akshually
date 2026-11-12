@@ -3,8 +3,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,10 @@ pub struct SessionView {
     pub view: ChangesetView,
     /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
     pub viewed: BTreeSet<String>,
+    /// Files that changed on disk during the human's Turn and differ from the Changeset shown.
+    /// They're offered as a reload, never applied: empty means nothing to reload.
+    #[serde(default)]
+    pub changed_on_disk: BTreeSet<String>,
 }
 
 impl SessionView {
@@ -196,6 +200,35 @@ struct Session {
     threads_opened: u32,
     /// Rounds handed over while no `review` call waited, oldest first.
     queued: Vec<Round>,
+    /// What the agent's last `review` call asked for, to rebuild the Changeset from on reload.
+    local: LocalOptions,
+}
+
+impl Session {
+    /// Takes a new full Changeset (and the changes since the Session base): clears viewed ticks
+    /// on files that changed, recomputes the changes since the last Round and re-anchors the
+    /// Threads. With `default_view`, from Round 2 the view resets to the changes since the last
+    /// Round, as on each re-attach.
+    fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
+        let view = &mut self.view;
+        let before = view.anchored_in().clone();
+        for file in changeset.since(&view.changeset).files {
+            view.viewed.remove(&file.path);
+        }
+        view.changeset = changeset;
+        view.since_session_base = since_session_base;
+        view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
+        view.changed_on_disk.clear();
+        if default_view && view.since_last_round.is_some() {
+            view.view = ChangesetView::SinceLastRound;
+        }
+        // Threads follow the Changeset they are anchored in.
+        if view.anchored_in() != &before {
+            let mut threads = std::mem::take(&mut view.threads);
+            reanchor(&mut threads, view.anchored_in());
+            view.threads = threads;
+        }
+    }
 }
 
 /// A Session base as saved: `session_bases` keys by a tuple, which JSON can't.
@@ -420,23 +453,8 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
-                let before = session.view.anchored_in().clone();
-                for file in changeset.since(&session.view.changeset).files {
-                    session.view.viewed.remove(&file.path);
-                }
-                session.view.changeset = changeset;
-                session.view.since_session_base = since_session_base;
-                session.view.since_last_round =
-                    session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
-                if session.view.since_last_round.is_some() {
-                    session.view.view = ChangesetView::SinceLastRound;
-                }
-                // Threads follow the Changeset they are anchored in.
-                if session.view.anchored_in() != &before {
-                    let mut threads = std::mem::take(&mut session.view.threads);
-                    reanchor(&mut threads, session.view.anchored_in());
-                    session.view.threads = threads;
-                }
+                session.local = request.local;
+                session.refresh(changeset, since_session_base, true);
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
                     if session.view.turn != Turn::Human {
@@ -468,8 +486,9 @@ impl Service {
                     turn: Turn::Human,
                     attention: false,
                     viewed: BTreeSet::new(),
+                    changed_on_disk: BTreeSet::new(),
                 };
-                inner.sessions.push(Session { view, waiter: Some(tx), ..Session::default() });
+                inner.sessions.push(Session { view, waiter: Some(tx), local: request.local, ..Session::default() });
                 let at = inner.sessions.len() - 1;
                 inner.became_humans_turn(at);
                 id
@@ -477,6 +496,69 @@ impl Service {
         };
         inner.notify();
         Ok(PendingReview { session: id, outcome: rx })
+    }
+
+    /// Human: refreshes the Session's Changeset from disk. Threads and Drafts are re-anchored by
+    /// content, or become Outdated.
+    pub fn reload(&self, id: &SessionId) -> Result<(), Error> {
+        let (repo, local, settings, session_base) = {
+            let inner = self.lock();
+            let session = &inner.sessions[inner.position(id)?];
+            let key = (session.view.repo.clone(), session.view.branch.clone());
+            (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
+        };
+        let now = changeset::local(&repo, &local, &settings, session_base.as_deref())?;
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        inner.sessions[at].refresh(now.full, now.since_session_base, false);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Runs `check_disk` every `every` on a background thread, until the service is dropped.
+    pub fn watch_disk(self: &Arc<Self>, every: Duration) {
+        let service = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(every);
+                let Some(service) = service.upgrade() else { return };
+                service.check_disk();
+            }
+        });
+    }
+
+    /// Looks for changes on disk in every local Session whose Turn is the human's, and offers
+    /// them as a reload (`SessionView::changed_on_disk`) without touching the Changeset. During
+    /// the agent's Turn there's nothing to offer: its next `review` refreshes the Changeset.
+    pub fn check_disk(&self) {
+        let (settings, checks) = {
+            let inner = self.lock();
+            let checks: Vec<_> = inner
+                .sessions
+                .iter()
+                .filter(|s| s.view.turn == Turn::Human)
+                .map(|s| {
+                    let key = (s.view.repo.clone(), s.view.branch.clone());
+                    (s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0)
+                })
+                .collect();
+            (inner.settings.clone(), checks)
+        };
+        for (id, local, session_base, repo) in checks {
+            // A repository that went away or broke has nothing to offer.
+            let Ok(now) = changeset::local(&repo, &local, &settings, session_base.as_deref()) else { continue };
+            let mut inner = self.lock();
+            let Ok(at) = inner.position(&id) else { continue };
+            let view = &mut inner.sessions[at].view;
+            if view.turn != Turn::Human {
+                continue;
+            }
+            let changed = changed_files(&view.changeset, &now.full);
+            if view.changed_on_disk != changed {
+                view.changed_on_disk = changed;
+                inner.notify();
+            }
+        }
     }
 
     /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
@@ -537,6 +619,8 @@ impl Service {
         }
         session.view.round += 1;
         session.view.turn = Turn::Agent;
+        // The agent's next `review` refreshes the Changeset anyway.
+        session.view.changed_on_disk.clear();
         session.view.since_last_round =
             Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
         session.view.last_round = Some(session.view.changeset.clone());
@@ -672,6 +756,14 @@ impl Service {
 fn resolve(thread: &mut Thread, by: Party) {
     thread.resolved = Some(by);
     thread.reopened = false;
+}
+
+/// The paths whose change differs between two Changesets, including files in only one of them.
+fn changed_files(then: &Changeset, now: &Changeset) -> BTreeSet<String> {
+    let differs = |a: &Changeset, b: &Changeset| {
+        a.files.iter().filter(|f| !b.files.contains(f)).map(|f| f.path.clone()).collect::<Vec<_>>()
+    };
+    differs(then, now).into_iter().chain(differs(now, then)).collect()
 }
 
 /// The `n` of a Session id `sn`.
