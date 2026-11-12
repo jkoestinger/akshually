@@ -4,5 +4,5 @@ We build the desktop UI with [Rune](https://github.com/anomalyco/rune), even tho
 
 ## Consequences
 
-- Our `Cargo.toml` has to repeat Rune's `[patch]` entries for its vendored winit, wgpu-hal and parley.
+- Our `Cargo.toml` has to repeat Rune's `[patch]` entries for its vendored winit, wgpu-hal, parley_engine and accesskit_windows, and re-check them whenever the pinned revision changes.
 - Builds are heavy; keep debug info at line tables only.
