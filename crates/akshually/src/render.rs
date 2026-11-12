@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use akshually_core::{Anchor, Outcome, Round, Thread};
+use akshually_core::{Anchor, Outcome, Round, Side, Thread};
 
 /// What `review --format markdown` prints for `outcome`.
 pub fn outcome_markdown(outcome: &Outcome) -> String {
@@ -32,18 +32,43 @@ fn round_markdown(round: &Round) -> String {
 }
 
 fn thread_markdown(out: &mut String, thread: &Thread) {
-    let Anchor::Lines { path, side, start, end } = &thread.anchor;
-    let lines = if start == end { format!("line {start}") } else { format!("lines {start}-{end}") };
-    let _ = write!(out, "\n## {} · {path}, {side} {lines}\n\n", thread.id);
-    let fence = fence_for(&thread.excerpt);
-    let _ = write!(out, "{fence}\n{}", thread.excerpt);
-    if !thread.excerpt.ends_with('\n') {
+    let _ = writeln!(out, "\n## {} · {}", thread.id, anchor_markdown(&thread.anchor));
+    if let Anchor::Lines { .. } = thread.anchor {
+        out.push('\n');
+        code_block(out, &thread.excerpt);
+    }
+    for comment in &thread.comments {
+        let _ = writeln!(out, "\n{}", comment.body.trim_end());
+        if let (Some(code), Anchor::Lines { path, side, start, end }) = (&comment.suggestion, &thread.anchor) {
+            let _ = writeln!(out, "\nSuggested change: replace {} of {path} with\n", lines(*side, *start, *end));
+            code_block(out, code);
+        }
+    }
+}
+
+/// `new lines 2-3`, or `old line 1`.
+fn lines(side: Side, start: u32, end: u32) -> String {
+    if start == end { format!("{side} line {start}") } else { format!("{side} lines {start}-{end}") }
+}
+
+/// Where a Thread sits, naming its Anchor kind: `lib.rs, new lines 2-3`, `lib.rs, whole file`
+/// or `whole Review`.
+fn anchor_markdown(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Lines { path, side, start, end } => format!("{path}, {}", lines(*side, *start, *end)),
+        Anchor::File { path } => format!("{path}, whole file"),
+        Anchor::Review => "whole Review".to_owned(),
+    }
+}
+
+/// `code` in a fence it can't close.
+fn code_block(out: &mut String, code: &str) {
+    let fence = fence_for(code);
+    let _ = write!(out, "{fence}\n{code}");
+    if !code.ends_with('\n') {
         out.push('\n');
     }
     let _ = writeln!(out, "{fence}");
-    for comment in &thread.comments {
-        let _ = writeln!(out, "\n{}", comment.body.trim_end());
-    }
 }
 
 /// A backtick fence longer than any backtick run in `code`, so the code can't close it.

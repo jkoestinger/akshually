@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Settings, git};
 
 /// Identifies a Session for as long as the app runs.
@@ -370,12 +370,15 @@ impl Service {
         Ok(PendingReview { session: id, outcome: rx })
     }
 
-    /// Human: opens a Thread at `anchor` with `body` (markdown) as a Draft, which goes out
-    /// with the next Round.
-    pub fn comment(&self, id: &SessionId, anchor: Anchor, body: impl Into<String>) -> Result<ThreadId, Error> {
-        let body = body.into();
+    /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
+    /// Draft, which goes out with the next Round.
+    pub fn comment(&self, id: &SessionId, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
+        let NewComment { body, suggestion } = comment.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
+        }
+        if suggestion.is_some() && !matches!(anchor, Anchor::Lines { side: Side::New, .. }) {
+            return Err(Error::InvalidSuggestion);
         }
         let mut inner = self.lock();
         let at = inner.position(id)?;
@@ -389,7 +392,7 @@ impl Service {
         let excerpt = anchor.excerpt(anchored_to).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
-        let comment = Comment { author: Party::Human, body, round: None };
+        let comment = Comment { author: Party::Human, body, round: None, suggestion };
         session.view.threads.push(Thread {
             id: thread.clone(),
             anchor,
@@ -453,7 +456,7 @@ impl Service {
             return Err(Error::EmptyComment);
         }
         self.agent_thread(cwd, thread, |round, thread| {
-            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round) });
+            thread.comments.push(Comment { author: Party::Agent, body, round: Some(round), suggestion: None });
         })
     }
 

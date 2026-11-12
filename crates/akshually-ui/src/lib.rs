@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, Party, Service, SessionId, SessionView, Side, Thread,
-    ThreadId, Turn,
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Party, Service, SessionId, SessionView, Side,
+    Thread, ThreadId, Turn,
 };
-use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
+use rune::{AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
-use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, TextArea};
+use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -29,7 +29,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let spec = AppSpec {
-        scenes: &[("session", scene_session)],
+        scenes: &[("session", scene_session), ("threads", scene_threads)],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
         // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
         // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
@@ -65,12 +65,13 @@ struct State {
     composer_text: TextEdit,
 }
 
-/// A Comment being written on a line range, before it becomes a Draft.
+/// A Comment being written, before it becomes a Draft.
 struct Composer {
     session: SessionId,
     anchor: Anchor,
-    /// Where the composer shows in the diff: the range's last line.
-    at: Annotation,
+    /// Where the composer shows in the diff: a line range's last line. File and Review
+    /// composers show above the diff instead.
+    at: Option<Annotation>,
 }
 
 struct SessionTab {
@@ -95,7 +96,7 @@ impl SessionTab {
             .threads
             .iter()
             .filter_map(|t| {
-                let Anchor::Lines { path, side, end, .. } = &t.anchor;
+                let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
                 if *side == Side::Old && self.session.view == ChangesetView::SinceLastRound {
                     // That old side is the last Round's code, not the code the Thread is on.
                     return None;
@@ -104,7 +105,7 @@ impl SessionTab {
                 Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
             })
             .collect();
-        notes.extend(composer.filter(|c| c.session == self.session.id).map(|c| c.at.clone()));
+        notes.extend(composer.filter(|c| c.session == self.session.id).and_then(|c| c.at.clone()));
         self.diff.set_annotations(notes);
     }
 
@@ -270,6 +271,25 @@ impl State {
         }
         let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
+        self.open_composer(anchor, Some(at));
+    }
+
+    /// Opens the composer on a whole file (`Some(index)`) or the whole Review (`None`) of the
+    /// active Session.
+    fn compose_general(&mut self, file: Option<usize>) {
+        let Some(tab) = self.active_tab() else { return };
+        let anchor = match file {
+            Some(at) => match tab.session.shown().files.get(at) {
+                Some(f) => Anchor::file(f.path.clone()),
+                None => return,
+            },
+            None => Anchor::Review,
+        };
+        self.open_composer(anchor, None);
+    }
+
+    fn open_composer(&mut self, anchor: Anchor, at: Option<Annotation>) {
+        let Some(tab) = self.active_tab() else { return };
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
         self.composer_text = TextEdit::new("");
         self.annotate();
@@ -284,7 +304,8 @@ impl State {
     /// Turns the composer's text into a Draft in a new Thread.
     fn save_draft(&mut self) {
         let Some(composer) = &self.composer else { return };
-        match self.service.comment(&composer.session, composer.anchor.clone(), self.composer_text.text.clone()) {
+        let comment = NewComment::from_markdown(&self.composer_text.text);
+        match self.service.comment(&composer.session, composer.anchor.clone(), comment) {
             Ok(_) => self.close_composer(),
             Err(error) => eprintln!("akshually: {error}"),
         }
@@ -346,6 +367,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .child(row().key("tabbar").h(40.0).w_full().child(tabs))
                 .child(session_header(k, tab))
+                .child(general_threads(k, s, tab))
                 .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab)))
         }
         None => col().w_full().h_full().items_center().justify_center().child(
@@ -411,6 +433,12 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .child(row().grow(1.0))
         .children(toggle)
         .child(
+            Button::new("Comment on Review")
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut State| s.compose_general(None))
+                .build(k),
+        )
+        .child(
             Button::new("Abandon")
                 .variant(ButtonVariant::Ghost)
                 .on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
@@ -451,16 +479,26 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
         let note = file_note(change).unwrap_or_default();
         let viewed = tab.session.viewed.contains(&change.path);
         let (id, path) = (tab.session.id.clone(), change.path.clone());
-        row().gap(12.0).items_center().child(text(note).font(kc.ty.small).color(kc.c.text_muted)).child(
-            Checkbox::new(viewed)
-                .label("Viewed")
-                .on_toggle(move |s: &mut State| {
-                    if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
-                        eprintln!("akshually: {error}");
-                    }
-                })
-                .build(&kc),
-        )
+        row()
+            .gap(12.0)
+            .items_center()
+            .child(text(note).font(kc.ty.small).color(kc.c.text_muted))
+            .child(
+                Button::new("Comment on file")
+                    .variant(ButtonVariant::GhostMuted)
+                    .on_press(move |s: &mut State| s.compose_general(Some(file)))
+                    .build(&kc),
+            )
+            .child(
+                Checkbox::new(viewed)
+                    .label("Viewed")
+                    .on_toggle(move |s: &mut State| {
+                        if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
+                            eprintln!("akshually: {error}");
+                        }
+                    })
+                    .build(&kc),
+            )
     })
     .annotation({
         let k = k.clone();
@@ -470,17 +508,39 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     .build(s, k)
 }
 
+/// The Threads on the Review as a whole and on whole files, which have no line in the diff,
+/// and the composer when it's writing one.
+fn general_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
+    let general = |anchor: &Anchor| !matches!(anchor, Anchor::Lines { .. });
+    let threads: Vec<&Thread> = tab.session.threads.iter().filter(|t| general(&t.anchor)).collect();
+    let composing = s.composer.as_ref().is_some_and(|c| c.session == tab.session.id && c.at.is_none());
+    if threads.is_empty() && !composing {
+        return col();
+    }
+    let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
+    for thread in threads {
+        list = list.child(thread_view(k, thread, tab.session.id.clone()));
+    }
+    if composing {
+        list = list.child(composer(k, s));
+    }
+    col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list)
+}
+
 fn annotation(k: &Kit, s: &State, a: &Annotation) -> El {
     if a.id == COMPOSER {
         return composer(k, s);
     }
-    let thread = s.active_tab().and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id));
-    let session = s.active.clone();
-    match (thread, session) {
-        (Some(thread), Some(session)) if thread.resolved.is_some() => resolved_row(k, thread, session),
-        (Some(thread), Some(session)) => thread_card(k, thread, session),
-        _ => col(),
+    let tab = s.active_tab();
+    match tab.and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id).map(|th| (t, th))) {
+        Some((tab, thread)) => thread_view(k, thread, tab.session.id.clone()),
+        None => col(),
     }
+}
+
+/// A Thread of `session`: its card, or one line while it's Resolved.
+fn thread_view(k: &Kit, thread: &Thread, session: SessionId) -> El {
+    if thread.resolved.is_some() { resolved_row(k, thread, session) } else { thread_card(k, thread, session) }
 }
 
 /// A Resolved Thread, collapsed to one line with a way to reopen it.
@@ -525,6 +585,9 @@ fn card(k: &Kit) -> El {
 
 fn thread_card(k: &Kit, thread: &Thread, session: SessionId) -> El {
     let mut card = card(k);
+    if let Some(label) = general_label(&thread.anchor) {
+        card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
+    }
     for comment in &thread.comments {
         let who = match comment.author {
             Party::Human => "You",
@@ -542,7 +605,12 @@ fn thread_card(k: &Kit, thread: &Thread, session: SessionId) -> El {
                     .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
                     .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
             )
-            .child(text(comment.body.clone()).font(k.ty.body).color(k.c.text_base).wrap());
+            .child(Markdown::new(comment.body.clone()).selectable(true).build(k));
+        if let Some(suggestion) = &comment.suggestion {
+            card = card
+                .child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
+                .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
+        }
     }
     // A Thread still all Drafts hasn't reached the agent yet: nothing to resolve.
     if thread.comments.iter().any(|c| !c.is_draft()) {
@@ -559,10 +627,29 @@ fn thread_card(k: &Kit, thread: &Thread, session: SessionId) -> El {
     card
 }
 
+/// What a File or Review Thread is on; line Threads sit on their lines instead.
+fn general_label(anchor: &Anchor) -> Option<String> {
+    match anchor {
+        Anchor::Lines { .. } => None,
+        Anchor::File { path } => Some(path.clone()),
+        Anchor::Review => Some("Whole Review".to_owned()),
+    }
+}
+
+/// A suggestion as a markdown `diff` fence: the anchored code it replaces, then the code.
+fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
+    let removed = excerpt.lines().map(|l| format!("-{l}\n"));
+    let added = suggestion.lines().map(|l| format!("+{l}\n"));
+    let lines: String = removed.chain(added).collect();
+    let longest = lines.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}diff\n{lines}{fence}\n")
+}
+
 fn composer(k: &Kit, s: &State) -> El {
     card(k)
         .key("composer")
-        .child(text("New Comment · a Draft until you hand over the Round").font(k.ty.small).color(k.c.text_faint))
+        .child(text(composer_title(s)).font(k.ty.small).color(k.c.text_faint))
         .child(
             TextArea::new(&s.composer_text)
                 .placeholder("Comment…")
@@ -577,6 +664,7 @@ fn composer(k: &Kit, s: &State) -> El {
                 .w_full()
                 .gap(8.0)
                 .items_center()
+                .child(text("Markdown · suggestion: ```suggestion").font(k.ty.small).color(k.c.text_faint))
                 .child(row().grow(1.0))
                 .child(
                     Button::new("Discard")
@@ -591,6 +679,14 @@ fn composer(k: &Kit, s: &State) -> El {
                         .build(k),
                 ),
         )
+}
+
+fn composer_title(s: &State) -> String {
+    let on = s.composer.as_ref().and_then(|c| general_label(&c.anchor));
+    match on {
+        Some(on) => format!("New Comment on {on} · a Draft until you hand over the Round"),
+        None => "New Comment · a Draft until you hand over the Round".to_owned(),
+    }
 }
 
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -621,7 +717,12 @@ fn scene_session(s: &mut State) {
         attention: false,
     };
     let mut session = session;
-    let agent = |body: &str| akshually_core::Comment { author: Party::Agent, body: body.into(), round: Some(2) };
+    let agent = |body: &str| akshually_core::Comment {
+        author: Party::Agent,
+        body: body.into(),
+        round: Some(2),
+        suggestion: None,
+    };
     session.threads[0].comments.push(agent("Done: the snapshot is taken first."));
     session.threads[2].comments.push(agent("Renamed."));
     session.threads[2].resolved = Some(Party::Agent);
@@ -639,13 +740,61 @@ fn scene_session(s: &mut State) {
     s.apply(vec![session, unseen, working]);
 }
 
+/// `--scene threads`: Review, file and suggestion Threads, with markdown bodies.
+fn scene_threads(s: &mut State) {
+    use akshually_core::Comment;
+    let comment = |body: &str, suggestion: Option<&str>| Comment {
+        author: Party::Human,
+        body: body.into(),
+        round: None,
+        suggestion: suggestion.map(Into::into),
+    };
+    let thread = |id: &str, anchor: Anchor, excerpt: &str, comment: Comment| Thread {
+        id: ThreadId::new(id),
+        anchor,
+        excerpt: excerpt.into(),
+        comments: vec![comment],
+        resolved: None,
+    };
+    let session = SessionView {
+        id: SessionId::new("sample"),
+        repo: "/home/me/akshually".into(),
+        branch: "feat/round-snapshots".into(),
+        changeset: sample_changeset(),
+        since_session_base: None,
+        last_round: None,
+        since_last_round: None,
+        view: ChangesetView::Full,
+        viewed: Default::default(),
+        turn: Turn::Human,
+        attention: false,
+        round: 1,
+        threads: vec![
+            thread(
+                "T1",
+                Anchor::Review,
+                "",
+                comment("Looks good. Two things:\n\n- add a **changelog** entry\n- run `cargo fmt`", None),
+            ),
+            thread("T2", Anchor::file("src/round.rs"), "", comment("Does `Round` need its own file?", None)),
+            thread(
+                "T3",
+                Anchor::lines(Side::New, "src/session.rs", 3..=3),
+                "    let snapshot = self.changeset.snapshot()?;\n",
+                comment("Name it for what it holds:", Some("    let before = self.changeset.snapshot()?;\n")),
+            ),
+        ],
+    };
+    s.apply(vec![session]);
+}
+
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
     use akshually_core::Comment;
     Thread {
         id: ThreadId::new(id),
         anchor: Anchor::lines(Side::New, "src/session.rs", lines),
         excerpt: String::new(),
-        comments: vec![Comment { author: Party::Human, body: body.into(), round }],
+        comments: vec![Comment { author: Party::Human, body: body.into(), round, suggestion: None }],
         resolved: None,
     }
 }
