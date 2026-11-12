@@ -16,8 +16,8 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use super::{epoch_seconds, file_change, with_suggestion};
-use crate::{Changeset, FileChange, Hunk, Side, Verdict};
+use super::{FileFetch, epoch_seconds, fetch_files, with_suggestion};
+use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
@@ -329,33 +329,34 @@ impl ForgeAdapter for GitHub {
 
         // Like the local Source, renames are a deletion plus an addition. Line comments must
         // fit GitHub's own diff, so each file keeps its hunks.
-        let mut files = Vec::new();
+        let mut fetches = Vec::new();
         for file in listed {
-            let old = |path: &str| self.file(id, path, &base).map(Some);
-            let new = |path: &str| self.file(id, path, &pr.head_sha).map(Some);
             let hunks = file.patch.as_deref().map(Hunk::parse_patch);
-            let with = |change: FileChange, hunks| FileChange { hunks, ..change };
+            let path = file.filename;
+            let fetch = |old: Option<&String>, new: Option<&String>, hunks| FileFetch {
+                path: new.or(old).cloned().unwrap_or_default(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks,
+            };
             match file.status.as_str() {
-                "added" | "copied" => {
-                    files.push(with(file_change(file.filename.clone(), None, new(&file.filename)?), hunks))
-                }
-                "removed" => files.push(with(file_change(file.filename.clone(), old(&file.filename)?, None), hunks)),
+                "added" | "copied" => fetches.push(fetch(None, Some(&path), hunks)),
+                "removed" => fetches.push(fetch(Some(&path), None, hunks)),
                 "renamed" => {
                     // GitHub shows the renamed file only: none of the old path's lines, and of
                     // the new path's only those its patch changes.
-                    let previous = file.previous_filename.unwrap_or_else(|| file.filename.clone());
-                    files.push(with(file_change(previous.clone(), old(&previous)?, None), Some(Vec::new())));
-                    let renamed = file_change(file.filename.clone(), None, new(&file.filename)?);
-                    files.push(with(renamed, Some(hunks.unwrap_or_default())));
+                    let previous = file.previous_filename.unwrap_or_else(|| path.clone());
+                    fetches.push(fetch(Some(&previous), None, Some(Vec::new())));
+                    fetches.push(fetch(None, Some(&path), Some(hunks.unwrap_or_default())));
                 }
                 "unchanged" => {}
-                _ => {
-                    let change = file_change(file.filename.clone(), old(&file.filename)?, new(&file.filename)?);
-                    files.push(with(change, hunks))
-                }
+                _ => fetches.push(fetch(Some(&path), Some(&path), hunks)),
             }
         }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = fetch_files(fetches, |path, side| {
+            self.file(id, path, if side == Side::Old { &base } else { &pr.head_sha })
+        })?;
         Ok(Changeset { base, files })
     }
 

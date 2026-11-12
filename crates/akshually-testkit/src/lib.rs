@@ -141,3 +141,39 @@ pub fn wait_until<T>(timeout: Duration, what: &str, mut check: impl FnMut() -> O
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A local HTTP server answering each request on its own thread with `answer(path_and_query)`,
+/// for what a mock server answering one request at a time can't show: requests made at the
+/// same time. Returns its base URL.
+pub fn threaded_http_server(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let answer = std::sync::Arc::new(answer);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let (Ok(stream), answer) = (stream, answer.clone()) else { continue };
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // One request after another on a kept-alive connection; none has a body.
+                loop {
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                        header.clear();
+                    }
+                    let target = request.split(' ').nth(1).unwrap_or("/").to_owned();
+                    let body = answer(&target);
+                    let response = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                    if (&stream).write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    url
+}

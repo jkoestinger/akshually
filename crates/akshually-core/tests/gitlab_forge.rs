@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitLab, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
 use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
-use akshually_testkit::TestDirs;
+use akshually_testkit::{TestDirs, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value, json};
 
@@ -213,6 +214,39 @@ impl Harness {
             .with_body(body)
             .create()
     }
+}
+
+#[test]
+fn file_contents_are_fetched_in_parallel_and_kept_in_path_order() {
+    let paths: Vec<String> = (0..16).map(|n| format!("src/f{n:02}.rs")).collect();
+    let diff = |p: &String| {
+        format!(
+            r#"{{ "old_path": "{p}", "new_path": "{p}", "new_file": false, "renamed_file": false,
+                "deleted_file": false, "diff": "@@ -1 +1 @@\n-a\n+b\n" }}"#
+        )
+    };
+    let listed = format!("[{}]", paths.iter().rev().map(diff).collect::<Vec<_>>().join(","));
+    let api = threaded_http_server(move |target| {
+        if target.starts_with("/projects/platform%2Finfra/merge_requests/97/diffs") {
+            listed.clone()
+        } else {
+            // Each read takes 100 ms: 32 of them one after the other would take 3.2 s.
+            std::thread::sleep(Duration::from_millis(100));
+            format!("{target}\n")
+        }
+    });
+    let h = Harness::new();
+    let host = HostConfig { api_base: Some(api), ..HostConfig::new(ForgeKind::GitLab, "gitlab.example.com") };
+    let gitlab = GitLab::new(host, h.sources(Some(("gitlab.example.com", TOKEN)), &[]));
+
+    let started = Instant::now();
+    let changeset = gitlab.changeset(&rotate_creds()).unwrap();
+
+    assert!(started.elapsed() < Duration::from_millis(1600), "took {:?}", started.elapsed());
+    assert_eq!(changeset.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), paths);
+    let raw = "/projects/platform%2Finfra/repository/files/src%2Ff00.rs/raw";
+    assert_eq!(changeset.files[0].old, Some(format!("{raw}?ref=mb1\n")));
+    assert_eq!(changeset.files[0].new, Some(format!("{raw}?ref=head1\n")));
 }
 
 #[test]

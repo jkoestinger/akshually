@@ -307,6 +307,60 @@ pub(crate) fn with_suggestion(body: &str, info: &str, code: &str) -> String {
     if body.is_empty() { block } else { format!("{body}\n\n{block}") }
 }
 
+/// How many requests for file contents run at once.
+const PARALLEL_FETCHES: usize = 8;
+
+/// One changed file to fetch: its path in the Changeset, the paths to read on each side (`None`
+/// where it doesn't exist), and the hunks of the Forge's diff.
+pub(crate) struct FileFetch {
+    pub path: String,
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub hunks: Option<Vec<crate::Hunk>>,
+}
+
+/// Fetches each of `files`, reading a side's contents with `read(path, side)`, on up to
+/// [`PARALLEL_FETCHES`] threads. The changes come back in the order of `files`; the first
+/// failure fails them all.
+pub(crate) fn fetch_files(
+    files: Vec<FileFetch>,
+    read: impl Fn(&str, Side) -> Result<Vec<u8>, ForgeError> + Sync,
+) -> Result<Vec<FileChange>, ForgeError> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fetch = |file: &FileFetch| -> Result<FileChange, ForgeError> {
+        let old = file.old.as_deref().map(|path| read(path, Side::Old)).transpose()?;
+        let new = file.new.as_deref().map(|path| read(path, Side::New)).transpose()?;
+        Ok(FileChange { hunks: file.hunks.clone(), ..file_change(file.path.clone(), old, new) })
+    };
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<Result<FileChange, ForgeError>>>> =
+        Mutex::new(std::iter::repeat_with(|| None).take(files.len()).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_FETCHES.min(files.len()) {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(at) else { return };
+                    let result = fetch(file);
+                    let failed = result.is_err();
+                    results.lock().unwrap_or_else(|e| e.into_inner())[at] = Some(result);
+                    if failed {
+                        // No point fetching the rest.
+                        next.store(files.len(), Ordering::Relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    // Files are taken in order, and each one taken is fetched: a failure stops the takes after
+    // it, so it comes before any file left unfetched, and without one every file was fetched.
+    results.into_iter().map_while(|r| r).collect()
+}
+
 /// A changed file from its contents on each side: binary (a NUL in its first 8 KB, as git
 /// decides) is summarised by size, text is decoded lossily.
 pub(crate) fn file_change(path: String, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> FileChange {
