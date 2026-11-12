@@ -1117,7 +1117,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
             .build(k)
             .into()
     };
-    let views = view_dropdown(k, tab, layer);
+    let view_select = view_dropdown(k, tab, layer);
     row()
         .key("session-header")
         .w_full()
@@ -1131,7 +1131,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
-        .children(views)
+        .children(view_select)
         .child(
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -1801,8 +1801,8 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     s.active_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
 }
 
-/// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an unseen human's Turn and an agent's
-/// Turn, for headless renders.
+/// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
+/// unseen human's Turn and an agent's Turn, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {

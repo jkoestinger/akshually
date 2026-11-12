@@ -53,6 +53,15 @@ fn opening_the_dropdown_lists_the_views_that_apply_with_the_active_one_checked()
 }
 
 #[test]
+fn choosing_a_view_closes_the_dropdown() {
+    // The scene's service has no Sessions, so the view itself can't change here: choosing goes
+    // through `Service::show` as the view buttons did.
+    let tree = session_tree(&[open_views(), json!({ "t": 0.6, "type": "click", "key": "option2" })]);
+
+    assert!(tree.with_role("list-box-option").is_empty(), "the dropdown is still open");
+}
+
+#[test]
 fn escape_closes_the_dropdown_without_changing_the_view() {
     let tree = session_tree(&[open_views(), json!({ "t": 0.6, "type": "key", "name": "Escape" })]);
 
