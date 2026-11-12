@@ -66,7 +66,7 @@ Read [`GLOSSARY.md`](GLOSSARY.md) and the ADRs in [`docs/adr/`](docs/adr/) first
   - **Seam A**: the core `Service` in-process, in `crates/akshually-core/tests`.
   - **Seam B**: the CLI contract (blocking, stdout, exit codes, attaching to the app instance), in `crates/akshually/tests`. Cover only what seam A can't.
   - **Seam C**: a Forge adapter at its HTTP boundary, against `mockito`, a fake `gh` or `glab`, and a controlled environment.
-  - **UI**: a headless render smoke check only (`ui_smoke.rs`): Rune's `--snap` for pixels, and `--tree` for the text a scene shows. Keep the UI thin enough that this is enough.
+  - **UI**: a headless render smoke check (`ui_smoke.rs`): Rune's `--snap` for pixels, and `--tree` for the text a scene shows. Keep the UI thin enough that this is enough. A bug only Rune's event timing shows is pinned in `crates/akshually-ui/tests`, driving `State` and `view` in Rune's headless `Runtime` (`diff_view.rs`).
 - **Every test file opens with a `//!` line naming its seam** and what it covers: `//! Seam A: the Inbox in the core review service, with fake Forge adapters.`
 - **Name a test after the behaviour it pins**, as a sentence: `review_blocks_until_the_human_acts`, `approving_returns_approved_to_the_waiting_review_and_ends_the_session`.
 - **One behaviour per test, laid out as arrange, act, assert**, with each part separated by a blank line.
