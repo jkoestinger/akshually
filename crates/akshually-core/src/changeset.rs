@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::git::{self, GitError};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changeset {
     /// The commit the Changeset is shown against.
     pub base: String,

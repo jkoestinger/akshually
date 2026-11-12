@@ -8,6 +8,7 @@ pub mod git;
 pub mod ipc;
 mod paths;
 mod service;
+mod store;
 mod thread;
 
 pub use changeset::{Changeset, FileChange};

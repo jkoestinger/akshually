@@ -1,7 +1,7 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -9,11 +9,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset};
+use crate::store::Store;
 use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
 use crate::{Error, git};
 
-/// Identifies a Session for as long as the app runs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Identifies a Session, across restarts too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -58,8 +59,10 @@ impl ReviewRequest {
     }
 }
 
-/// What the UI (and tests) can observe of one Session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the UI (and tests) can observe of one Session. It's persisted: a field missing from
+/// an older saved Session takes its `Default`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
     /// The working tree root: each worktree is its own Session.
@@ -97,9 +100,15 @@ impl PendingReview {
 
 type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 
+/// A Session as the service keeps it, and as the store saves it: every field but the waiter
+/// survives a restart, and a field missing from an older saved Session takes its `Default`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Session {
     view: SessionView,
-    /// The agent's blocked `review` call, if any.
+    /// The agent's blocked `review` call, if any. A restart drops it; the agent's next
+    /// `review` attaches to the restored Session.
+    #[serde(skip)]
     waiter: Option<Sender<Outcome>>,
     /// Threads opened so far, for numbering the next one.
     threads_opened: u32,
@@ -112,6 +121,8 @@ struct Inner {
     next_id: u64,
     sessions: Vec<Session>,
     subscribers: Vec<Subscriber>,
+    /// Where Sessions are saved; `None` keeps them in memory only.
+    store: Option<Store>,
 }
 
 impl Inner {
@@ -123,7 +134,14 @@ impl Inner {
         self.sessions.iter().map(|s| s.view.clone()).collect()
     }
 
-    fn notify(&self) {
+    /// Publishes a change: saves the Sessions, then tells subscribers.
+    fn notify(&mut self) {
+        if let Some(store) = &mut self.store {
+            // The change already happened in memory; a failed save shouldn't undo it.
+            if let Err(error) = store.sync(self.sessions.iter().map(|s| (&s.view.id, s))) {
+                eprintln!("akshually: couldn't save Sessions: {error}");
+            }
+        }
         if self.subscribers.is_empty() {
             return;
         }
@@ -141,8 +159,19 @@ pub struct Service {
 }
 
 impl Service {
+    /// A service that keeps its Sessions in memory only.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A service that saves its Sessions under `state_dir` (never inside a repository) and
+    /// restores the ones saved there by an earlier run.
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let (store, mut sessions) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
+        sessions.sort_by_key(|s| id_number(&s.view.id));
+        let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
+        let inner = Inner { next_id, sessions, subscribers: Vec::new(), store: Some(store) };
+        Ok(Service { inner: Mutex::new(inner) })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -191,7 +220,7 @@ impl Service {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
                 let view = SessionView { id: id.clone(), repo, branch, changeset, round: 1, threads: Vec::new() };
-                inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
+                inner.sessions.push(Session { view, waiter: Some(tx), ..Session::default() });
                 id
             }
         };
@@ -279,4 +308,9 @@ impl Service {
         inner.notify();
         Ok(())
     }
+}
+
+/// The `n` of a Session id `sn`.
+fn id_number(id: &SessionId) -> Option<u64> {
+    id.as_str().strip_prefix('s')?.parse().ok()
 }

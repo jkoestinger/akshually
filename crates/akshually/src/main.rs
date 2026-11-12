@@ -80,13 +80,16 @@ fn review() -> Result<ExitCode> {
 }
 
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
-    let service = Arc::new(Service::new());
     if !headless && akshually_ui::is_headless_run(&rune_args) {
         // A headless render (`--snap`, ...) of the UI alone: no socket, no state.
-        akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
+        akshually_ui::run(Arc::new(Service::new()), rune_args).map_err(anyhow::Error::msg)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let server = match Server::bind(&Paths::from_env(), service.clone()) {
+    let paths = Paths::from_env();
+    // Only reads the saved Sessions: it writes nothing until a Session changes, which a
+    // second instance never sees, since it quits below.
+    let service = Arc::new(Service::open(&paths.state)?);
+    let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
         // Another instance serves the CLI already; leave it to that one.
         Err(BindError::AlreadyRunning) => return Ok(ExitCode::SUCCESS),
