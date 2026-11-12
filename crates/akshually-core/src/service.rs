@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset};
 use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, git};
+use crate::{Error, git, reanchor};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,7 +179,10 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
-                session.view.changeset = changeset;
+                if session.view.changeset != changeset {
+                    reanchor(&mut session.view.threads, &changeset);
+                    session.view.changeset = changeset;
+                }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
                 } else {
@@ -213,7 +216,13 @@ impl Service {
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            outdated: false,
+        });
         inner.notify();
         Ok(thread)
     }

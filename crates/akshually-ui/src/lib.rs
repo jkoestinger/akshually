@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread};
+use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread, ThreadId};
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
@@ -73,23 +73,27 @@ struct Composer {
 struct SessionTab {
     session: SessionView,
     diff: DiffState,
+    /// Outdated Threads the human expanded; the others show as one collapsed line.
+    expanded: Vec<ThreadId>,
 }
 
 impl SessionTab {
     fn new(session: SessionView) -> Self {
         let diff = DiffState::new(file_diffs(&session.changeset));
-        let mut tab = SessionTab { session, diff };
+        let mut tab = SessionTab { session, diff, expanded: Vec::new() };
         tab.annotate(None);
         tab
     }
 
-    /// Puts each Thread, and the composer when it's on this Session, under its last line.
+    /// Puts each current Thread, and the composer when it's on this Session, under its last
+    /// line. Outdated Threads have no line; they show above the diff.
     fn annotate(&mut self, composer: Option<&Composer>) {
         let changeset = &self.session.changeset;
         let mut notes: Vec<Annotation> = self
             .session
             .threads
             .iter()
+            .filter(|t| !t.outdated)
             .filter_map(|t| {
                 let Anchor::Lines { path, side, end, .. } = &t.anchor;
                 let file = changeset.files.iter().position(|f| &f.path == path)?;
@@ -224,6 +228,17 @@ impl State {
         }
     }
 
+    /// Expands or collapses an Outdated Thread.
+    fn toggle_outdated(&mut self, session: &SessionId, thread: &ThreadId) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == session) else { return };
+        match tab.expanded.iter().position(|t| t == thread) {
+            Some(at) => {
+                tab.expanded.remove(at);
+            }
+            None => tab.expanded.push(thread.clone()),
+        }
+    }
+
     fn active_tab(&self) -> Option<&SessionTab> {
         self.tabs.iter().find(|t| Some(&t.session.id) == self.active.as_ref())
     }
@@ -262,6 +277,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .child(row().key("tabbar").h(40.0).w_full().child(tabs))
                 .child(session_header(k, tab))
+                .child(outdated_threads(k, tab))
                 .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab)))
         }
         None => col().w_full().h_full().items_center().justify_center().child(
@@ -370,6 +386,54 @@ fn thread_card(k: &Kit, thread: &Thread) -> El {
     card
 }
 
+/// The Session's Outdated Threads, collapsed to one line each until expanded to show the code
+/// they were written against and their Comments.
+fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
+    let mut list = col().key("outdated-threads").w_full().px(16.0).gap(8.0);
+    for thread in tab.session.threads.iter().filter(|t| t.outdated) {
+        let expanded = tab.expanded.contains(&thread.id);
+        let Anchor::Lines { path, side, start, end } = &thread.anchor;
+        let first = thread.comments.first().map(|c| c.body.lines().next().unwrap_or_default()).unwrap_or_default();
+        let count = match thread.comments.len() {
+            1 => "1 Comment".to_owned(),
+            n => format!("{n} Comments"),
+        };
+        let lines = if start == end { format!("line {start}") } else { format!("lines {start}-{end}") };
+        let (session, id) = (tab.session.id.clone(), thread.id.clone());
+        let summary = row()
+            .w_full()
+            .gap(8.0)
+            .items_center()
+            .child(
+                text(format!("Outdated · {} · {path}, {side} {lines} · “{first}” · {count}", thread.id))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            )
+            .child(row().grow(1.0))
+            .child(
+                Button::new(if expanded { "Hide" } else { "Show" })
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.toggle_outdated(&session, &id))
+                    .build(k),
+            );
+        let mut card = card(k).max_w(f32::INFINITY).child(summary);
+        if expanded {
+            card = card
+                .child(
+                    col()
+                        .w_full()
+                        .padding(8.0)
+                        .radius(4.0)
+                        .fill(k.c.bg_base)
+                        .child(text(thread.excerpt.trim_end().to_owned()).font(k.ty.mono).color(k.c.text_muted)),
+                )
+                .child(thread_card(k, thread));
+        }
+        list = list.child(card).pb(8.0);
+    }
+    list
+}
+
 fn composer(k: &Kit, s: &State) -> El {
     card(k)
         .key("composer")
@@ -420,6 +484,11 @@ fn scene_session(s: &mut State) {
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
+            Thread {
+                excerpt: "    let round = Round::new(drafts)?;\n".into(),
+                outdated: true,
+                ..sample_thread("T3", 4..=4, "Why does this return a Result now?", Some(1))
+            },
         ],
     };
     s.apply(vec![session]);
@@ -432,6 +501,7 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
         anchor: Anchor::lines(Side::New, "src/session.rs", lines),
         excerpt: String::new(),
         comments: vec![Comment { author: Party::Human, body: body.into(), round }],
+        outdated: false,
     }
 }
 
