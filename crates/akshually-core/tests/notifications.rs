@@ -19,7 +19,11 @@ struct FakeNotifier(Arc<Mutex<Vec<Notification>>>);
 
 impl FakeNotifier {
     fn sessions(&self) -> Vec<SessionId> {
-        self.0.lock().unwrap().iter().map(|n| n.session.clone()).collect()
+        self.0.lock().unwrap().iter().filter_map(|n| n.session.clone()).collect()
+    }
+
+    fn all(&self) -> Vec<Notification> {
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -75,6 +79,19 @@ fn the_notifier_is_called_each_time_the_session_becomes_the_humans_turn_and_only
     drop(picks_up_the_round);
     let _waits_again = svc.review(ReviewRequest::new(repo.path())).unwrap();
     assert_eq!(notifier.sessions(), vec![id.clone(), id], "the human's Turn again");
+}
+
+#[test]
+fn losing_the_local_channel_is_notified_once_without_a_session() {
+    let notifier = FakeNotifier::default();
+    let svc = service(&notifier);
+
+    svc.local_channel_lost();
+
+    let notifications = notifier.all();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert_eq!(notifications[0].session, None);
+    assert!(notifications[0].body.contains("restart"), "says how to fix it: {:?}", notifications[0]);
 }
 
 #[test]

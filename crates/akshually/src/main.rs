@@ -351,11 +351,13 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
             if std::env::var_os("AKSHUALLY_TEST_CONTROL").is_some() { server.with_test_control() } else { server };
         server.serve().context("can't serve the CLI")?;
     } else {
+        let notifying_service = service.clone();
         std::thread::spawn(move || {
-            // Logged rather than fatal: the window stays up so the human keeps what they have
-            // open, though agents can't reach the app any more (#36).
+            // Logged and notified rather than fatal: the window stays up (ADR 0002), though
+            // agents can't reach the app any more (#36).
             if let Err(error) = server.serve().context("can't serve the CLI") {
-                eprintln!("akshually: {error:#}; agents can't reach akshually until you restart it");
+                eprintln!("akshually: {error:#}");
+                notifying_service.local_channel_lost();
             }
         });
         // Offers changes on disk during the human's Turn as reloads (the banner).
