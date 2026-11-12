@@ -328,3 +328,21 @@ fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
     app.service.approve(&session.id).unwrap();
     assert_eq!(finish(third).status.code(), Some(EXIT_APPROVED));
 }
+
+#[test]
+fn a_verdict_given_while_no_review_waits_goes_to_the_next_review() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    first.kill().unwrap();
+    first.wait().unwrap();
+    wait_until(TIMEOUT, "the app to notice", || app.service.session(&session.id).filter(|s| !s.agent_waiting));
+
+    app.service.approve(&session.id).unwrap();
+
+    let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
+    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Approved.\n");
+    assert!(app.service.sessions().is_empty(), "collected, the Session ends");
+}

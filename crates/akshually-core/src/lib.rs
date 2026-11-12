@@ -48,6 +48,8 @@ pub enum Error {
     AlreadyYourTurn,
     #[error("another `akshually review` is already waiting on this Session")]
     Busy,
+    #[error("this Session has ended; the agent's next `akshually review` collects its outcome")]
+    Ended,
     #[error("{0} isn't in the Changeset")]
     NotInChangeset(String),
 }

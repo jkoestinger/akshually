@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Party, Service, SessionId, SessionView, Side,
-    Thread, ThreadId, Turn,
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, Service, SessionId,
+    SessionView, Side, Thread, ThreadId, Turn,
 };
 use rune::{AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -484,17 +484,24 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         )
 }
 
-/// During the agent's Turn: what the human can still do.
+/// During the agent's Turn: what the human can still do. Once ended: that the agent hasn't
+/// collected the outcome yet.
 fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
-    if session.turn != Turn::Agent {
-        return None;
-    }
-    let handed = session.round.saturating_sub(1);
-    let note = format!(
-        "Waiting for the agent to answer Round {handed}. You can keep reading and drafting: new Drafts go out \
-         with Round {}.",
-        session.round
-    );
+    let note = match &session.ended {
+        Some(Outcome::Approved) => {
+            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session.".to_owned()
+        }
+        Some(_) => {
+            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
+        }
+        None if session.turn == Turn::Agent => format!(
+            "Waiting for the agent to answer Round {}. You can keep reading and drafting: new Drafts go out with \
+             Round {}.",
+            session.round.saturating_sub(1),
+            session.round
+        ),
+        None => return None,
+    };
     Some(
         row()
             .key("turn-banner")
@@ -754,6 +761,7 @@ fn scene_session(s: &mut State) {
         viewed: ["src/round.rs".to_owned()].into(),
         round: 2,
         agent_waiting: true,
+        ended: None,
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
@@ -808,6 +816,7 @@ fn scene_threads(s: &mut State) {
         viewed: Default::default(),
         turn: Turn::Human,
         agent_waiting: true,
+        ended: None,
         attention: false,
         round: 1,
         threads: vec![

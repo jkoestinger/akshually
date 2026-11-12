@@ -7,9 +7,9 @@
 //! {"v":1,"err":{"code":"version","message":"…"}}
 //! ```
 //!
-//! A Round is the one exception: once the CLI has printed it, it sends `{"v":1,"op":"ack"}` on
-//! the same connection and the app replies `{"v":1,"ok":{}}`. A Round never acknowledged (the
-//! CLI died before printing it) is queued again for the next `review` call.
+//! `review` is the one exception: once the CLI has printed the outcome, it sends
+//! `{"v":1,"op":"ack"}` on the same connection and the app replies `{"v":1,"ok":{}}`. A Round
+//! or Verdict never acknowledged (the CLI died before printing it) goes to the next `review`.
 
 use std::path::PathBuf;
 
@@ -29,7 +29,7 @@ pub enum Request {
         #[serde(flatten)]
         local: LocalOptions,
     },
-    /// After a `review` replied with a Round: the CLI printed it. Replies `{}`.
+    /// After a `review` replied: the CLI printed the outcome. Replies `{}`.
     Ack,
     /// Records the Session base; replies `{}` at once.
     Start { cwd: PathBuf },

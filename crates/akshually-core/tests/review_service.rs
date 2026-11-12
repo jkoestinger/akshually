@@ -364,8 +364,8 @@ fn taking_the_turn_back_lets_the_human_go_on_while_the_agent_is_quiet() {
     svc.take_turn_back(&id).unwrap();
 
     assert_eq!(svc.session(&id).unwrap().turn, Turn::Human);
-    svc.abandon(&id).unwrap();
-    assert!(svc.session(&id).is_none());
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "two").unwrap();
+    assert_eq!(svc.hand_over_round(&id).unwrap(), 2);
 }
 
 #[test]
@@ -425,7 +425,7 @@ fn a_review_call_that_went_away_frees_the_session_for_the_next() {
 fn a_round_received_but_never_acknowledged_goes_to_the_next_review() {
     let repo = agent_branch();
     let svc = Service::new();
-    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let first = svc.review(ReviewRequest::new(repo.path()).with_ack()).unwrap();
     let id = first.session().clone();
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
     svc.hand_over_round(&id).unwrap();
@@ -433,7 +433,7 @@ fn a_round_received_but_never_acknowledged_goes_to_the_next_review() {
     assert_eq!(round(first.receive()).number, 1);
     drop(first); // say, killed before printing it
 
-    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let second = svc.review(ReviewRequest::new(repo.path()).with_ack()).unwrap();
     assert_eq!(round(second.receive()).number, 1);
     second.ack();
     drop(second);
@@ -912,7 +912,7 @@ fn huge_files_are_collapsed() {
 fn a_round_never_acknowledged_goes_to_the_review_already_waiting() {
     let repo = agent_branch();
     let svc = Service::new();
-    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let first = svc.review(ReviewRequest::new(repo.path()).with_ack()).unwrap();
     let id = first.session().clone();
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
     svc.hand_over_round(&id).unwrap();
@@ -1132,11 +1132,14 @@ fn sessions_opened_after_a_restart_get_new_ids_and_thread_ids_keep_counting() {
 #[test]
 fn approved_and_abandoned_sessions_are_not_restored() {
     let dirs = TestDirs::new();
-    let (approved, abandoned, open) = (agent_branch(), agent_branch(), agent_branch());
+    let (approved_repo, abandoned_repo, open) = (agent_branch(), agent_branch(), agent_branch());
     let svc = Service::open(dirs.state()).unwrap();
-    let approved = session_mid_review(&svc, &approved);
-    let abandoned = session_mid_review(&svc, &abandoned);
+    let approved = session_mid_review(&svc, &approved_repo);
+    let abandoned = session_mid_review(&svc, &abandoned_repo);
     let open = session_mid_review(&svc, &open);
+    // Both agents wait, so they collect the outcome at once.
+    let _approved_call = svc.review(ReviewRequest::new(approved_repo.path())).unwrap();
+    let _abandoned_call = svc.review(ReviewRequest::new(abandoned_repo.path())).unwrap();
     svc.approve(&approved).unwrap();
     svc.abandon(&abandoned).unwrap();
     drop(svc);
@@ -1197,4 +1200,115 @@ fn a_restored_session_keeps_its_session_base_and_the_changeset_the_human_chose()
     assert_eq!(session.view, ChangesetView::Full);
     let since = session.since_session_base.expect("the Session base survived").files;
     assert_eq!(since, vec![change("agent.txt", None, Some("agent, again\n"))]);
+}
+
+#[test]
+fn a_verdict_given_while_no_review_waits_goes_to_the_next_review_which_ends_the_session() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    drop(first);
+
+    svc.approve(&id).unwrap();
+    assert_eq!(svc.session(&id).unwrap().ended, Some(Outcome::Approved), "kept until the agent collects it");
+    assert!(svc.abandon(&id).is_err(), "the Session already has its outcome");
+
+    let next = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    assert_eq!(next.wait_timeout(Duration::from_secs(1)), Some(Outcome::Approved));
+    assert!(svc.session(&id).is_none());
+}
+
+#[test]
+fn abandoning_while_no_review_waits_tells_the_next_review() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    drop(first);
+
+    svc.abandon(&id).unwrap();
+
+    let next = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    assert_eq!(next.wait_timeout(Duration::from_secs(1)), Some(Outcome::Abandoned));
+    assert!(svc.session(&id).is_none());
+}
+
+#[test]
+fn a_verdict_received_but_never_acknowledged_goes_to_the_next_review() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path()).with_ack()).unwrap();
+    let id = first.session().clone();
+    svc.approve(&id).unwrap();
+
+    assert_eq!(first.receive(), Some(Outcome::Approved));
+    drop(first); // killed before printing it
+    assert!(svc.session(&id).is_some(), "not delivered yet");
+
+    let second = svc.review(ReviewRequest::new(repo.path()).with_ack()).unwrap();
+    assert_eq!(second.receive(), Some(Outcome::Approved));
+    second.ack();
+    assert!(svc.session(&id).is_none());
+}
+
+#[test]
+fn approving_during_the_agents_turn_is_refused_but_abandoning_is_not() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+
+    assert!(matches!(svc.approve(&id), Err(Error::NotYourTurn)));
+    assert!(svc.session(&id).is_some());
+
+    svc.abandon(&id).unwrap();
+}
+
+#[test]
+fn withdrawing_a_round_restores_the_last_round_it_replaced() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+    let round1 = svc.session(&id).unwrap().last_round;
+    repo.write("lib.rs", "fn a() {}\nfn b2() {}\nfn c2() {}\nfn d() {}\nfn e() {}\n");
+    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    drop(second);
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 5..=5), "two").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    assert_ne!(svc.session(&id).unwrap().last_round, round1);
+
+    svc.take_turn_back(&id).unwrap();
+
+    let session = svc.session(&id).unwrap();
+    assert_eq!(session.round, 2);
+    assert_eq!(session.last_round, round1);
+    let since = session.since_last_round.expect("Round 1 is still the last Round");
+    assert_eq!(since.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["lib.rs"]);
+    assert_eq!(since.files[0].old, round1.unwrap().files[0].new, "compared against Round 1's code");
+}
+
+#[test]
+fn a_verdict_no_agent_collected_before_a_restart_goes_to_the_next_review() {
+    let dirs = TestDirs::new();
+    let repo = agent_branch();
+    let svc = Service::open(dirs.state()).unwrap();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    drop(first);
+    svc.approve(&id).unwrap();
+    drop(svc);
+
+    let restored = Service::open(dirs.state()).unwrap();
+    let next = restored.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(next.wait_timeout(Duration::from_secs(1)), Some(Outcome::Approved));
+    assert!(restored.sessions().is_empty());
 }

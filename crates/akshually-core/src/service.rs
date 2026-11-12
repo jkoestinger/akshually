@@ -66,11 +66,21 @@ pub struct ReviewRequest {
     pub cwd: PathBuf,
     /// Which local changes make up the Changeset.
     pub local: LocalOptions,
+    /// Whether the caller acknowledges what it receives (`PendingReview::ack`), as the CLI
+    /// channel does. Without, what the call receives counts as delivered at once.
+    pub ack: bool,
 }
 
 impl ReviewRequest {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default() }
+        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default(), ack: false }
+    }
+
+    /// Counts a Round or Verdict as delivered only once the caller acknowledges it: dropping
+    /// the call before that gives it to the next `review` call.
+    pub fn with_ack(mut self) -> Self {
+        self.ack = true;
+        self
     }
 
     /// Shows the changes since HEAD's merge-base with `base` instead of the default branch.
@@ -111,6 +121,9 @@ pub struct SessionView {
     /// In the order they were opened.
     pub threads: Vec<Thread>,
     pub turn: Turn,
+    /// The human approved or abandoned the Session while no agent's `review` call received it.
+    /// The Session stays until the next `review` call collects this, then ends.
+    pub ended: Option<Outcome>,
     /// The Session became the human's Turn while another tab was displayed, and its tab
     /// hasn't been opened since.
     pub attention: bool,
@@ -177,29 +190,35 @@ impl PendingReview {
     /// stopped waiting for this call without an outcome.
     pub fn wait(self) -> Option<Outcome> {
         let outcome = self.receive();
-        self.ack();
+        if outcome.is_some() {
+            self.ack();
+        }
         outcome
     }
 
     /// `wait`, giving up after `timeout`.
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome> {
         let outcome = self.outcome.recv_timeout(timeout).ok();
-        self.ack();
+        if outcome.is_some() {
+            self.ack();
+        }
         outcome
     }
 
-    /// Blocks until the human acts, without acknowledging a Round: until `ack`, dropping this
-    /// call queues the Round again for the next one.
+    /// Blocks until the human acts, without acknowledging what it receives. For a call made
+    /// `with_ack`, dropping it before `ack` gives the Round or Verdict to the next call.
     pub fn receive(&self) -> Option<Outcome> {
         self.outcome.recv().ok()
     }
 
-    /// Confirms the agent got the Round received, which is then delivered for good.
+    /// Confirms the agent got what this call received, which is then delivered for good: a
+    /// Verdict ends the Session.
     pub fn ack(&self) {
         let waiter = self.call.waiter;
         self.call.with_session(|session| {
             if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                session.in_flight = None;
+                let (_, outcome) = session.in_flight.take().expect("checked");
+                session.delivered(&outcome);
             }
         });
     }
@@ -248,8 +267,13 @@ impl Call {
         let waiting = session.view.agent_waiting;
         f(session);
         session.view.agent_waiting = session.waiter.is_some();
-        if session.view.agent_waiting != waiting {
+        let changed = session.view.agent_waiting != waiting || session.finished;
+        inner.reap();
+        if changed {
             inner.notify();
+        } else {
+            // Nothing to show, but an ack or a requeue changes what's saved.
+            inner.save();
         }
     }
 }
@@ -262,8 +286,8 @@ impl Drop for PendingReview {
             // Received but not acknowledged: the agent may never have seen it. It goes to the
             // call waiting now, if any, or the next one.
             if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
-                let (_, round) = session.in_flight.take().expect("checked");
-                session.queued.insert(0, round);
+                let (_, outcome) = session.in_flight.take().expect("checked");
+                session.queued.insert(0, outcome);
                 session.deliver();
             }
         });
@@ -276,6 +300,8 @@ type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 struct Waiter {
     id: u64,
     outcome: Sender<Outcome>,
+    /// The call acknowledges what it receives.
+    ack: bool,
 }
 
 /// A Session as the service keeps it, and as the store saves it: every field but the waiter
@@ -290,10 +316,16 @@ struct Session {
     waiter: Option<Waiter>,
     /// Threads opened so far, for numbering the next one.
     threads_opened: u32,
-    /// Rounds handed over that no `review` call received yet, oldest first.
-    queued: Vec<Round>,
-    /// The Round a `review` call received but hasn't acknowledged yet, and that call's id.
-    in_flight: Option<(u64, Round)>,
+    /// Rounds handed over, then the Verdict (or Abandoned), that no `review` call received
+    /// yet, oldest first.
+    queued: Vec<Outcome>,
+    /// What a `review` call received but hasn't acknowledged yet, and that call's id.
+    in_flight: Option<(u64, Outcome)>,
+    /// The `last_round` each Round not yet delivered replaced, by Round number, to restore if
+    /// the human withdraws it.
+    replaced_last_rounds: Vec<(u32, Option<Changeset>)>,
+    /// The agent has its Verdict (or Abandoned): the Session is over.
+    finished: bool,
 }
 
 impl Session {
@@ -303,15 +335,29 @@ impl Session {
             return;
         }
         let Some(waiter) = self.waiter.take() else { return };
-        let round = self.queued.remove(0);
-        match waiter.outcome.send(Outcome::Round(round.clone())) {
+        let outcome = self.queued.remove(0);
+        match waiter.outcome.send(outcome.clone()) {
             Ok(()) => {
-                self.in_flight = Some((waiter.id, round));
-                self.view.turn = Turn::Agent;
                 self.view.agent_waiting = false;
+                if matches!(outcome, Outcome::Round(_)) {
+                    self.view.turn = Turn::Agent;
+                }
+                if waiter.ack {
+                    self.in_flight = Some((waiter.id, outcome));
+                } else {
+                    self.delivered(&outcome);
+                }
             }
-            // A waiter that went away without being dropped yet gives the Round back.
-            Err(_) => self.queued.insert(0, round),
+            // A waiter that went away without being dropped yet gives it back.
+            Err(mpsc::SendError(outcome)) => self.queued.insert(0, outcome),
+        }
+    }
+
+    /// The agent got `outcome` for good.
+    fn delivered(&mut self, outcome: &Outcome) {
+        match outcome {
+            Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
+            Outcome::Approved | Outcome::Abandoned => self.finished = true,
         }
     }
 }
@@ -360,6 +406,17 @@ impl Inner {
                 title: "Your Turn to review".into(),
                 body: format!("{repo} ({})", view.branch),
             });
+        }
+    }
+
+    /// Removes the Sessions whose agent got their Verdict (or Abandoned).
+    fn reap(&mut self) {
+        while let Some(at) = self.sessions.iter().position(|s| s.finished) {
+            let session = self.sessions.remove(at);
+            if self.displayed.as_ref() == Some(&session.view.id) {
+                self.displayed = None;
+            }
+            self.session_bases.remove(&(session.view.repo, session.view.branch));
         }
     }
 
@@ -429,11 +486,11 @@ impl Service {
         let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
         let bases: Vec<SessionBase> = bases;
         let session_bases = bases.into_iter().map(|b| ((b.repo, b.branch), b.tree)).collect();
-        // No `review` call survives a restart: a Round one received without acknowledging it
-        // goes to the next.
+        // No `review` call survives a restart: what one received without acknowledging it goes
+        // to the next.
         for session in &mut sessions {
-            if let Some((_, round)) = session.in_flight.take() {
-                session.queued.insert(0, round);
+            if let Some((_, outcome)) = session.in_flight.take() {
+                session.queued.insert(0, outcome);
             }
             session.view.agent_waiting = false;
         }
@@ -551,7 +608,7 @@ impl Service {
 
         let mut inner = self.lock();
         inner.next_waiter += 1;
-        let waiter = Waiter { id: inner.next_waiter, outcome: tx };
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
         let waiter_id = waiter.id;
         let existing = inner.sessions.iter().position(|s| s.view.repo == repo && s.view.branch == branch);
         let id = match existing {
@@ -606,6 +663,7 @@ impl Service {
                     agent_waiting: true,
                     threads: Vec::new(),
                     turn: Turn::Human,
+                    ended: None,
                     attention: false,
                     viewed: BTreeSet::new(),
                 };
@@ -615,6 +673,8 @@ impl Service {
                 id
             }
         };
+        // A Verdict waiting for this call ends the Session.
+        inner.reap();
         inner.notify();
         Ok(PendingReview {
             call: Call { session: id, waiter: waiter_id, inner: Arc::downgrade(&self.inner) },
@@ -656,6 +716,9 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
         if session.view.turn != Turn::Human {
             return Err(Error::NotYourTurn);
         }
@@ -682,9 +745,9 @@ impl Service {
         session.view.turn = Turn::Agent;
         session.view.since_last_round =
             Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
-        session.view.last_round = Some(session.view.changeset.clone());
-        let round = Round { number, threads };
-        session.queued.push(round);
+        let replaced = session.view.last_round.replace(session.view.changeset.clone());
+        session.replaced_last_rounds.push((number, replaced));
+        session.queued.push(Outcome::Round(Round { number, threads }));
         session.deliver();
         inner.notify();
         Ok(number)
@@ -696,11 +759,19 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
+        }
         if session.view.turn == Turn::Human {
             return Err(Error::AlreadyYourTurn);
         }
-        // Rounds no agent received yet go back to being Drafts, for the human to keep editing.
-        if let Some(first) = session.queued.first().map(|r| r.number) {
+        // Rounds no agent received yet go back to being Drafts, for the human to keep editing,
+        // and the last Round is the one before them again.
+        let first = session.queued.iter().find_map(|o| match o {
+            Outcome::Round(round) => Some(round.number),
+            _ => None,
+        });
+        if let Some(first) = first {
             session.queued.clear();
             for comment in session.view.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 if comment.author == Party::Human && comment.round.is_some_and(|n| n >= first) {
@@ -708,6 +779,15 @@ impl Service {
                 }
             }
             session.view.round = first;
+            if let Some(at) = session.replaced_last_rounds.iter().position(|(n, _)| *n == first) {
+                // The withdrawn Rounds' entries go too.
+                let (_, last_round) = session.replaced_last_rounds.drain(at..).next().expect("found at `at`");
+                session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
+                session.view.last_round = last_round;
+                if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {
+                    session.view.view = ChangesetView::Full;
+                }
+            }
         }
         inner.became_humans_turn(at);
         inner.notify();
@@ -731,7 +811,8 @@ impl Service {
         Ok(())
     }
 
-    /// Human: approves the Session, which ends it and returns the Verdict to the agent.
+    /// Human: approves the Session, which ends it and returns the Verdict to the agent. Only
+    /// on the human's Turn: during the agent's, take the Turn back first.
     pub fn approve(&self, id: &SessionId) -> Result<(), Error> {
         self.end(id, Outcome::Approved)
     }
@@ -741,18 +822,24 @@ impl Service {
         self.end(id, Outcome::Abandoned)
     }
 
+    /// Gives the agent `outcome`, which ends the Session once delivered. With no `review` call
+    /// waiting, the Session keeps it for the next one.
     fn end(&self, id: &SessionId, outcome: Outcome) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let session = inner.sessions.remove(at);
-        if inner.displayed.as_ref() == Some(id) {
-            inner.displayed = None;
+        let session = &mut inner.sessions[at];
+        if session.view.ended.is_some() {
+            return Err(Error::Ended);
         }
-        inner.session_bases.remove(&(session.view.repo.clone(), session.view.branch.clone()));
-        if let Some(waiter) = session.waiter {
-            // The agent may have gone away; the Session ends regardless.
-            let _ = waiter.outcome.send(outcome);
+        if outcome == Outcome::Approved && session.view.turn != Turn::Human {
+            return Err(Error::NotYourTurn);
         }
+        session.view.ended = Some(outcome.clone());
+        // It replaces any Round the agent hasn't received.
+        session.queued.clear();
+        session.queued.push(outcome);
+        session.deliver();
+        inner.reap();
         inner.notify();
         Ok(())
     }

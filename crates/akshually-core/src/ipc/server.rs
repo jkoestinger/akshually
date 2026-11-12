@@ -5,7 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, mpsc};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{LocalOptions, Outcome, Paths, ReviewRequest, Service};
+use crate::{LocalOptions, Paths, ReviewRequest, Service};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
@@ -88,7 +88,7 @@ impl Server {
         stream: &UnixStream,
         mut reader: BufReader<UnixStream>,
     ) {
-        let pending = match self.service.review(ReviewRequest { cwd, local }) {
+        let pending = match self.service.review(ReviewRequest { cwd, local, ack: true }) {
             Ok(pending) => pending,
             Err(error) => {
                 let _ = send(stream, Reply::Err(failed(error)));
@@ -111,11 +111,10 @@ impl Server {
             let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
             return;
         };
-        let round = matches!(outcome, Outcome::Round(_));
-        if send(stream, Reply::Ok(json(outcome))).is_err() || !round {
+        if send(stream, Reply::Ok(json(outcome))).is_err() {
             return;
         }
-        // Without the ack, dropping `pending` queues the Round again.
+        // Without the ack, dropping `pending` queues the Round or Verdict again.
         if let Ok(Some(line)) = client.recv()
             && matches!(parse(&line), Ok(Request::Ack))
         {

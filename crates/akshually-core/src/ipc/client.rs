@@ -29,8 +29,8 @@ pub struct Connection {
 
 impl Connection {
     /// Asks for review of the local work in `cwd` and blocks until the human answers, then
-    /// hands the outcome to `deliver` (which prints it). A Round is acknowledged only once
-    /// `deliver` succeeds; until then the app keeps it queued for the next `review` call.
+    /// hands the outcome to `deliver` (which prints it). It is acknowledged only once `deliver`
+    /// succeeds; until then the app keeps it for the next `review` call.
     pub fn review(
         mut self,
         cwd: &Path,
@@ -41,10 +41,8 @@ impl Connection {
         let mut reader = BufReader::new(self.stream.try_clone()?);
         let outcome: Outcome = read_reply(&mut reader)?;
         deliver(&outcome)?;
-        if matches!(outcome, Outcome::Round(_)) {
-            self.send(Request::Ack)?;
-            read_reply::<IgnoredAny>(&mut reader)?;
-        }
+        self.send(Request::Ack)?;
+        read_reply::<IgnoredAny>(&mut reader)?;
         Ok(outcome)
     }
 
