@@ -1,0 +1,26 @@
+[
+  {
+    "old_path": "src/a.rs",
+    "new_path": "src/a.rs",
+    "a_mode": "100644",
+    "b_mode": "100644",
+    "new_file": false,
+    "renamed_file": false,
+    "deleted_file": false,
+    "generated_file": false,
+    "too_large": false,
+    "collapsed": false,
+    "diff": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}\n"
+  },
+  {
+    "old_path": "docs/new.md",
+    "new_path": "docs/new.md",
+    "a_mode": "0",
+    "b_mode": "100644",
+    "new_file": true,
+    "renamed_file": false,
+    "deleted_file": false,
+    "generated_file": false,
+    "diff": "@@ -0,0 +1 @@\n+# New\n"
+  }
+]
