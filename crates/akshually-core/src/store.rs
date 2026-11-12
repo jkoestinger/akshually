@@ -1,5 +1,5 @@
 //! Persistence: one JSON file per open Session under the state directory, never inside the
-//! repository under Review.
+//! repository under Review, plus one file for the Session bases recorded by `start`.
 //!
 //! The store mirrors the service's Sessions after every change: it rewrites the files whose
 //! content changed and deletes the files of Sessions that ended. Whatever a Session serializes
@@ -21,18 +21,37 @@ pub(crate) struct Store {
     dir: PathBuf,
     /// A hash of each file as last written, so unchanged Sessions aren't rewritten.
     written: HashMap<SessionId, u64>,
+    /// The Session bases from `start`, which exist before their Session does.
+    bases: PathBuf,
+    bases_written: Option<u64>,
 }
 
 impl Store {
-    /// Opens the store under `state_dir`, creating it if needed, and loads its Sessions.
-    /// A file that can't be read is reported and left alone rather than stopping the app.
-    pub(crate) fn open<S: DeserializeOwned>(
+    /// Opens the store under `state_dir`, creating it if needed, and loads its Sessions and
+    /// Session bases. A file that can't be read is reported and left alone rather than
+    /// stopping the app.
+    pub(crate) fn open<S: DeserializeOwned, B: DeserializeOwned + Default>(
         state_dir: &Path,
         id: impl Fn(&S) -> &SessionId,
-    ) -> Result<(Store, Vec<S>), Error> {
+    ) -> Result<(Store, Vec<S>, B), Error> {
         let dir = state_dir.join("sessions");
         fs::create_dir_all(&dir)?;
-        let mut store = Store { dir, written: HashMap::new() };
+        let bases_path = state_dir.join("session-bases.json");
+        let mut store = Store { dir, written: HashMap::new(), bases: bases_path, bases_written: None };
+        let bases = match fs::read_to_string(&store.bases) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(bases) => {
+                    store.bases_written = Some(hash(&json));
+                    bases
+                }
+                Err(error) => {
+                    eprintln!("akshually: skipping unreadable {}: {error}", store.bases.display());
+                    B::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => B::default(),
+            Err(e) => return Err(e.into()),
+        };
         let mut sessions = Vec::new();
         for entry in fs::read_dir(&store.dir)? {
             let path = entry?.path();
@@ -50,7 +69,18 @@ impl Store {
                 Err(error) => eprintln!("akshually: skipping unreadable Session {}: {error}", path.display()),
             }
         }
-        Ok((store, sessions))
+        Ok((store, sessions, bases))
+    }
+
+    /// Saves the Session bases, if they changed since last time.
+    pub(crate) fn sync_bases<B: Serialize>(&mut self, bases: &B) -> Result<(), Error> {
+        let json = serde_json::to_string(bases).map_err(std::io::Error::from)?;
+        let hash = hash(&json);
+        if self.bases_written != Some(hash) {
+            write_atomically(&self.bases, &json)?;
+            self.bases_written = Some(hash);
+        }
+        Ok(())
     }
 
     /// Makes the files match `sessions`: writes new and changed ones, deletes ended ones.
@@ -83,15 +113,20 @@ impl Store {
         self.dir.join(format!("{id}.json"))
     }
 
-    /// Writes atomically, so a crash leaves either the old file or the new one.
     fn write(&self, id: &SessionId, json: &str) -> Result<(), Error> {
-        let tmp = self.dir.join(format!("{id}.json.tmp"));
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp, self.path(id))?;
-        Ok(())
+        write_atomically(&self.path(id), json)
     }
+}
+
+/// Writes through a temporary file, so a crash leaves either the old file or the new one.
+fn write_atomically(path: &Path, json: &str) -> Result<(), Error> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn hash(json: &str) -> u64 {

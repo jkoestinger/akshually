@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{Outcome, Paths};
+use crate::{LocalOptions, Outcome, Paths};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -29,8 +29,13 @@ pub struct Connection {
 
 impl Connection {
     /// Asks for review of the local work in `cwd` and blocks until the human answers.
-    pub fn review(self, cwd: &Path) -> Result<Outcome, ClientError> {
-        self.call(Request::Review { cwd: cwd.to_owned() })
+    pub fn review(self, cwd: &Path, local: LocalOptions) -> Result<Outcome, ClientError> {
+        self.call(Request::Review { cwd: cwd.to_owned(), local })
+    }
+
+    /// Records the Session base for the local work in `cwd`.
+    pub fn start(self, cwd: &Path) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::Start { cwd: cwd.to_owned() }).map(drop)
     }
 
     /// Test control: the app's pid and Sessions.
