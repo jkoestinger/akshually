@@ -21,7 +21,7 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PublishPlan,
-    ReviewRequest, Role, Service, SessionId, SessionView, Turn, Verdict,
+    ReviewRequest, Role, Service, SessionId, SessionView, Source, Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId};
@@ -54,6 +54,8 @@ pub enum Error {
     Ended,
     #[error("no Session for {} on branch {branch}; run `akshually review` first", repo.display())]
     NoSessionHere { repo: std::path::PathBuf, branch: String },
+    #[error("no Session for {0}; run `akshually review --pr {0}` first")]
+    NoPullRequestSession(String),
     #[error("no Thread {0} in this Session")]
     UnknownThread(ThreadId),
     #[error("{0} isn't in the Changeset")]

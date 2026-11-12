@@ -95,6 +95,7 @@ fn exit_code_reached_for(code: i32) -> Option<i32> {
             service.hand_over_round(id).unwrap();
         }),
         5 => co_review_published(),
+        6 => local_co_review_closed(),
         _ => None,
     }
 }
@@ -108,10 +109,22 @@ fn co_review_published() -> Option<i32> {
     finish(child).status.code()
 }
 
+/// Drafts on local work, runs `review` and lets the human close the co-review.
+fn local_co_review_closed() -> Option<i32> {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let drafted = app.akshually(repo.path(), &["draft", "--review", "Small."]).output().unwrap();
+    assert_eq!(drafted.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&drafted.stderr));
+    let child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.close(&session.id).unwrap();
+    finish(child).status.code()
+}
+
 #[test]
 fn every_exit_code_the_skill_documents_is_one_the_cli_exits_with() {
     let documented = documented_exit_codes();
-    assert_eq!(documented, BTreeSet::from([0, 1, 2, 3, 4, 5]), "every exit code the CLI has");
+    assert_eq!(documented, BTreeSet::from([0, 1, 2, 3, 4, 5, 6]), "every exit code the CLI has");
     for code in documented {
         assert_eq!(exit_code_reached_for(code), Some(code), "exit code {code}");
     }

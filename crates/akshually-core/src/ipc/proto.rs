@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Anchor, LocalOptions, SessionId, SessionView, ThreadId};
+use crate::{Anchor, LocalOptions, SessionId, SessionView, Source, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -32,10 +32,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pr: Option<String>,
     },
-    /// The co-Reviewer adds a Draft on the Pull Request `pr`, at `anchor`. Replies
-    /// `{"thread":"T1"}` once the Draft is in the Session.
+    /// The co-Reviewer adds a Draft at `anchor` on the Pull Request `pr`, or without one on
+    /// the local work in `cwd`. Replies `{"thread":"T1"}` once the Draft is in the Session.
     Draft {
-        pr: String,
+        #[serde(default)]
+        cwd: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr: Option<String>,
         anchor: Anchor,
         body: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,10 +48,22 @@ pub enum Request {
     Ack,
     /// Records the Session base; replies `{}` at once.
     Start { cwd: PathBuf },
-    /// The agent replies to a Thread in the Session for `cwd`. Replies `{}` at once.
-    Reply { cwd: PathBuf, thread: ThreadId, body: String },
-    /// The agent resolves a Thread in the Session for `cwd`. Replies `{}` at once.
-    Resolve { cwd: PathBuf, thread: ThreadId },
+    /// The agent replies to a Thread in the Session of the Pull Request `pr`, or without one
+    /// of the local work in `cwd`. Replies `{}` at once.
+    Reply {
+        cwd: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr: Option<String>,
+        thread: ThreadId,
+        body: String,
+    },
+    /// The agent resolves a Thread in the Session of `pr`, or of `cwd`. Replies `{}` at once.
+    Resolve {
+        cwd: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr: Option<String>,
+        thread: ThreadId,
+    },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
@@ -63,6 +78,15 @@ pub enum Request {
 pub enum HumanCommand {
     Approve { session: SessionId },
     Abandon { session: SessionId },
+}
+
+/// The Session an agent request names: the Pull Request `pr` if given, else the local work in
+/// `cwd`.
+pub fn source(cwd: PathBuf, pr: Option<String>) -> Source {
+    match pr {
+        Some(url) => Source::PullRequest(url),
+        None => Source::Local(cwd),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -51,14 +51,21 @@ impl Connection {
         self.wait(request, deliver)
     }
 
-    /// Adds a co-Reviewer Draft at `anchor` on the Pull Request at `url`, and returns its Thread.
-    pub fn draft(self, url: &str, anchor: Anchor, comment: NewComment) -> Result<ThreadId, ClientError> {
+    /// Adds a co-Reviewer Draft at `anchor` on the Pull Request at `pr`, or without one on the
+    /// local work in `cwd`, and returns its Thread.
+    pub fn draft(
+        self,
+        cwd: &Path,
+        pr: Option<&str>,
+        anchor: Anchor,
+        comment: NewComment,
+    ) -> Result<ThreadId, ClientError> {
         #[derive(serde::Deserialize)]
         struct Drafted {
             thread: ThreadId,
         }
         let NewComment { body, suggestion } = comment;
-        let request = Request::Draft { pr: url.to_owned(), anchor, body, suggestion };
+        let request = Request::Draft { cwd: cwd.to_owned(), pr: pr.map(Into::into), anchor, body, suggestion };
         self.call::<Drafted>(request).map(|d| d.thread)
     }
 
@@ -82,15 +89,18 @@ impl Connection {
         self.call::<IgnoredAny>(Request::Start { cwd: cwd.to_owned() }).map(drop)
     }
 
-    /// Replies to `thread` in the Session for `cwd`, as the agent.
-    pub fn reply(self, cwd: &Path, thread: &ThreadId, body: &str) -> Result<(), ClientError> {
-        let request = Request::Reply { cwd: cwd.to_owned(), thread: thread.clone(), body: body.to_owned() };
-        self.call::<IgnoredAny>(request).map(drop)
+    /// Replies to `thread` in the Session of the Pull Request `pr`, or without one of `cwd`,
+    /// as the agent.
+    pub fn reply(self, cwd: &Path, pr: Option<&str>, thread: &ThreadId, body: &str) -> Result<(), ClientError> {
+        let (cwd, pr, thread, body) = (cwd.to_owned(), pr.map(Into::into), thread.clone(), body.to_owned());
+        self.call::<IgnoredAny>(Request::Reply { cwd, pr, thread, body }).map(drop)
     }
 
-    /// Resolves `thread` in the Session for `cwd`, as the agent.
-    pub fn resolve(self, cwd: &Path, thread: &ThreadId) -> Result<(), ClientError> {
-        self.call::<IgnoredAny>(Request::Resolve { cwd: cwd.to_owned(), thread: thread.clone() }).map(drop)
+    /// Resolves `thread` in the Session of the Pull Request `pr`, or without one of `cwd`, as
+    /// the agent.
+    pub fn resolve(self, cwd: &Path, pr: Option<&str>, thread: &ThreadId) -> Result<(), ClientError> {
+        let (cwd, pr, thread) = (cwd.to_owned(), pr.map(Into::into), thread.clone());
+        self.call::<IgnoredAny>(Request::Resolve { cwd, pr, thread }).map(drop)
     }
 
     /// Test control: the app's pid and Sessions.
