@@ -3,6 +3,7 @@
 mod launch;
 mod render;
 
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -139,16 +140,22 @@ fn start() -> Result<ExitCode> {
 
 fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local)?;
+    // Printed and flushed before the app hears back, so the outcome is acknowledged only once
+    // the agent can see it.
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, |outcome| {
+        let text = match format {
+            Format::Markdown => render::outcome_markdown(outcome),
+            Format::Json => format!("{}\n", serde_json::to_string(outcome).map_err(io::Error::other)?),
+        };
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(text.as_bytes())?;
+        stdout.flush()
+    })?;
     let code = match outcome {
         Outcome::Round(_) => exit::ROUND,
         Outcome::Approved => exit::APPROVED,
         Outcome::Abandoned => exit::ABANDONED,
     };
-    match format {
-        Format::Markdown => print!("{}", render::outcome_markdown(&outcome)),
-        Format::Json => println!("{}", serde_json::to_string(&outcome).context("can't print the outcome as JSON")?),
-    }
     Ok(ExitCode::from(code))
 }
 

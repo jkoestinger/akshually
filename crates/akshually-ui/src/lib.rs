@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Party, Service, SessionId, SessionView, Side,
-    Thread, ThreadId, Turn,
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, Service, SessionId,
+    SessionView, Side, Thread, ThreadId, Turn,
 };
 use rune::{AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
-use rune_kit::{Badge, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -422,6 +422,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .child(row().key("tabbar").h(40.0).w_full().child(tabs))
                 .child(session_header(k, tab))
+                .children(turn_banner(k, &tab.session))
                 .child(disk_banner(k, tab))
                 .child(general_threads(k, s, tab))
                 .child(outdated_threads(k, tab))
@@ -461,7 +462,22 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         "since Session base".to_owned()
     };
     let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let take_back_id = session.id.clone();
     let drafts = tab.to_hand_over();
+    let yours = session.turn == Turn::Human;
+    let turn = Badge::new(if yours { "Your Turn" } else { "Agent's Turn" });
+    // During the agent's Turn the Verdict waits: take the Turn back first (or abandon).
+    let decide = if yours {
+        Button::new("Approve")
+            .variant(ButtonVariant::Contrast)
+            .on_press(move |s: &mut State| s.act(&approve_id, Service::approve))
+            .build(k)
+    } else {
+        Button::new("Take Turn back")
+            .variant(ButtonVariant::Outline)
+            .on_press(move |s: &mut State| s.act(&take_back_id, Service::take_turn_back))
+            .build(k)
+    };
     let views = [
         ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
         ("Since Session base", ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
@@ -489,6 +505,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
         .child(text(base).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
+        .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
         .children(toggle)
         .child(
@@ -503,16 +520,11 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 .on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
                 .build(k),
         )
-        .child(
-            Button::new("Approve")
-                .variant(ButtonVariant::Contrast)
-                .on_press(move |s: &mut State| s.act(&approve_id, Service::approve))
-                .build(k),
-        )
+        .child(decide)
         .child(
             Button::new(if drafts == 0 { "Hand over Round".to_owned() } else { format!("Hand over Round ({drafts})") })
                 .variant(ButtonVariant::Submit)
-                .disabled(drafts == 0)
+                .disabled(drafts == 0 || !yours)
                 .on_press(move |s: &mut State| {
                     if let Err(error) = s.service.hand_over_round(&hand_over_id) {
                         eprintln!("akshually: {error}");
@@ -520,6 +532,36 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 })
                 .build(k),
         )
+}
+
+/// During the agent's Turn: what the human can still do. Once ended: that the agent hasn't
+/// collected the outcome yet.
+fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
+    let note = match &session.ended {
+        Some(Outcome::Approved) => {
+            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session.".to_owned()
+        }
+        Some(_) => {
+            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
+        }
+        None if session.turn == Turn::Agent => format!(
+            "Waiting for the agent to answer Round {}. You can keep reading and drafting: new Drafts go out with \
+             Round {}.",
+            session.round.saturating_sub(1),
+            session.round
+        ),
+        None => return None,
+    };
+    Some(
+        row()
+            .key("turn-banner")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(note).font(k.ty.small).color(k.c.text_muted).wrap()),
+    )
 }
 
 /// Offers the files that changed on disk during the human's Turn as a reload; the diff stays
@@ -923,6 +965,8 @@ fn scene_session(s: &mut State) {
         view: ChangesetView::Full,
         viewed: ["src/round.rs".to_owned()].into(),
         round: 2,
+        agent_waiting: true,
+        ended: None,
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
@@ -981,6 +1025,8 @@ fn scene_threads(s: &mut State) {
         view: ChangesetView::Full,
         viewed: Default::default(),
         turn: Turn::Human,
+        agent_waiting: true,
+        ended: None,
         attention: false,
         changed_on_disk: ["src/round.rs".to_owned(), "src/session.rs".to_owned()].into(),
         round: 1,
