@@ -234,6 +234,8 @@ pub enum ForgeError {
     Http { host: String, message: String },
     #[error("unexpected answer from {host}: {message}")]
     Unexpected { host: String, message: String },
+    #[error("akshually can't {what} on {host} yet")]
+    Unsupported { host: String, what: &'static str },
 }
 
 /// The adapters for github.com and every configured host (`Settings::hosts`).

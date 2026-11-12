@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitLab, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, adapters,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, adapters,
 };
-use akshually_core::{Anchor, BinarySizes, FileChange, Party, Service, Settings, Side};
+use akshually_core::{Anchor, BinarySizes, FileChange, Party, Service, Settings, Side, Verdict};
 use akshually_testkit::TestDirs;
 use mockito::{Matcher, Mock, Server, ServerGuard};
 
@@ -508,6 +508,23 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
     assert_eq!(thread.anchor, Anchor::lines(Side::New, "src/a.rs", 1..=1));
     assert_eq!(thread.excerpt, "fn a2() {}\n");
     assert_eq!(thread.comments[0].author, Party::Other("lee".into()));
+}
+
+#[test]
+fn publishing_to_gitlab_is_refused_without_sending_anything() {
+    let mut h = Harness::new();
+    let sent: Vec<Mock> =
+        ["GET", "POST", "PUT"].map(|method| h.server.mock(method, Matcher::Any).expect(0).create()).into();
+    let gitlab = h.gitlab();
+    let review = Review { verdict: Verdict::Feedback, body: "Looks good.".into(), comments: Vec::new() };
+
+    let verdicts = gitlab.verdicts(&rotate_creds()).unwrap_err();
+    let published = gitlab.publish(&rotate_creds(), &review).unwrap_err();
+
+    sent.iter().for_each(Mock::assert);
+    for error in [verdicts, published] {
+        assert!(matches!(&error, ForgeError::Unsupported { host, .. } if host == "gitlab.example.com"), "{error:?}");
+    }
 }
 
 #[test]

@@ -12,10 +12,10 @@ use url::Url;
 
 use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
 use super::{epoch_seconds, file_change};
-use crate::{Changeset, Side};
+use crate::{Changeset, Side, Verdict};
 
 /// Pages of up to this many items, GitLab's maximum.
 const PAGE: &str = "100";
@@ -367,6 +367,15 @@ impl ForgeAdapter for GitLab {
         let discussions: Vec<Discussion> =
             self.pages(self.merge_request_url(&pr.id, &["discussions"])).map_err(|e| self.not_found_as(e, &pr.id))?;
         Ok(discussions.into_iter().filter_map(|d| d.into_remote(&pr.head_sha)).collect())
+    }
+
+    // Publishing to GitLab (draft notes, then bulk publish and approve) is ticket #28.
+    fn verdicts(&self, _pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host.host.clone(), what: "publish a review" })
+    }
+
+    fn publish(&self, _pr: &PullRequest, _review: &Review) -> Result<String, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host.host.clone(), what: "publish a review" })
     }
 
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
