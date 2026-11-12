@@ -4,6 +4,7 @@
 //! the CLI, which talks to the running app over the local channel in [`ipc`] (ADR 0002).
 
 mod changeset;
+pub mod forge;
 pub mod git;
 pub mod ipc;
 mod notifier;
@@ -56,4 +57,8 @@ pub enum Error {
     UnknownThread(ThreadId),
     #[error("{0} isn't in the Changeset")]
     NotInChangeset(String),
+    #[error("{0} isn't a Pull Request on any configured Forge")]
+    NotAPullRequest(String),
+    #[error(transparent)]
+    Forge(#[from] forge::ForgeError),
 }

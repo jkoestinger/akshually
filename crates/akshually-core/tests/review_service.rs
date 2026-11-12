@@ -973,7 +973,7 @@ fn an_agent_reply_shows_in_its_thread_attributed_to_the_agent() {
     svc.reply(repo.path(), &ThreadId::new("T1"), "Renamed for clarity.").unwrap();
 
     let thread = &svc.session(&id).unwrap().threads[0];
-    let comments: Vec<_> = thread.comments.iter().map(|c| (c.author, c.body.as_str(), c.round)).collect();
+    let comments: Vec<_> = thread.comments.iter().map(|c| (c.author.clone(), c.body.as_str(), c.round)).collect();
     assert_eq!(
         comments,
         vec![(Party::Human, "Why rename?", Some(1)), (Party::Agent, "Renamed for clarity.", Some(2))],
@@ -1035,7 +1035,7 @@ fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_any_thread() {
 
     svc.resolve_thread(&id, &ThreadId::new("T1")).unwrap();
     svc.resolve_thread(&id, &ThreadId::new("T2")).unwrap();
-    let resolved: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.resolved).collect();
+    let resolved: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.resolved.clone()).collect();
     assert_eq!(resolved, vec![Some(Party::Human), Some(Party::Human)]);
     assert!(svc.resolve_thread(&id, &ThreadId::new("T9")).is_err());
 }
@@ -1053,7 +1053,7 @@ fn a_human_reply_in_a_thread_is_a_draft_that_goes_out_with_the_next_round() {
 
     let thread = svc.session(&id).unwrap().threads.remove(0);
     let last = thread.comments.last().unwrap();
-    assert_eq!((last.author, last.body.as_str(), last.is_draft()), (Party::Human, "Clearer how?", true));
+    assert_eq!((last.author.clone(), last.body.as_str(), last.is_draft()), (Party::Human, "Clearer how?", true));
     assert_eq!(second.wait_timeout(Duration::from_millis(50)), None, "a Draft doesn't reach the agent");
 
     svc.hand_over_round(&id).unwrap();
@@ -1061,7 +1061,8 @@ fn a_human_reply_in_a_thread_is_a_draft_that_goes_out_with_the_next_round() {
     let round2 = round(second.wait_timeout(Duration::from_secs(1)));
     assert_eq!(round2.threads.len(), 1);
     assert_eq!(round2.threads[0].id, t1);
-    let sent: Vec<_> = round2.threads[0].comments.iter().map(|c| (c.author, c.body.as_str(), c.round)).collect();
+    let sent: Vec<_> =
+        round2.threads[0].comments.iter().map(|c| (c.author.clone(), c.body.as_str(), c.round)).collect();
     assert_eq!(sent, vec![(Party::Human, "Clearer how?", Some(2))], "only what this Round carries");
 }
 
@@ -1161,7 +1162,7 @@ fn a_handed_over_round_carries_whether_each_thread_is_resolved() {
 
     let round2 = round(second.wait_timeout(Duration::from_secs(1)));
     assert_eq!(
-        round2.threads.iter().map(|t| (t.id.as_str(), t.resolved)).collect::<Vec<_>>(),
+        round2.threads.iter().map(|t| (t.id.as_str(), t.resolved.clone())).collect::<Vec<_>>(),
         vec![("T2", Some(Party::Human))]
     );
 }

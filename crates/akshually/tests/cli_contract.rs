@@ -188,7 +188,10 @@ fn reply_and_resolve_act_on_the_session_for_this_branch_and_return_at_once() {
     assert_eq!(replied.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&replied.stderr));
     assert_eq!(resolved.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&resolved.stderr));
     let thread = &app.service.session(&session).unwrap().threads[0];
-    assert_eq!(thread.comments.last().map(|c| (c.author, c.body.as_str())), Some((Party::Agent, "Dropped it.")));
+    assert_eq!(
+        thread.comments.last().map(|c| (c.author.clone(), c.body.as_str())),
+        Some((Party::Agent, "Dropped it."))
+    );
     assert_eq!(thread.resolved, Some(Party::Agent));
 }
 

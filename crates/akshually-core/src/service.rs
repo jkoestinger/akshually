@@ -10,9 +10,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
+use crate::forge::{ForgeAdapter, PullRequest};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
+
+mod pull_request;
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,9 +111,12 @@ impl ReviewRequest {
 #[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
-    /// The working tree root: each worktree is its own Session.
+    /// The working tree root: each worktree is its own Session. Empty for a Pull Request.
     pub repo: PathBuf,
+    /// The branch under Review; a Pull Request's head branch.
     pub branch: String,
+    /// The Pull Request under Review, which is the Session's identity; `None` for local work.
+    pub pull_request: Option<PullRequest>,
     /// The full Changeset.
     pub changeset: Changeset,
     /// The Round being drafted: 1 until the first handover, then one more after each.
@@ -498,9 +504,12 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 
 #[derive(Default)]
 pub struct Service {
+    // One lock for Sessions and subscribers, so subscribers see changes in order.
     // One lock for Sessions and subscribers, so subscribers see changes in order. Shared with
     // each PendingReview, which frees its Session when dropped.
     inner: Arc<Mutex<Inner>>,
+    /// One per Forge host, asked in order which one serves a Pull Request URL.
+    forges: Vec<Box<dyn ForgeAdapter>>,
 }
 
 impl Service {
@@ -526,7 +535,7 @@ impl Service {
             session.view.agent_waiting = false;
         }
         let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
-        Ok(Service { inner: Arc::new(Mutex::new(inner)) })
+        Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
     }
 
     /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
@@ -670,6 +679,7 @@ impl Service {
                     id: id.clone(),
                     repo,
                     branch,
+                    pull_request: None,
                     changeset,
                     since_session_base,
                     last_round: None,
@@ -705,6 +715,9 @@ impl Service {
         let (repo, local, settings, session_base) = {
             let inner = self.lock();
             let session = &inner.sessions[inner.position(id)?];
+            if session.view.pull_request.is_some() {
+                return Err(Error::InvalidRequest("a Pull Request reloads from its Forge, not from disk".into()));
+            }
             let key = (session.view.repo.clone(), session.view.branch.clone());
             (key.0.clone(), session.local.clone(), inner.settings.clone(), inner.session_bases.get(&key).cloned())
         };
@@ -737,7 +750,8 @@ impl Service {
             let checks: Vec<_> = inner
                 .sessions
                 .iter()
-                .filter(|s| s.view.turn == Turn::Human)
+                // A Pull Request has no files on disk.
+                .filter(|s| s.view.turn == Turn::Human && s.view.pull_request.is_none())
                 .map(|s| {
                     let key = (s.view.repo.clone(), s.view.branch.clone());
                     (s.view.id.clone(), s.local.clone(), inner.session_bases.get(&key).cloned(), key.0)

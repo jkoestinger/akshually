@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::forge::HostConfig;
+
 /// The human's settings. Keys missing from the config file keep their defaults.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -11,6 +13,8 @@ pub struct Settings {
     /// Whether a local Changeset includes untracked, non-ignored files. A `review` call can
     /// override it.
     pub untracked: bool,
+    /// Forge hosts beyond github.com, each with an optional pasted token (`[[hosts]]`).
+    pub hosts: Vec<HostConfig>,
     /// Whether a Session that becomes the human's Turn while the window is unfocused shows an
     /// OS desktop notification.
     pub notifications: bool,
@@ -18,7 +22,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { untracked: true, notifications: true }
+        Settings { untracked: true, notifications: true, hosts: Vec::new() }
     }
 }
 

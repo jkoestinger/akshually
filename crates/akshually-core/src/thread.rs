@@ -117,11 +117,13 @@ pub struct Thread {
 }
 
 /// Who wrote a Comment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Party {
     Human,
     Agent,
+    /// Someone on the Forge, by login: a Comment that was on the Pull Request already.
+    Other(String),
 }
 
 /// A single message inside a Thread.
@@ -130,8 +132,9 @@ pub struct Comment {
     pub author: Party,
     /// Markdown.
     pub body: String,
-    /// The Round that carried it to the other side; `None` while it's a Draft. An agent's
-    /// reply, which the human sees at once, counts towards the Round being drafted.
+    /// The Round that carried it to the other side; `None` while it's a Draft, and for a
+    /// Comment that was on the Forge already. An agent's reply, which the human sees at once,
+    /// counts towards the Round being drafted.
     pub round: Option<u32>,
     /// Code proposed to replace the Thread's anchored lines (always new-side lines), whole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +143,7 @@ pub struct Comment {
 
 impl Comment {
     pub fn is_draft(&self) -> bool {
-        self.round.is_none()
+        self.round.is_none() && !matches!(self.author, Party::Other(_))
     }
 }
 

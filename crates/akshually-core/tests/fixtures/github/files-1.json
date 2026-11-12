@@ -1,0 +1,4 @@
+[
+  { "filename": "src/a.rs", "status": "modified", "additions": 1, "deletions": 1, "patch": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" },
+  { "filename": "docs/new.md", "status": "added", "additions": 1, "deletions": 0, "patch": "@@ -0,0 +1 @@\n+# New" }
+]

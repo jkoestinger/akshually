@@ -9,10 +9,10 @@ use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, Service, SessionId,
     SessionView, Side, Thread, ThreadId, Turn,
 };
-use rune::{AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
+use rune::{AppHandle, AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea};
+use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea, TextInput};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -49,6 +49,8 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         // Notifications are for when the human looks elsewhere.
         .on_focus(|s: &mut State, focused, _| s.service.set_window_focused(focused));
     let handle = app.handle();
+    let own = handle.clone();
+    handle.update(move |s: &mut State, _| s.handle = Some(own));
     service.subscribe(move |sessions| {
         let sessions = sessions.to_vec();
         let any = !sessions.is_empty();
@@ -68,6 +70,11 @@ struct State {
     /// The Comment being written, at most one in the window.
     composer: Option<Composer>,
     composer_text: TextEdit,
+    /// The "Open a Pull Request by URL" field, and what became of the last URL opened.
+    pr_url: TextEdit,
+    pr_status: Option<String>,
+    /// For work off the UI thread to report back; `None` in headless renders.
+    handle: Option<AppHandle<State>>,
     /// The Thread a reply is being written in, at most one in the window.
     reply: Option<(SessionId, ThreadId)>,
     reply_text: TextEdit,
@@ -128,6 +135,9 @@ impl SessionTab {
     }
 
     fn title(&self) -> String {
+        if let Some(pr) = &self.session.pull_request {
+            return format!("{} #{}", pr.id.repo, pr.id.number);
+        }
         let repo = self
             .session
             .repo
@@ -220,6 +230,9 @@ impl State {
             active: None,
             composer: None,
             composer_text: TextEdit::new(""),
+            pr_url: TextEdit::new(""),
+            pr_status: None,
+            handle: None,
             reply: None,
             reply_text: TextEdit::new(""),
         };
@@ -264,6 +277,34 @@ impl State {
             } else {
                 self.active = None;
             }
+        }
+    }
+
+    /// Opens the Pull Request in the URL field off the UI thread (the Forge may be slow); the
+    /// service then displays its Session.
+    fn open_pull_request(&mut self) {
+        let url = self.pr_url.text.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        self.pr_status = Some("Opening…".to_owned());
+        let service = self.service.clone();
+        let opened = |s: &mut State, result: Result<SessionId, akshually_core::Error>| match result {
+            Ok(id) => {
+                s.open_tab(id);
+                s.pr_url = TextEdit::new("");
+                s.pr_status = None;
+            }
+            Err(error) => s.pr_status = Some(error.to_string()),
+        };
+        match self.handle.clone() {
+            Some(handle) => {
+                std::thread::spawn(move || {
+                    let result = service.open_pull_request(&url);
+                    handle.update(move |s: &mut State, _| opened(s, result));
+                });
+            }
+            None => opened(self, service.open_pull_request(&url)),
         }
     }
 
@@ -420,7 +461,16 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .w_full()
                 .h_full()
                 .min_h(0.0)
-                .child(row().key("tabbar").h(40.0).w_full().child(tabs))
+                .child(
+                    row()
+                        .h(40.0)
+                        .w_full()
+                        .gap(8.0)
+                        .pr(8.0)
+                        .items_center()
+                        .child(row().key("tabbar").h(40.0).grow(1.0).min_w(0.0).child(tabs))
+                        .child(pull_request_opener(k, s)),
+                )
                 .child(session_header(k, tab))
                 .children(turn_banner(k, &tab.session))
                 .child(disk_banner(k, tab))
@@ -428,15 +478,68 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(outdated_threads(k, tab))
                 .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab)))
         }
-        None => col().w_full().h_full().items_center().justify_center().child(
-            text("No Sessions. Run `akshually review` in a repository to ask for a review.")
+        None => col()
+            .w_full()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .gap(16.0)
+            .child(
+                text(
+                    "No Sessions. Run `akshually review` in a repository to ask for a review, or open a Pull Request.",
+                )
                 .font(k.ty.ui)
                 .color(k.c.text_muted),
-        ),
+            )
+            .child(pull_request_opener(k, s)),
     };
     rune_kit::root(body.fill(k.c.bg_base), layer)
 }
 
+fn pull_request_opener(k: &Kit, s: &State) -> El {
+    let field = TextInput::new(&s.pr_url)
+        .placeholder("Open a Pull Request by URL…")
+        .width(Some(360.0))
+        .on_edit(|s: &mut State| &mut s.pr_url)
+        .on_submit(|s: &mut State, _| s.open_pull_request())
+        .build(k);
+    let status = s.pr_status.clone().map(|status| text(status).font(k.ty.small).color(k.c.text_muted));
+    row().gap(8.0).items_center().children(status).child(field)
+}
+
+/// A Pull Request Session's header. Its Drafts stay in the Session until Publish.
+fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
+    let session = &tab.session;
+    let base = &session.changeset.base[..session.changeset.base.len().min(8)];
+    let close_id = session.id.clone();
+    row()
+        .key("session-header")
+        .w_full()
+        .h(56.0)
+        .px(16.0)
+        .gap(12.0)
+        .items_center()
+        .fill(k.c.layer_01)
+        .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
+        .child(text(format!("{} · {} → {base}", pr.author, session.branch)).font(k.ty.mono).color(k.c.text_muted))
+        .child(row().grow(1.0))
+        .child(Badge::new(format!("{} Drafts", tab.to_hand_over())).build(k))
+        .child(
+            Button::new("Comment on Review")
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut State| s.compose_general(None))
+                .build(k),
+        )
+        .child(
+            Button::new("Close")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.act(&close_id, Service::abandon))
+                .build(k),
+        )
+}
+
+/// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
+/// working indicator during the agent's Turn.
 /// The tab's marker: attention when the Session became the human's Turn unseen, a dot when
 /// files changed on disk, a quiet working indicator during the agent's Turn.
 fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
@@ -453,6 +556,9 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
+    if let Some(pr) = &session.pull_request {
+        return pull_request_header(k, tab, pr);
+    }
     let shown = session.shown();
     let base = if shown == &session.changeset {
         format!("→ {}", &shown.base[..shown.base.len().min(8)])
@@ -695,11 +801,12 @@ fn resolve_button(k: &Kit, thread: &Thread, session: SessionId) -> Option<El> {
 }
 
 /// `Resolved by agent · `, or nothing for an open Thread.
-fn resolved_by(thread: &Thread) -> &'static str {
-    match thread.resolved {
-        Some(Party::Agent) => "✓ Resolved by agent · ",
-        Some(Party::Human) => "✓ Resolved by you · ",
-        None => "",
+fn resolved_by(thread: &Thread) -> String {
+    match &thread.resolved {
+        Some(Party::Agent) => "✓ Resolved by agent · ".to_owned(),
+        Some(Party::Human) => "✓ Resolved by you · ".to_owned(),
+        Some(Party::Other(login)) => format!("✓ Resolved by {login} · "),
+        None => String::new(),
     }
 }
 
@@ -741,12 +848,14 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, SessionId)>) -
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
     for comment in &thread.comments {
-        let who = match comment.author {
+        let who = match &comment.author {
             Party::Human => "You",
             Party::Agent => "Agent",
+            Party::Other(login) => login,
         };
         let when = match comment.round {
-            None => "Draft · goes out with your next Round".to_owned(),
+            None if comment.is_draft() => "Draft · goes out with your next Round".to_owned(),
+            None => "on the Pull Request".to_owned(),
             Some(round) => format!("Round {round}"),
         };
         card = card
@@ -958,6 +1067,7 @@ fn scene_session(s: &mut State) {
         id: SessionId::new("sample"),
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
+        pull_request: None,
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
         last_round: None,
@@ -983,6 +1093,7 @@ fn scene_session(s: &mut State) {
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
         branch: branch.into(),
+        pull_request: None,
         round: 1,
         threads: Vec::new(),
         turn,
@@ -1018,6 +1129,7 @@ fn scene_threads(s: &mut State) {
         id: SessionId::new("sample"),
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
+        pull_request: None,
         changeset: sample_changeset(),
         since_session_base: None,
         last_round: None,

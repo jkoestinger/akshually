@@ -1,0 +1,4 @@
+[
+  { "filename": "old.txt", "status": "removed", "additions": 0, "deletions": 1, "patch": "@@ -1 +0,0 @@\n-bye" },
+  { "filename": "lib/b.rs", "previous_filename": "src/b.rs", "status": "renamed", "additions": 0, "deletions": 0 }
+]

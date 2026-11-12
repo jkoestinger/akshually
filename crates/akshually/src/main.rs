@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use akshually_core::ipc::{BindError, Connection, Server};
-use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings, ThreadId};
+use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings, ThreadId, forge};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -188,7 +188,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     let paths = Paths::from_env();
     // Only reads the saved Sessions: it writes nothing until a Session changes, which a
     // second instance never sees, since it quits below.
-    let service = Service::open(&paths.state)?;
+    let forges = forge::adapters(&settings.hosts, &forge::CredentialSources::from_env());
+    let service = Service::open(&paths.state)?.with_forges(forges);
     // No window means nothing to notify about, and tests never show real notifications.
     let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);

@@ -1,0 +1,29 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": { "hasNextPage": false, "endCursor": "CURSOR2" },
+          "nodes": [
+            {
+              "id": "PRRT_3", "isResolved": false, "isOutdated": true, "path": "src/a.rs", "subjectType": "LINE",
+              "line": null, "originalLine": 7, "startLine": null, "originalStartLine": 6,
+              "diffSide": "RIGHT", "startDiffSide": "RIGHT",
+              "comments": { "nodes": [
+                { "body": "Typo here.", "author": { "login": "lee" }, "diffHunk": "@@ -5,3 +5,3 @@\n+fn typo() {}" }
+              ] }
+            },
+            {
+              "id": "PRRT_4", "isResolved": false, "isOutdated": false, "path": "docs/new.md", "subjectType": "FILE",
+              "line": null, "originalLine": null, "startLine": null, "originalStartLine": null,
+              "diffSide": "RIGHT", "startDiffSide": null,
+              "comments": { "nodes": [
+                { "body": "Link this from the README.", "author": { "login": "sam" }, "diffHunk": "" }
+              ] }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
