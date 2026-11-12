@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, FileChange, Party, Service, SessionId, SessionView, Side, Thread,
-    ThreadId,
+    ThreadId, Turn,
 };
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
-use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
+use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{Badge, Button, ButtonVariant, Kit, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -229,8 +229,20 @@ impl State {
         }
         self.annotate();
         if self.active_tab().is_none() {
-            self.active = self.tabs.first().map(|t| t.session.id.clone());
+            // The displayed Session ended (or none was): open the first tab, if any.
+            if let Some(id) = self.tabs.first().map(|t| t.session.id.clone()) {
+                self.open_tab(id);
+            } else {
+                self.active = None;
+            }
         }
+    }
+
+    /// Shows the Session's tab and tells the service, which clears its attention.
+    fn open_tab(&mut self, id: SessionId) {
+        // The Session may have ended meanwhile; its tab goes with the next update.
+        let _ = self.service.display(&id);
+        self.active = Some(id);
     }
 
     fn show(&self, id: &SessionId, view: ChangesetView) {
@@ -306,12 +318,18 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         Some(tab) => {
             let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
                 .tabs(s.tabs.iter().map(|t| {
-                    TabItem::new(t.session.id.as_str(), t.title()).icon(&rune_kit::glyphs::FILE_CODE).closable(false)
+                    TabItem::new(t.session.id.as_str(), t.title())
+                        .icon(&rune_kit::glyphs::FILE_CODE)
+                        .closable(false)
+                        .status(tab_status(&t.session))
                 }))
                 .active(s.active.as_ref().map(SessionId::as_str))
                 .viewport_width(cx.layout_size("tabbar").map(|z| z[0]))
                 .on_select(|s: &mut State, id: &str, _| {
-                    s.active = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone());
+                    if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone())
+                    {
+                        s.open_tab(id);
+                    }
                 })
                 .build_layered(k, &mut layer);
             col()
@@ -329,6 +347,18 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         ),
     };
     rune_kit::root(body.fill(k.c.bg_base), layer)
+}
+
+/// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
+/// working indicator during the agent's Turn.
+fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
+    if session.attention {
+        Some(TabItemStatus::Attention)
+    } else if session.turn == Turn::Agent {
+        Some(TabItemStatus::Busy)
+    } else {
+        None
+    }
 }
 
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
@@ -540,7 +570,8 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     s.active_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
 }
 
-/// `--scene session`: a sample Session, for headless renders.
+/// `--scene session`: a sample Session, plus tabs for an unseen human's Turn and an agent's
+/// Turn, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {
@@ -556,13 +587,26 @@ fn scene_session(s: &mut State) {
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
             sample_thread("T3", 1..=1, "Rename `turn` to `whose_turn`?", Some(1)),
         ],
+        turn: Turn::Human,
+        attention: false,
     };
     let mut session = session;
     let agent = |body: &str| akshually_core::Comment { author: Party::Agent, body: body.into(), round: Some(2) };
     session.threads[0].comments.push(agent("Done: the snapshot is taken first."));
     session.threads[2].comments.push(agent("Renamed."));
     session.threads[2].resolved = Some(Party::Agent);
-    s.apply(vec![session]);
+    let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
+        id: SessionId::new(id),
+        branch: branch.into(),
+        round: 1,
+        threads: Vec::new(),
+        turn,
+        attention,
+        ..session.clone()
+    };
+    let unseen = other("unseen", "fix/inbox-refresh", Turn::Human, true);
+    let working = other("working", "feat/publish", Turn::Agent, false);
+    s.apply(vec![session, unseen, working]);
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {

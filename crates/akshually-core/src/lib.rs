@@ -13,7 +13,7 @@ mod thread;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
 pub use paths::Paths;
-pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn};
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
 
