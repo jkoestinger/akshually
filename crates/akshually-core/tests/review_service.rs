@@ -751,3 +751,123 @@ fn a_round_never_acknowledged_goes_to_the_review_already_waiting() {
     assert_eq!(round(second.wait_timeout(Duration::from_secs(1))).number, 1);
     assert_eq!(svc.session(&id).unwrap().turn, Turn::Agent);
 }
+
+/// A Session in its second Round: the agent changed `lib.rs` and `other.rs` for Round 1, then,
+/// in response, changed `lib.rs` again and added `extra.rs` before calling `review` again.
+fn second_round(svc: &Service) -> (TestRepo, akshually_core::PendingReview) {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "fn a() {}\n").write("other.rs", "fn o() {}\n").commit_all("base");
+    repo.branch("agent").write("lib.rs", "fn a() {}\nfn d() {}\n").write("other.rs", "fn o2() {}\n");
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Add a test for d").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+    repo.write("lib.rs", "fn a() {}\nfn d() {}\n#[test]\nfn d_works() {}\n").write("extra.rs", "fn e() {}\n");
+    repo.git(&["add", "extra.rs"]);
+    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    (repo, second)
+}
+
+#[test]
+fn files_can_be_ticked_as_viewed_and_unticked() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session();
+
+    svc.mark_viewed(id, "lib.rs", true).unwrap();
+    assert!(svc.session(id).unwrap().viewed.contains("lib.rs"));
+
+    svc.mark_viewed(id, "lib.rs", false).unwrap();
+    assert!(svc.session(id).unwrap().viewed.is_empty());
+
+    assert!(svc.mark_viewed(id, "unchanged.rs", true).is_err(), "not in the Changeset");
+    assert!(svc.session(id).unwrap().viewed.is_empty());
+}
+
+#[test]
+fn viewed_ticks_persist_across_rounds_on_unchanged_files_and_clear_on_changed_ones() {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "fn a() {}\n").write("other.rs", "fn o() {}\n").commit_all("base");
+    repo.branch("agent").write("lib.rs", "fn a() {}\nfn d() {}\n").write("other.rs", "fn o2() {}\n");
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    svc.mark_viewed(&id, "lib.rs", true).unwrap();
+    svc.mark_viewed(&id, "other.rs", true).unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Add a test for d").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(first.wait_timeout(Duration::from_secs(1)));
+
+    repo.write("lib.rs", "fn a() {}\nfn d() {}\n#[test]\nfn d_works() {}\n");
+    let _second = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let viewed = svc.session(&id).unwrap().viewed;
+    assert_eq!(viewed.iter().map(String::as_str).collect::<Vec<_>>(), ["other.rs"]);
+}
+
+#[test]
+fn from_round_2_the_default_view_shows_only_the_changes_since_the_last_round() {
+    let svc = Service::new();
+
+    let (_repo, second) = second_round(&svc);
+
+    let session = svc.session(second.session()).unwrap();
+    assert_eq!(session.view, ChangesetView::SinceLastRound);
+    assert_eq!(
+        session.shown().files,
+        vec![
+            change("extra.rs", None, Some("fn e() {}\n")),
+            change("lib.rs", Some("fn a() {}\nfn d() {}\n"), Some("fn a() {}\nfn d() {}\n#[test]\nfn d_works() {}\n")),
+        ]
+    );
+}
+
+#[test]
+fn round_1_shows_the_full_changeset() {
+    let repo = agent_branch();
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.view, ChangesetView::Full);
+    assert_eq!(session.shown(), &session.changeset);
+
+    svc.show(pending.session(), ChangesetView::SinceLastRound).unwrap();
+    let session = svc.session(pending.session()).unwrap();
+    assert_eq!(session.shown(), &session.changeset, "there's no last Round yet");
+}
+
+fn shown_paths(changeset: &akshually_core::Changeset) -> Vec<&str> {
+    changeset.files.iter().map(|f| f.path.as_str()).collect()
+}
+
+#[test]
+fn the_toggle_switches_to_the_full_changeset_and_back() {
+    let svc = Service::new();
+    let (_repo, second) = second_round(&svc);
+    let id = second.session();
+
+    svc.show(id, ChangesetView::Full).unwrap();
+    let full = svc.session(id).unwrap();
+    assert_eq!(shown_paths(full.shown()), ["extra.rs", "lib.rs", "other.rs"]);
+    assert_eq!(full.shown().files[1].old.as_deref(), Some("fn a() {}\n"), "against the base again");
+
+    svc.show(id, ChangesetView::SinceLastRound).unwrap();
+    assert_eq!(shown_paths(svc.session(id).unwrap().shown()), ["extra.rs", "lib.rs"]);
+}
+
+#[test]
+fn a_file_the_agent_reverted_since_the_last_round_shows_as_changed_back() {
+    let svc = Service::new();
+    let (repo, second) = second_round(&svc);
+    drop(second);
+
+    repo.write("other.rs", "fn o() {}\n");
+    let third = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let session = svc.session(third.session()).unwrap();
+    assert!(session.shown().files.contains(&change("other.rs", Some("fn o2() {}\n"), Some("fn o() {}\n"))));
+}
