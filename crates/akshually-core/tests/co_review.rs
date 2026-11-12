@@ -401,3 +401,21 @@ fn local_work_has_at_most_one_agent_in_one_role() {
     assert!(matches!(draft, Err(Error::OtherAgent(Role::Author))), "{draft:?}");
     assert!(matches!(svc.close(author.session()), Err(Error::InvalidRequest(_))), "an Author is abandoned");
 }
+
+#[test]
+fn a_co_reviewer_still_drafting_answers_no_round_until_one_is_handed_over() {
+    let repo = local_work();
+    let svc = Service::new();
+    let thread = svc.draft(repo.path(), Anchor::lines(Side::New, "lib.rs", 2..=2), "Name it.").unwrap();
+    let id = svc.sessions()[0].id.clone();
+
+    assert_eq!(svc.session(&id).unwrap().turn, Turn::Agent);
+    assert_eq!(svc.session(&id).unwrap().answering_round(), None, "it hasn't been handed a Round");
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    assert_eq!(svc.session(&id).unwrap().answering_round(), None, "the human's Turn");
+    svc.reply_in_thread(&ThreadRef::new(&id, &thread), "Name it what?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    pending.wait().unwrap();
+    assert_eq!(svc.session(&id).unwrap().answering_round(), Some(1));
+}

@@ -1115,13 +1115,18 @@ fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
              now."
                 .to_owned()
         }
-        None if session.turn == Turn::Agent => format!(
-            "Waiting for the agent to answer Round {}. You can keep reading and drafting: new Drafts go out with \
-             Round {}.",
-            session.round.saturating_sub(1),
-            session.round
-        ),
-        None => return None,
+        None => match session.answering_round() {
+            Some(answering) => format!(
+                "Waiting for the agent to answer Round {answering}. You can keep reading and drafting: new Drafts go \
+                 out with Round {}.",
+                session.round
+            ),
+            // A co-Reviewer that opened the Session hasn't asked for the human yet.
+            None if session.turn == Turn::Agent => "The agent is still reviewing: its Drafts show here as it adds \
+                                                    them. You can read and draft meanwhile."
+                .to_owned(),
+            None => return None,
+        },
     };
     Some(
         row()

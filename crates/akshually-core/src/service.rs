@@ -399,6 +399,13 @@ impl SessionView {
         Some(Anchor::lines(side, path, first..=last))
     }
 
+    /// The Round the agent is working on during its Turn: the last one handed over. `None` in
+    /// the human's Turn, and while a co-Reviewer that opened the Session is still drafting,
+    /// before any Round.
+    pub fn answering_round(&self) -> Option<u32> {
+        (self.turn == Turn::Agent && self.round > 1).then(|| self.round - 1)
+    }
+
     /// How many Drafts the Session holds: the human's, and the co-Reviewer's not kept yet.
     pub fn drafts(&self) -> usize {
         self.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
