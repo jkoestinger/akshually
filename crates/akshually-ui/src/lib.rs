@@ -5,11 +5,14 @@
 
 use std::sync::{Arc, OnceLock};
 
-use akshually_core::{Changeset, Service, SessionId, SessionView};
-use rune::{AppSpec, Cx, El, KeyEvent, Tx, col, row, text};
-use rune_kit::diff::{DiffState, DiffView, FileDiff};
+use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread};
+use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
+use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
-use rune_kit::{Button, ButtonVariant, Kit};
+use rune_kit::{Badge, Button, ButtonVariant, Kit, TextArea};
+
+/// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
+const COMPOSER: &str = "composer";
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
 /// a window. Such a run must not bind the socket or touch the state dir.
@@ -49,6 +52,17 @@ struct State {
     service: Arc<Service>,
     tabs: Vec<SessionTab>,
     active: Option<SessionId>,
+    /// The Comment being written, at most one in the window.
+    composer: Option<Composer>,
+    composer_text: TextEdit,
+}
+
+/// A Comment being written on a line range, before it becomes a Draft.
+struct Composer {
+    session: SessionId,
+    anchor: Anchor,
+    /// Where the composer shows in the diff: the range's last line.
+    at: Annotation,
 }
 
 struct SessionTab {
@@ -59,7 +73,30 @@ struct SessionTab {
 impl SessionTab {
     fn new(session: SessionView) -> Self {
         let diff = DiffState::new(file_diffs(&session.changeset));
-        SessionTab { session, diff }
+        let mut tab = SessionTab { session, diff };
+        tab.annotate(None);
+        tab
+    }
+
+    /// Puts each Thread, and the composer when it's on this Session, under its last line.
+    fn annotate(&mut self, composer: Option<&Composer>) {
+        let changeset = &self.session.changeset;
+        let mut notes: Vec<Annotation> = self
+            .session
+            .threads
+            .iter()
+            .filter_map(|t| {
+                let Anchor::Lines { path, side, end, .. } = &t.anchor;
+                let file = changeset.files.iter().position(|f| &f.path == path)?;
+                Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
+            })
+            .collect();
+        notes.extend(composer.filter(|c| c.session == self.session.id).map(|c| c.at.clone()));
+        self.diff.set_annotations(notes);
+    }
+
+    fn drafts(&self) -> usize {
+        self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
     }
 
     fn title(&self) -> String {
@@ -70,6 +107,29 @@ impl SessionTab {
             .map_or_else(|| self.session.repo.display().to_string(), |n| n.to_string_lossy().into_owned());
         format!("{repo} · {}", self.session.branch)
     }
+}
+
+fn diff_side(side: Side) -> diff::Side {
+    match side {
+        Side::Old => diff::Side::Old,
+        Side::New => diff::Side::New,
+    }
+}
+
+/// The Anchor for lines selected in the diff. A selection may run across sides; it then
+/// anchors to its last line alone.
+fn anchor_for(changeset: &Changeset, range: LineRange) -> Option<Anchor> {
+    let path = changeset.files.get(range.file)?.path.clone();
+    let side = match range.end.side {
+        diff::Side::Old => Side::Old,
+        diff::Side::New => Side::New,
+    };
+    let (start, end) = if range.start.side == range.end.side {
+        (range.start.line.min(range.end.line), range.start.line.max(range.end.line))
+    } else {
+        (range.end.line, range.end.line)
+    };
+    Some(Anchor::lines(side, path, start..=end))
 }
 
 fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
@@ -90,24 +150,72 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
 
 impl State {
     fn new(service: Arc<Service>) -> Self {
-        let mut state = State { service, tabs: Vec::new(), active: None };
+        let mut state =
+            State { service, tabs: Vec::new(), active: None, composer: None, composer_text: TextEdit::new("") };
         let sessions = state.service.sessions();
         state.apply(sessions);
         state
     }
 
-    /// Mirrors the service's Sessions, keeping the view state of Sessions that didn't change.
+    /// Mirrors the service's Sessions, keeping each Session's view state (scroll, folds) and
+    /// rebuilding its diff only when its Changeset changed.
     fn apply(&mut self, sessions: Vec<SessionView>) {
         let mut old = std::mem::take(&mut self.tabs);
         self.tabs = sessions
             .into_iter()
-            .map(|session| match old.iter().position(|t| t.session == session) {
-                Some(at) => old.swap_remove(at),
+            .map(|session| match old.iter().position(|t| t.session.id == session.id) {
+                Some(at) => {
+                    let mut tab = old.swap_remove(at);
+                    if tab.session.changeset != session.changeset {
+                        tab.diff.set_files(file_diffs(&session.changeset));
+                        // The lines it was on may be gone.
+                        if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
+                            self.composer = None;
+                        }
+                    }
+                    tab.session = session;
+                    tab
+                }
                 None => SessionTab::new(session),
             })
             .collect();
+        if self.composer.as_ref().is_some_and(|c| !self.tabs.iter().any(|t| t.session.id == c.session)) {
+            self.composer = None;
+        }
+        self.annotate();
         if self.active_tab().is_none() {
             self.active = self.tabs.first().map(|t| t.session.id.clone());
+        }
+    }
+
+    fn annotate(&mut self) {
+        for tab in &mut self.tabs {
+            tab.annotate(self.composer.as_ref());
+        }
+    }
+
+    /// Opens the composer on `range` of the active Session.
+    fn compose(&mut self, range: LineRange) {
+        let Some(tab) = self.active_tab() else { return };
+        let Some(anchor) = anchor_for(&tab.session.changeset, range) else { return };
+        let at = Annotation::new(range.file, range.end, COMPOSER);
+        self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
+        self.composer_text = TextEdit::new("");
+        self.annotate();
+    }
+
+    fn close_composer(&mut self) {
+        self.composer = None;
+        self.composer_text = TextEdit::new("");
+        self.annotate();
+    }
+
+    /// Turns the composer's text into a Draft in a new Thread.
+    fn save_draft(&mut self) {
+        let Some(composer) = &self.composer else { return };
+        match self.service.comment(&composer.session, composer.anchor.clone(), self.composer_text.text.clone()) {
+            Ok(_) => self.close_composer(),
+            Err(error) => eprintln!("akshually: {error}"),
         }
     }
 
@@ -169,7 +277,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
     let base = &session.changeset.base[..session.changeset.base.len().min(8)];
-    let (approve_id, abandon_id) = (session.id.clone(), session.id.clone());
+    let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let drafts = tab.drafts();
     row()
         .key("session-header")
         .w_full()
@@ -180,6 +289,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .fill(k.c.layer_01)
         .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
         .child(text(format!("→ {base}")).font(k.ty.mono).color(k.c.text_muted))
+        .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(row().grow(1.0))
         .child(
             Button::new("Abandon")
@@ -193,6 +303,17 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 .on_press(move |s: &mut State| s.act(&approve_id, Service::approve))
                 .build(k),
         )
+        .child(
+            Button::new(if drafts == 0 { "Hand over Round".to_owned() } else { format!("Hand over Round ({drafts})") })
+                .variant(ButtonVariant::Submit)
+                .disabled(drafts == 0)
+                .on_press(move |s: &mut State| {
+                    if let Err(error) = s.service.hand_over_round(&hand_over_id) {
+                        eprintln!("akshually: {error}");
+                    }
+                })
+                .build(k),
+        )
 }
 
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
@@ -203,7 +324,85 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
         move |s: &mut State| &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the active tab").diff,
     )
     .key(format!("diff-{}", tab.session.id))
+    .annotation({
+        let k = k.clone();
+        move |s: &State, a: &Annotation| annotation(&k, s, a)
+    })
+    .on_comment(|s: &mut State, range: LineRange, _: &mut Tx| s.compose(range))
     .build(s, k)
+}
+
+fn annotation(k: &Kit, s: &State, a: &Annotation) -> El {
+    if a.id == COMPOSER {
+        return composer(k, s);
+    }
+    let thread = s.active_tab().and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id));
+    match thread {
+        Some(thread) => thread_card(k, thread),
+        None => col(),
+    }
+}
+
+fn card(k: &Kit) -> El {
+    col().w_full().max_w(720.0).padding(12.0).gap(8.0).radius(8.0).fill(k.c.layer_01).border(1.0, k.c.border_weak)
+}
+
+fn thread_card(k: &Kit, thread: &Thread) -> El {
+    let mut card = card(k);
+    for comment in &thread.comments {
+        let who = match comment.author {
+            Party::Human => "You",
+            Party::Agent => "Agent",
+        };
+        let when = match comment.round {
+            None => "Draft · goes out with your next Round".to_owned(),
+            Some(round) => format!("Round {round}"),
+        };
+        card = card
+            .child(
+                row()
+                    .gap(8.0)
+                    .items_center()
+                    .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
+                    .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
+            )
+            .child(text(comment.body.clone()).font(k.ty.body).color(k.c.text_base).wrap());
+    }
+    card
+}
+
+fn composer(k: &Kit, s: &State) -> El {
+    card(k)
+        .key("composer")
+        .child(text("New Comment · a Draft until you hand over the Round").font(k.ty.small).color(k.c.text_faint))
+        .child(
+            TextArea::new(&s.composer_text)
+                .placeholder("Comment…")
+                .width(None)
+                .auto_grow(2, 12)
+                .on_edit(|s: &mut State| &mut s.composer_text)
+                .on_submit(|s: &mut State, _| s.save_draft())
+                .build(k),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(row().grow(1.0))
+                .child(
+                    Button::new("Discard")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut State| s.close_composer())
+                        .build(k),
+                )
+                .child(
+                    Button::new("Save Draft")
+                        .variant(ButtonVariant::Submit)
+                        .on_press(|s: &mut State| s.save_draft())
+                        .build(k),
+                ),
+        )
 }
 
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -218,8 +417,23 @@ fn scene_session(s: &mut State) {
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
         changeset,
+        round: 2,
+        threads: vec![
+            sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
+            sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
+        ],
     };
     s.apply(vec![session]);
+}
+
+fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
+    use akshually_core::{Comment, ThreadId};
+    Thread {
+        id: ThreadId::new(id),
+        anchor: Anchor::lines(Side::New, "src/session.rs", lines),
+        excerpt: String::new(),
+        comments: vec![Comment { author: Party::Human, body: body.into(), round }],
+    }
 }
 
 fn sample_changeset() -> Changeset {
