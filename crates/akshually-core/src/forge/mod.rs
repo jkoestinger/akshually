@@ -251,6 +251,13 @@ pub enum ForgeError {
     Unexpected { host: String, message: String },
     #[error("akshually can't {what} on {host} yet")]
     Unsupported { host: String, what: &'static str },
+    #[error("{0} has new commits since it was opened: reload it, then Publish")]
+    Moved(String),
+    #[error(
+        "you have {count} unpublished comment(s) on {pr} in the browser, which GitLab would publish with \
+         this review: submit or delete them there first"
+    )]
+    DraftsInBrowser { pr: String, count: usize },
 }
 
 /// The adapters for github.com and every configured host (`Settings::hosts`).
@@ -262,6 +269,17 @@ pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dy
             ForgeKind::GitLab => Box::new(GitLab::new(host, sources.clone())),
         })
         .collect()
+}
+
+/// `body` followed by a native suggestion of `code` for the commented lines: a code block whose
+/// info string is `info` (`suggestion` on GitHub), in a fence longer than any backtick run in
+/// `code`. Empty `code` suggests deleting the lines.
+pub(crate) fn with_suggestion(body: &str, info: &str, code: &str) -> String {
+    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    let newline = if code.is_empty() || code.ends_with('\n') { "" } else { "\n" };
+    let block = format!("{fence}{info}\n{code}{newline}{fence}");
+    if body.is_empty() { block } else { format!("{body}\n\n{block}") }
 }
 
 /// A changed file from its contents on each side: binary (a NUL in its first 8 KB, as git

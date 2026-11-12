@@ -16,7 +16,7 @@ use super::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use super::{epoch_seconds, file_change};
+use super::{epoch_seconds, file_change, with_suggestion};
 use crate::{Changeset, FileChange, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
@@ -544,7 +544,7 @@ impl GitHub {
             };
             input["pullRequestReviewId"] = json!(review_id);
             input["body"] = json!(match &comment.suggestion {
-                Some(code) => with_suggestion(&comment.body, code),
+                Some(code) => with_suggestion(&comment.body, "suggestion", code),
                 None => comment.body.clone(),
             });
             let data: Value = self.graphql(ADD_THREAD, json!({ "input": input }))?;
@@ -594,16 +594,6 @@ impl GitHub {
             .map(str::to_owned)
             .ok_or_else(|| self.unexpected(format!("GraphQL answered no {pointer}")))
     }
-}
-
-/// `body` followed by GitHub's native suggestion of `code` for the commented lines, in a fence
-/// longer than any backtick run in `code`. Empty `code` suggests deleting the lines.
-fn with_suggestion(body: &str, code: &str) -> String {
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat((longest + 1).max(3));
-    let newline = if code.is_empty() || code.ends_with('\n') { "" } else { "\n" };
-    let block = format!("{fence}suggestion\n{code}{newline}{fence}");
-    if body.is_empty() { block } else { format!("{body}\n\n{block}") }
 }
 
 const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
