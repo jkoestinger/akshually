@@ -19,6 +19,7 @@ mod inbox;
 mod pull_request;
 
 pub use inbox::{InboxRow, InboxRowState, InboxView};
+pub use pull_request::PublishPlan;
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,6 +52,33 @@ pub enum Outcome {
     Approved,
     /// The human closed the Session without a Verdict; the agent should stop.
     Abandoned,
+    /// The human Published their Review of a Pull Request with `verdict`; `url` is the review
+    /// on the Forge.
+    Published { verdict: Verdict, url: String },
+}
+
+/// How the human ends a Review of a Pull Request, at Publish. Feedback becomes the Forge's
+/// "Comment" only there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Approve,
+    RequestChanges,
+    Feedback,
+}
+
+impl Verdict {
+    pub const ALL: [Verdict; 3] = [Verdict::Approve, Verdict::RequestChanges, Verdict::Feedback];
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Verdict::Approve => "approve",
+            Verdict::RequestChanges => "request changes",
+            Verdict::Feedback => "feedback",
+        })
+    }
 }
 
 /// Whose move a Session is waiting on.
@@ -344,6 +372,9 @@ struct Session {
     finished: bool,
     /// What the agent's last `review` call asked for, to rebuild the Changeset from on reload.
     local: LocalOptions,
+    /// A Publish is under way. A restart drops it: the call making it is gone.
+    #[serde(skip)]
+    publishing: bool,
 }
 
 impl Session {
@@ -375,7 +406,7 @@ impl Session {
     fn delivered(&mut self, outcome: &Outcome) {
         match outcome {
             Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
-            Outcome::Approved | Outcome::Abandoned => self.finished = true,
+            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } => self.finished = true,
         }
     }
 
@@ -1001,7 +1032,11 @@ impl Service {
     }
 
     /// Human: closes the Session without a Verdict and tells the agent to stop.
+    /// A Pull Request Session has no agent: abandoning it closes it.
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
+        if self.lock().sessions.iter().any(|s| &s.view.id == id && s.view.pull_request.is_some()) {
+            return self.close(id);
+        }
         self.end(id, Outcome::Abandoned)
     }
 
