@@ -157,9 +157,32 @@ impl LaunchedApp {
         cmd
     }
 
+    pub(crate) fn paths(&self) -> Paths {
+        paths(&self.dirs)
+    }
+
+    /// Runs the app itself, headless with test control, allowed at most `limit` open file
+    /// descriptors (`ulimit -n`), so the test can make it run out of them. Its stderr is piped.
+    pub(crate) fn spawn_app_with_fd_limit(&self, limit: u32) -> AppProcess {
+        let app = self.akshually(&std::env::temp_dir(), &["app", "--headless"]);
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("ulimit -n {limit} && exec \"$0\" \"$@\""))
+            .arg(app.get_program())
+            .args(app.get_args())
+            .envs(app.get_envs().filter_map(|(key, value)| Some((key, value?))))
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the app");
+        AppProcess(child)
+    }
+
     /// The running app's pid and Sessions, or `None` while no app answers.
     pub(crate) fn state(&self) -> Option<AppState> {
-        ipc::connect(&paths(&self.dirs)).ok()?.test_state().ok()
+        ipc::connect(&self.paths()).ok()?.test_state().ok()
     }
 
     /// Waits until the app reports a state matching `ready`.
@@ -169,7 +192,7 @@ impl LaunchedApp {
 
     /// Acts as the human in the running app.
     pub(crate) fn human(&self, cmd: HumanCommand) {
-        ipc::connect(&paths(&self.dirs)).expect("connect").test_human(cmd).expect("human command");
+        ipc::connect(&self.paths()).expect("connect").test_human(cmd).expect("human command");
     }
 }
 
@@ -178,6 +201,16 @@ impl Drop for LaunchedApp {
         if let Some(state) = self.state() {
             let _ = Command::new("kill").arg(state.pid.to_string()).status();
         }
+    }
+}
+
+/// An app process the test spawned itself. Killed and reaped on drop, even when the test fails.
+pub(crate) struct AppProcess(pub Child);
+
+impl Drop for AppProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 

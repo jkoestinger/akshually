@@ -1,0 +1,24 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": { "hasNextPage": false, "endCursor": "CURSOR1" },
+          "nodes": [
+            {
+              "id": "PRRT_9", "isResolved": false, "isOutdated": false, "path": "src/a.rs", "subjectType": "LINE",
+              "line": 1, "originalLine": 1, "startLine": null, "originalStartLine": null,
+              "diffSide": "RIGHT", "startDiffSide": null,
+              "comments": {
+                "pageInfo": { "hasNextPage": true, "endCursor": "COMMENTS1" },
+                "nodes": [
+                  { "body": "Why the rename?", "author": { "login": "lee" }, "diffHunk": "@@ -1 +1 @@\n-fn a() {}\n+fn a2() {}" }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

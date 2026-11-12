@@ -6,9 +6,34 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION, source};
 use crate::{NewComment, Paths, ReviewRequest, Service};
+
+/// How long `serve` first waits after a brief accept error before it tries again. It doubles
+/// while accepting keeps failing, so running out of file descriptors doesn't spin a core.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// The longest wait between accept attempts: agents get through within a second of the
+/// error clearing.
+const ACCEPT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// `EMFILE` and `ENFILE`: the process, or the whole system, ran out of file descriptors. std
+/// has no `ErrorKind` for them; their numbers are the same on Linux and macOS.
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+/// `ENOBUFS`: the kernel ran short of socket buffers.
+#[cfg(target_os = "linux")]
+const ENOBUFS: i32 = 105;
+#[cfg(not(target_os = "linux"))]
+const ENOBUFS: i32 = 55;
+
+/// Whether an accept error clears on its own (a resource runs short for a while, or a client
+/// gave up while queued), so `serve` should try again rather than stop.
+fn clears_on_its_own(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::OutOfMemory)
+        || matches!(error.raw_os_error(), Some(EMFILE | ENFILE | ENOBUFS))
+}
 
 /// Why the app couldn't start serving the local channel.
 #[derive(Debug, thiserror::Error)]
@@ -56,11 +81,26 @@ impl Server {
     }
 
     /// Serves requests until the process exits, one thread per connection (a `review` blocks
-    /// its thread until the human answers).
+    /// its thread until the human answers). Keeps going through brief accept errors, such as
+    /// running out of file descriptors, waiting a little longer each time one repeats. Returns
+    /// only on an error that can't clear on its own, after which agents can't reach the app.
     pub fn serve(self) -> io::Result<()> {
         let server = Arc::new(self);
+        let mut delay = ACCEPT_RETRY_DELAY;
         for stream in server.listener.incoming() {
-            let stream = stream?;
+            let stream = match stream {
+                Ok(stream) => stream,
+                // Best-effort: stopping here would cut every agent off until the human restarts
+                // akshually, though the error clears once connections close (#36).
+                Err(error) if clears_on_its_own(&error) => {
+                    eprintln!("akshually: can't accept a CLI connection, trying again in {delay:?}: {error}");
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(ACCEPT_RETRY_MAX_DELAY);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            delay = ACCEPT_RETRY_DELAY;
             let server = server.clone();
             std::thread::spawn(move || server.handle(stream));
         }

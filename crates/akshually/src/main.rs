@@ -351,7 +351,15 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
             if std::env::var_os("AKSHUALLY_TEST_CONTROL").is_some() { server.with_test_control() } else { server };
         server.serve().context("can't serve the CLI")?;
     } else {
-        std::thread::spawn(move || server.serve());
+        let notifying_service = service.clone();
+        std::thread::spawn(move || {
+            // Logged and notified rather than fatal: the window stays up (ADR 0002), though
+            // agents can't reach the app any more (#36).
+            if let Err(error) = server.serve().context("can't serve the CLI") {
+                eprintln!("akshually: {error:#}");
+                notifying_service.local_channel_lost();
+            }
+        });
         // Offers changes on disk during the human's Turn as reloads (the banner).
         service.watch_disk(DISK_CHECK_INTERVAL);
         // The headless app (tests) never asks the Forges on its own.
