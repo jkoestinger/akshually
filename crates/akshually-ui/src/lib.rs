@@ -1022,7 +1022,8 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let turn = Badge::new(if yours { "Your Turn" } else { "Agent's Turn" });
     // During the agent's Turn the Verdict waits: take the Turn back first (or abandon). A
     // co-review of local work has no Verdict.
-    let decide = if yours && co_review {
+    let ended = session.ended.is_some();
+    let decide = if ended || (yours && co_review) {
         None
     } else if yours {
         Button::new("Approve")
@@ -1074,11 +1075,19 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 .build(k),
         )
         .child(
-            // Closing a co-review of local work is its normal end, not Abandoned.
-            Button::new(if co_review { "Close" } else { "Abandon" })
-                .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
-                .build(k),
+            // Closing a co-review of local work is its normal end, not Abandoned; a Session that
+            // has its outcome already just closes.
+            match (ended, co_review) {
+                (true, _) => Button::new("Close").on_press(move |s: &mut State| s.act(&abandon_id, Service::close)),
+                (false, true) => {
+                    Button::new("Close").on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
+                }
+                (false, false) => {
+                    Button::new("Abandon").on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
+                }
+            }
+            .variant(ButtonVariant::Ghost)
+            .build(k),
         )
         .children(decide)
         .child(hand_over_button(k, tab))
@@ -1089,17 +1098,22 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
 fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
     let note = match &session.ended {
         Some(Outcome::Approved) => {
-            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session.".to_owned()
+            "Approved. The agent's next `akshually review` receives the Verdict and ends this Session, or close it \
+             now."
+                .to_owned()
         }
         Some(Outcome::Published { verdict, url }) => {
             format!("Published with the Verdict {verdict}: {url}. Close this Session when you're done.")
         }
         Some(Outcome::Closed) => {
-            "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session."
+            "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session, \
+             or close it now."
                 .to_owned()
         }
         Some(Outcome::Abandoned | Outcome::Round(_)) => {
-            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
+            "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session, or close it \
+             now."
+                .to_owned()
         }
         None if session.turn == Turn::Agent => format!(
             "Waiting for the agent to answer Round {}. You can keep reading and drafting: new Drafts go out with \

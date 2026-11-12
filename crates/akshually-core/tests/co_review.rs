@@ -198,10 +198,26 @@ fn a_co_review_the_human_publishes_before_the_agent_asks_is_kept_for_its_review_
 
     let url = svc.publish(&id, Verdict::Approve, "LGTM").unwrap();
 
-    assert!(matches!(svc.close(&id), Err(Error::Ended)), "the co-Reviewer hasn't been told yet");
     let pending = svc.review(ReviewRequest::pull_request(URL)).unwrap();
     assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url }));
     assert!(svc.sessions().is_empty());
+}
+
+#[test]
+fn the_human_can_close_a_published_co_review_the_co_reviewer_never_collected() {
+    let (svc, published) = service();
+    svc.draft(URL, Anchor::Review, "Small and clear.").unwrap();
+    let id = svc.sessions()[0].id.clone();
+    svc.publish(&id, Verdict::Approve, "LGTM").unwrap();
+
+    svc.close(&id).unwrap();
+
+    assert!(svc.sessions().is_empty());
+    // What was Published went with it: the co-Reviewer's next `review` co-reviews afresh.
+    let pending = svc.review(ReviewRequest::pull_request(URL)).unwrap();
+    assert_ne!(pending.session(), &id);
+    assert!(pending.wait_timeout(Duration::from_millis(50)).is_none(), "waits for the human");
+    assert_eq!(published.lock().unwrap().len(), 1);
 }
 
 #[test]

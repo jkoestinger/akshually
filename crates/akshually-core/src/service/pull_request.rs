@@ -196,34 +196,6 @@ impl Service {
         Ok(forge.publish(pr, &review)?)
     }
 
-    /// Human: closes a Pull Request Session, Published or not; unpublished Drafts go with it.
-    /// A co-Reviewer is told the Session was Abandoned, unless it is still to collect what the
-    /// human Published (`Error::Ended`). Closing a co-review of local work is its normal end,
-    /// which its co-Reviewer is told as Closed.
-    pub fn close(&self, id: &SessionId) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let session = &mut inner.sessions[at];
-        if session.view.pull_request().is_none() {
-            if session.view.agent != Some(Role::CoReviewer) {
-                return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
-            }
-            drop(inner);
-            return self.end(id, Outcome::Closed);
-        }
-        if session.publishing {
-            return Err(Error::Publishing);
-        }
-        if session.view.agent.is_some() {
-            drop(inner);
-            return self.end(id, Outcome::Abandoned);
-        }
-        session.finished = true;
-        inner.reap();
-        inner.notify();
-        Ok(())
-    }
-
     /// Runs `check_pull_requests` every `every` on a background thread, until the service is
     /// dropped.
     pub fn watch_pull_requests(self: &Arc<Self>, every: Duration) {

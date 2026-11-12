@@ -19,7 +19,7 @@ When you are asked to review a Pull Request or someone's local changes instead, 
    - `3`, Abandoned: the human closed the Session without a Verdict. Stop working on this change.
    - `1`: an error, explained on stderr.
 
-The human can take minutes or hours. Run `review` without a timeout if your shell tool allows it. If the call is killed anyway (a tool timeout, a restart), run `akshually review` again: a Round or Verdict the human gave meanwhile is kept for the next call, and nothing is lost. Run only one `review` per branch at a time; a second one fails with `another akshually review is already waiting on this Session`.
+The human can take minutes or hours. Run `review` without a timeout if your shell tool allows it. If the call is killed anyway (a tool timeout, a restart), run `akshually review` again: a Round or Verdict the human gave meanwhile is kept for the next call, and nothing is lost. The human can still close a Session whose Verdict no call collected: your next `review` then starts a new Session, with a fresh Round 1. Run only one `review` per branch at a time; a second one fails with `another akshually review is already waiting on this Session`.
 
 ## Commands
 

@@ -1581,6 +1581,51 @@ fn a_verdict_given_while_no_review_waits_goes_to_the_next_review_which_ends_the_
 }
 
 #[test]
+fn the_human_can_close_a_session_whose_verdict_no_agent_collected() {
+    let dirs = TestDirs::new();
+    let repo = agent_branch();
+    let svc = Service::open(dirs.state()).unwrap();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    drop(first);
+    svc.approve(&id).unwrap();
+
+    svc.close(&id).unwrap();
+
+    assert!(svc.session(&id).is_none());
+    drop(svc);
+    let restored = Service::open(dirs.state()).unwrap();
+    assert!(restored.sessions().is_empty(), "closing removes it from what's saved too");
+    // The Verdict went with it: the agent's next `review` starts a new Session.
+    let next = restored.review(ReviewRequest::new(repo.path())).unwrap();
+    assert!(next.wait_timeout(Duration::from_millis(50)).is_none(), "waits for the human");
+    assert_eq!(restored.session(next.session()).unwrap().round, 1);
+}
+
+#[test]
+fn the_human_can_close_a_session_abandoned_while_no_review_waited() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    drop(first);
+    svc.abandon(&id).unwrap();
+
+    svc.close(&id).unwrap();
+
+    assert!(svc.sessions().is_empty());
+}
+
+#[test]
+fn local_work_without_a_verdict_is_still_ended_by_approving_or_abandoning() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert!(matches!(svc.close(pending.session()), Err(Error::InvalidRequest(_))));
+}
+
+#[test]
 fn abandoning_while_no_review_waits_tells_the_next_review() {
     let repo = agent_branch();
     let svc = Service::new();

@@ -875,6 +875,39 @@ impl Service {
         self.end(id, Outcome::Abandoned)
     }
 
+    /// Human: closes the Session. One that has its outcome already (a Verdict, Published,
+    /// Abandoned) and whose agent hasn't collected it goes at once, outcome and all: the agent's
+    /// next `review` then starts a new Session. Otherwise a Pull Request Session closes Published
+    /// or not, its unpublished Drafts going with it, and its co-Reviewer is told it was Abandoned;
+    /// closing a co-review of local work is its normal end, which its co-Reviewer is told as
+    /// Closed. Local work under Review by its Author ends with a Verdict or by abandoning it.
+    pub fn close(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        if session.publishing {
+            return Err(Error::Publishing);
+        }
+        if session.view.ended.is_none() {
+            let outcome = match (&session.view.source, session.view.agent) {
+                (Source::Local { .. }, Some(Role::CoReviewer)) => Some(Outcome::Closed),
+                (Source::Local { .. }, _) => {
+                    return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
+                }
+                (Source::PullRequest(_), Some(_)) => Some(Outcome::Abandoned),
+                (Source::PullRequest(_), None) => None,
+            };
+            if let Some(outcome) = outcome {
+                drop(inner);
+                return self.end(id, outcome);
+            }
+        }
+        session.finished = true;
+        inner.reap();
+        inner.notify();
+        Ok(())
+    }
+
     /// Gives the agent `outcome`, which ends the Session once delivered. With no `review` call
     /// waiting, the Session keeps it for the next one.
     fn end(&self, id: &SessionId, outcome: Outcome) -> Result<(), Error> {
