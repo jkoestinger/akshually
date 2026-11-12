@@ -11,7 +11,8 @@ use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, Text
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, TextArea, TextInput,
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, Select, SelectAppearance,
+    TextArea, TextInput,
 };
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
@@ -25,6 +26,9 @@ use akshually_core::{
 const COMPOSER: &str = "composer";
 /// The Inbox tab's id in the tab strip (Session ids are `s1`, `s2`, …).
 const INBOX_TAB: &str = "inbox";
+/// The Changeset view dropdown's list width in points: "Since Session base" whole, with the
+/// list's padding and check. `Select`'s own minimum (160) cuts it off.
+const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 
@@ -156,13 +160,16 @@ struct SessionTab {
     diff: DiffState,
     /// Outdated Threads the human expanded; the others show as one collapsed line.
     expanded: Vec<ThreadId>,
+    /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
+    /// in another tab.
+    choosing_view: bool,
 }
 
 impl SessionTab {
     fn new(session: SessionView) -> Self {
         let mut diff = DiffState::new(Vec::new());
         show_files(&mut diff, session.shown());
-        let mut tab = SessionTab { session, diff, expanded: Vec::new() };
+        let mut tab = SessionTab { session, diff, expanded: Vec::new(), choosing_view: false };
         tab.annotate(None);
         tab
     }
@@ -452,6 +459,13 @@ impl State {
         report(self.service.show(id, view));
     }
 
+    /// Opens or closes the Changeset view dropdown in the header of `id`'s tab.
+    fn choose_view(&mut self, id: &SessionId, open: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
+            tab.choosing_view = open;
+        }
+    }
+
     fn annotate(&mut self) {
         for tab in &mut self.tabs {
             tab.annotate(self.composer.as_ref());
@@ -668,7 +682,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .h_full()
             .min_h(0.0)
             .child(tab_bar.child(pull_request_opener(k, s)))
-            .child(session_header(k, tab))
+            .child(session_header(k, tab, &mut layer))
             .children(end_confirm(k, s, &tab.session))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
@@ -1021,6 +1035,54 @@ fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
         .child(text(line).font(k.ty.ui).color(k.c.text_base).grow(1.0).min_w(0.0))
 }
 
+/// The header's Changeset view dropdown: the views the Session offers, in this order, with the
+/// active one checked. `None` when the full Changeset is the only one.
+fn view_dropdown(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
+    let session = &tab.session;
+    let views: Vec<ChangesetView> = [
+        (ChangesetView::SinceLastRound, session.since_last_round.is_some()),
+        (ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
+        (ChangesetView::Full, true),
+    ]
+    .into_iter()
+    .filter_map(|(view, offered)| offered.then_some(view))
+    .collect();
+    if views.len() < 2 {
+        return None;
+    }
+    let labels: Vec<&str> = views.iter().map(|&v| view_label(v)).collect();
+    let open = tab.choosing_view;
+    let (toggle_id, close_id, choose_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let view_select = Select::new("changeset-view", &labels)
+        .label("Changeset view")
+        .appearance(SelectAppearance::Inline)
+        .current(Some(view_label(session.view)))
+        .open(open)
+        .on_toggle(move |s: &mut State| s.choose_view(&toggle_id, !open))
+        .on_close(move |s: &mut State| s.choose_view(&close_id, false))
+        .on_choose(move |s: &mut State, label: &str, _: &mut Tx| {
+            s.choose_view(&choose_id, false);
+            if let Some(&view) = views.iter().find(|&&v| view_label(v) == label) {
+                s.show(&choose_id, view);
+            }
+        })
+        .build(k, layer);
+    // `Select` gives its list a fixed minimum width, and its labels shrink to fit, so the
+    // longest view would be cut off. The list is the last element `build` puts in the layer.
+    if open && let Some(list) = layer.pop() {
+        layer.push(list.min_w(VIEW_LIST_MIN_WIDTH));
+    }
+    Some(view_select)
+}
+
+fn view_label(view: ChangesetView) -> &'static str {
+    match view {
+        ChangesetView::SinceLastRound => "Since last Round",
+        ChangesetView::SinceSessionBase => "Since Session base",
+        ChangesetView::Full => "Full Changeset",
+    }
+}
+
 fn verdict_label(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::Approve => "Approve",
@@ -1044,21 +1106,16 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
     }
 }
 
-/// A Session's header: its branch and base, Round and Turn, the Changeset views it offers, and
-/// the actions that end it or hand the Turn over. A Pull Request Session has its own header.
-fn session_header(k: &Kit, tab: &SessionTab) -> El {
+/// A Session's header: its branch and the base of the Changeset shown, Round and Turn, the
+/// Changeset views it offers, and the actions that end it or hand the Turn over. A Pull Request
+/// Session has its own header. The view dropdown's list goes into `layer`.
+fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
         return pull_request_header(k, tab, pr);
     }
     let shown = session.shown();
-    let base = if shown == &session.changeset {
-        format!("→ {}", &shown.base[..shown.base.len().min(SHORT_HASH)])
-    } else if session.view == ChangesetView::SinceLastRound {
-        "since last Round".to_owned()
-    } else {
-        "since Session base".to_owned()
-    };
+    let base = format!("→ {}", &shown.base[..shown.base.len().min(SHORT_HASH)]);
     let (approve_id, abandon_id) = (session.id.clone(), session.id.clone());
     let take_back_id = session.id.clone();
     let yours = session.turn == Turn::Human;
@@ -1082,22 +1139,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
             .build(k)
             .into()
     };
-    let views = [
-        ("Since last Round", ChangesetView::SinceLastRound, session.since_last_round.is_some()),
-        ("Since Session base", ChangesetView::SinceSessionBase, session.since_session_base.is_some()),
-    ];
-    let toggle = views.iter().any(|(_, _, available)| *available).then(|| {
-        let view_button = |label: &str, view: ChangesetView| {
-            let id = session.id.clone();
-            let variant = if session.view == view { ButtonVariant::Neutral } else { ButtonVariant::Ghost };
-            Button::new(label).variant(variant).on_press(move |s: &mut State| s.show(&id, view)).build(k)
-        };
-        views
-            .iter()
-            .filter(|(_, _, available)| *available)
-            .fold(row().gap(4.0), |toggle, (label, view, _)| toggle.child(view_button(label, *view)))
-            .child(view_button("Full Changeset", ChangesetView::Full))
-    });
+    let view_select = view_dropdown(k, tab, layer);
     row()
         .key("session-header")
         .w_full()
@@ -1111,7 +1153,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
-        .children(toggle)
+        .children(view_select)
         .child(
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -1798,8 +1840,8 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     s.active_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
 }
 
-/// `--scene session`: a sample Session, plus tabs for an unseen human's Turn and an agent's
-/// Turn, for headless renders.
+/// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
+/// unseen human's Turn and an agent's Turn, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {
@@ -1807,10 +1849,10 @@ fn scene_session(s: &mut State) {
         source: Source::Local { repo: "/home/me/akshually".into(), branch: "feat/round-snapshots".into() },
         agent: Some(Role::Author),
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
+        last_round: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
+        since_last_round: Some(Changeset { base: "1a5720und".into(), files: changeset.files[..1].to_vec() }),
         changeset,
-        last_round: None,
-        since_last_round: None,
-        view: ChangesetView::Full,
+        view: ChangesetView::SinceLastRound,
         viewed: ["src/round.rs".to_owned()].into(),
         round: 2,
         agent_waiting: true,
@@ -1832,6 +1874,11 @@ fn scene_session(s: &mut State) {
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
         source: Source::Local { repo: "/home/me/akshually".into(), branch: branch.into() },
+        // Round 1 without a Session base: the full Changeset is the only view.
+        since_session_base: None,
+        last_round: None,
+        since_last_round: None,
+        view: ChangesetView::Full,
         round: 1,
         threads: Vec::new(),
         turn,
