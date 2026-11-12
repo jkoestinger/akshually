@@ -20,8 +20,9 @@ mod exit {
 #[derive(Parser)]
 #[command(version, about = "Human-in-the-loop code review for agents")]
 struct Cli {
+    /// With no command, opens the app (as the `.desktop` entry and the macOS `.app` do).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -45,8 +46,9 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Review => review(),
-        Command::App { headless, rune_args } => app(headless, rune_args),
+        Some(Command::Review) => review(),
+        Some(Command::App { headless, rune_args }) => app(headless, rune_args),
+        None => app(false, Vec::new()),
     };
     result.unwrap_or_else(|error| {
         eprintln!("akshually: {error:#}");
