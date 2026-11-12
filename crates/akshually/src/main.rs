@@ -20,6 +20,10 @@ const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
 /// How often the app looks for changes on disk in Sessions waiting on the human.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the app refreshes the Inbox: 2 search requests per GitHub host each time, well
+/// within GitHub's 30 searches a minute.
+const INBOX_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
+
 /// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
 mod exit {
     pub const APPROVED: u8 = 0;
@@ -207,6 +211,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         std::thread::spawn(move || server.serve());
         // Offers changes on disk during the human's Turn as reloads (the banner).
         service.watch_disk(DISK_CHECK_INTERVAL);
+        // The headless app (tests) never asks the Forges on its own.
+        service.watch_inbox(INBOX_REFRESH_INTERVAL);
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
     }
     Ok(ExitCode::SUCCESS)

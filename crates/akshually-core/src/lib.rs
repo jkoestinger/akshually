@@ -20,7 +20,8 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn,
+    CancelReview, ChangesetView, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, ReviewRequest, Service,
+    SessionId, SessionView, Turn,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};

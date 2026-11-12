@@ -16,6 +16,11 @@ pub use config::{ForgeKind, HostConfig};
 pub use credentials::CredentialSources;
 pub use github::GitHub;
 
+/// Every host the Forge adapters serve: `configured` (`Settings::hosts`), plus github.com.
+pub fn served_hosts(configured: &[HostConfig]) -> Vec<HostConfig> {
+    config::with_github_com(configured)
+}
+
 /// One Forge host, as the review service sees it. Methods block on the network.
 pub trait ForgeAdapter: Send + Sync {
     /// The Pull Request `url` points at, if it's one on this adapter's host.
@@ -30,6 +35,70 @@ pub trait ForgeAdapter: Send + Sync {
 
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
+
+    /// The human's Inbox on this host: open Pull Requests where they are a requested reviewer
+    /// or an assignee, each listed once (as reviewer when both). A host without one has none.
+    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
+        Ok(Vec::new())
+    }
+}
+
+/// An open Pull Request in the human's Inbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub id: PullRequestRef,
+    pub kind: ForgeKind,
+    /// The Pull Request's web page, which `ForgeAdapter::recognise` accepts.
+    pub url: String,
+    pub title: String,
+    /// The author's login.
+    pub author: String,
+    /// Seconds since the Unix epoch.
+    pub created_at: i64,
+    /// Seconds since the Unix epoch. Any activity changes it: pushes, comments, labels.
+    pub updated_at: i64,
+    pub role: InboxRole,
+}
+
+/// Why a Pull Request is in the Inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxRole {
+    /// The human's review is requested (directly or through a team).
+    Reviewer,
+    /// The human is assigned, and no review is requested from them.
+    Assignee,
+}
+
+/// Seconds since the Unix epoch of an RFC 3339 time (`2026-11-12T09:30:00Z`, with optional
+/// fractional seconds and a `Z` or `±hh:mm` offset), as Forges send them.
+pub(crate) fn epoch_seconds(time: &str) -> Option<i64> {
+    let (date, rest) = time.split_once(['T', 't', ' '])?;
+    let mut date = date.splitn(3, '-').map(|n| n.parse::<i64>().ok());
+    let (y, m, d) = (date.next()??, date.next()??, date.next()??);
+    let (clock, offset) = rest.split_at(rest.find(['Z', 'z', '+', '-'])?);
+    let clock = clock.split('.').next()?;
+    let mut clock = clock.splitn(3, ':').map(|n| n.parse::<i64>().ok());
+    let (hh, mm, ss) = (clock.next()??, clock.next()??, clock.next()??);
+    let offset = match offset {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = if offset.starts_with('-') { -1 } else { 1 };
+            let (oh, om) = offset[1..].split_once(':')?;
+            sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60)
+        }
+    };
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days since 1970-01-01 in the proleptic Gregorian calendar (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
 }
 
 /// Names one Pull Request: a Pull Request Session's identity.

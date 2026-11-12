@@ -15,7 +15,10 @@ use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
+mod inbox;
 mod pull_request;
+
+pub use inbox::{InboxRow, InboxRowState, InboxView};
 
 /// Identifies a Session, across restarts too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -423,6 +426,7 @@ struct Inner {
     notifier: Option<Box<dyn Notifier>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
+    inbox: inbox::InboxState,
 }
 
 impl Inner {
@@ -433,6 +437,8 @@ impl Inner {
         let view = &mut self.sessions[at].view;
         view.turn = Turn::Human;
         match &self.displayed {
+            // The Inbox is displayed: it keeps the view.
+            None if self.inbox.displayed => view.attention = true,
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
         }
@@ -521,7 +527,7 @@ impl Service {
     /// A service that saves its Sessions under `state_dir` (never inside a repository) and
     /// restores the ones saved there by an earlier run.
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
-        let (store, mut sessions, bases) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
+        let (mut store, mut sessions, bases) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
         sessions.sort_by_key(|s| id_number(&s.view.id));
         let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
         let bases: Vec<SessionBase> = bases;
@@ -534,7 +540,9 @@ impl Service {
             }
             session.view.agent_waiting = false;
         }
-        let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
+        let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
+        inner.inbox.saved = store.load_inbox();
+        inner.store = Some(store);
         Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
     }
 
@@ -593,6 +601,7 @@ impl Service {
             return Ok(());
         }
         inner.displayed = Some(id.clone());
+        inner.inbox.displayed = false;
         inner.sessions[at].view.attention = false;
         inner.notify();
         Ok(())
@@ -1004,10 +1013,15 @@ impl Service {
             return Err(Error::NotYourTurn);
         }
         session.view.ended = Some(outcome.clone());
-        // It replaces any Round the agent hasn't received.
-        session.queued.clear();
-        session.queued.push(outcome);
-        session.deliver();
+        if session.view.pull_request.is_some() {
+            // No agent to tell: closing a Pull Request Session ends it.
+            session.finished = true;
+        } else {
+            // It replaces any Round the agent hasn't received.
+            session.queued.clear();
+            session.queued.push(outcome);
+            session.deliver();
+        }
         inner.reap();
         inner.notify();
         Ok(())

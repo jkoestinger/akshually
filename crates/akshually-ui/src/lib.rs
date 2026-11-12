@@ -5,17 +5,20 @@
 
 use std::sync::Arc;
 
+use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, Service, SessionId,
-    SessionView, Side, Thread, ThreadId, Turn,
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, InboxRow, InboxRowState, InboxView, NewComment, Outcome,
+    Party, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn,
 };
-use rune::{AppHandle, AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
+use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea, TextInput};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
+/// The Inbox tab's id in the tab strip (Session ids are `s1`, `s2`, …).
+const INBOX_TAB: &str = "inbox";
 
 mod notifier;
 mod theme;
@@ -32,7 +35,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let spec = AppSpec {
-        scenes: &[("session", scene_session), ("threads", scene_threads)],
+        scenes: &[("session", scene_session), ("threads", scene_threads), ("inbox", scene_inbox)],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
         // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
         // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
@@ -59,6 +62,11 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             handle.show();
         }
     });
+    let handle = app.handle();
+    service.subscribe_inbox(move |inbox| {
+        let inbox = inbox.clone();
+        handle.update(move |s: &mut State, _| s.inbox = inbox);
+    });
     app.try_run()
 }
 
@@ -66,7 +74,11 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
 struct State {
     service: Arc<Service>,
     tabs: Vec<SessionTab>,
+    /// The Session whose tab is open; `None` for the Inbox.
     active: Option<SessionId>,
+    inbox: InboxView,
+    /// An Inbox refresh the human asked for is running.
+    refreshing: bool,
     /// The Comment being written, at most one in the window.
     composer: Option<Composer>,
     composer_text: TextEdit,
@@ -228,6 +240,8 @@ impl State {
             service,
             tabs: Vec::new(),
             active: None,
+            inbox: InboxView::default(),
+            refreshing: false,
             composer: None,
             composer_text: TextEdit::new(""),
             pr_url: TextEdit::new(""),
@@ -238,6 +252,11 @@ impl State {
         };
         let sessions = state.service.sessions();
         state.apply(sessions);
+        // The Session the service displays, else the first one, else the Inbox.
+        match state.service.displayed().or_else(|| state.tabs.first().map(|t| t.session.id.clone())) {
+            Some(id) => state.open_tab(id),
+            None => state.open_inbox(),
+        }
         state
     }
 
@@ -270,20 +289,26 @@ impl State {
             self.close_reply();
         }
         self.annotate();
-        if self.active_tab().is_none() {
-            // The displayed Session ended (or none was): open the first tab, if any.
-            if let Some(id) = self.tabs.first().map(|t| t.session.id.clone()) {
-                self.open_tab(id);
-            } else {
-                self.active = None;
-            }
+        if self.active.is_some() && self.active_tab().is_none() {
+            // The displayed Session ended.
+            self.open_inbox();
+        } else if self.active.is_none() && !self.service.inbox_displayed() {
+            // Nothing was displayed, so a new Session took the view.
+            self.active = self.service.displayed().filter(|id| self.tabs.iter().any(|t| &t.session.id == id));
         }
+        // Row states follow the Sessions.
+        self.inbox = self.service.inbox();
     }
 
     /// Opens the Pull Request in the URL field off the UI thread (the Forge may be slow); the
     /// service then displays its Session.
     fn open_pull_request(&mut self) {
         let url = self.pr_url.text.trim().to_owned();
+        self.open_url(url);
+    }
+
+    /// Opens the Pull Request at `url` off the UI thread, starting or focusing its Session.
+    fn open_url(&mut self, url: String) {
         if url.is_empty() {
             return;
         }
@@ -306,6 +331,27 @@ impl State {
             }
             None => opened(self, service.open_pull_request(&url)),
         }
+    }
+
+    /// Shows the Inbox tab and tells the service, which clears its attention.
+    fn open_inbox(&mut self) {
+        self.service.display_inbox();
+        self.active = None;
+        self.inbox = self.service.inbox();
+    }
+
+    /// Asks the Forges for the Inbox off the UI thread; the service's update shows it.
+    fn refresh_inbox(&mut self) {
+        let Some(handle) = self.handle.clone() else { return };
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        let service = self.service.clone();
+        std::thread::spawn(move || {
+            service.refresh_inbox();
+            handle.update(|s: &mut State, _| s.refreshing = false);
+        });
     }
 
     /// Shows the Session's tab and tells the service, which clears its attention.
@@ -439,61 +485,179 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Rune keeps `system_dark` current with the OS setting and redraws when it changes.
     let k = theme::kit(cx.system_dark());
     let mut layer = Vec::new();
+    // Always first. Not `pinned`: the strip shows pinned tabs as an icon alone.
+    let inbox_tab = TabItem::new(INBOX_TAB, format!("Inbox {}", s.inbox.rows.len()))
+        .closable(false)
+        .status(s.inbox.attention.then_some(TabItemStatus::Attention));
+    let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
+        .tabs(std::iter::once(inbox_tab).chain(s.tabs.iter().map(|t| {
+            TabItem::new(t.session.id.as_str(), t.title())
+                .icon(&rune_kit::glyphs::FILE_CODE)
+                .closable(false)
+                .status(tab_status(&t.session))
+        })))
+        .active(Some(s.active.as_ref().map_or(INBOX_TAB, SessionId::as_str)))
+        .viewport_width(cx.layout_size("tabbar").map(|z| z[0]))
+        .on_select(|s: &mut State, id: &str, _| {
+            if id == INBOX_TAB {
+                s.open_inbox();
+            } else if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone()) {
+                s.open_tab(id);
+            }
+        })
+        .build_layered(k, &mut layer);
+    let tab_bar = row()
+        .h(40.0)
+        .w_full()
+        .gap(8.0)
+        .pr(8.0)
+        .items_center()
+        .child(row().key("tabbar").h(40.0).grow(1.0).min_w(0.0).child(tabs));
     let body = match s.active_tab() {
-        Some(tab) => {
-            let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
-                .tabs(s.tabs.iter().map(|t| {
-                    TabItem::new(t.session.id.as_str(), t.title())
-                        .icon(&rune_kit::glyphs::FILE_CODE)
-                        .closable(false)
-                        .status(tab_status(&t.session))
-                }))
-                .active(s.active.as_ref().map(SessionId::as_str))
-                .viewport_width(cx.layout_size("tabbar").map(|z| z[0]))
-                .on_select(|s: &mut State, id: &str, _| {
-                    if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone())
-                    {
-                        s.open_tab(id);
-                    }
-                })
-                .build_layered(k, &mut layer);
-            col()
-                .w_full()
-                .h_full()
-                .min_h(0.0)
-                .child(
-                    row()
-                        .h(40.0)
-                        .w_full()
-                        .gap(8.0)
-                        .pr(8.0)
-                        .items_center()
-                        .child(row().key("tabbar").h(40.0).grow(1.0).min_w(0.0).child(tabs))
-                        .child(pull_request_opener(k, s)),
-                )
-                .child(session_header(k, tab))
-                .children(turn_banner(k, &tab.session))
-                .child(disk_banner(k, tab))
-                .child(general_threads(k, s, tab))
-                .child(outdated_threads(k, tab))
-                .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab)))
-        }
-        None => col()
+        Some(tab) => col()
             .w_full()
             .h_full()
-            .items_center()
-            .justify_center()
-            .gap(16.0)
-            .child(
-                text(
-                    "No Sessions. Run `akshually review` in a repository to ask for a review, or open a Pull Request.",
-                )
-                .font(k.ty.ui)
-                .color(k.c.text_muted),
-            )
-            .child(pull_request_opener(k, s)),
+            .min_h(0.0)
+            .child(tab_bar.child(pull_request_opener(k, s)))
+            .child(session_header(k, tab))
+            .children(turn_banner(k, &tab.session))
+            .child(disk_banner(k, tab))
+            .child(general_threads(k, s, tab))
+            .child(outdated_threads(k, tab))
+            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab))),
+        None => {
+            let draft = theme::tokens(cx.system_dark()).color("state-draft");
+            col().w_full().h_full().min_h(0.0).child(tab_bar).child(inbox_view(k, s, draft))
+        }
     };
     rune_kit::root(body.fill(k.c.bg_base), layer)
+}
+
+/// The Inbox tab: open Pull Requests where the human is a requested reviewer or assignee, on
+/// every configured host. Opening a row starts or focuses its Session.
+fn inbox_view(k: &Kit, s: &State, draft: Color) -> El {
+    let now = now();
+    let hosts: Vec<String> =
+        akshually_core::forge::served_hosts(&s.service.settings().hosts).into_iter().map(|h| h.host).collect();
+    let refreshed = match (s.refreshing, s.inbox.refreshed_at) {
+        (true, _) => " · refreshing…".to_owned(),
+        (false, Some(at)) => format!(" · refreshed {}", ago(now - at)),
+        (false, None) => String::new(),
+    };
+    let subtitle =
+        format!("Pull Requests where you are a requested reviewer or assignee · {}{refreshed}", hosts.join(", "));
+    let header = row()
+        .key("inbox-header")
+        .w_full()
+        .gap(12.0)
+        .items_center()
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(text("Inbox").font(k.ty.body_medium).color(k.c.text_base))
+                .child(text(subtitle).font(k.ty.small).color(k.c.text_muted)),
+        )
+        .child(pull_request_opener(k, s))
+        .child(
+            Button::new("Refresh")
+                .variant(ButtonVariant::Outline)
+                .disabled(s.refreshing)
+                .on_press(|s: &mut State| s.refresh_inbox())
+                .build(k),
+        );
+    let errors = s.inbox.errors.iter().map(|e| text(e.clone()).font(k.ty.small).color(k.c.danger.fg).wrap());
+    let mut list = col().key("inbox-rows").w_full().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_base);
+    for inbox_row in &s.inbox.rows {
+        list = list.child(inbox_row_view(k, inbox_row, now, draft));
+    }
+    let empty = s.inbox.rows.is_empty().then(|| {
+        let note = if s.inbox.refreshed_at.is_some() { "Nothing waiting for you." } else { "Not refreshed yet." };
+        text(note).font(k.ty.ui).color(k.c.text_muted)
+    });
+    col()
+        .key("inbox")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(col().w_full().px(24.0).py(16.0).gap(16.0).child(header).children(errors).child(list).children(empty))
+}
+
+fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
+    let item = &inbox_row.item;
+    let (state, color) = match &inbox_row.state {
+        InboxRowState::New => ("New".to_owned(), k.c.warning.fg),
+        InboxRowState::Updated => ("Pull Request updated".to_owned(), k.c.warning.fg),
+        InboxRowState::Seen => ("—".to_owned(), k.c.text_muted),
+        InboxRowState::SessionOpen { drafts, .. } => (
+            match drafts {
+                0 => "Session open".to_owned(),
+                1 => "Session open · 1 Draft".to_owned(),
+                n => format!("Session open · {n} Drafts"),
+            },
+            draft,
+        ),
+    };
+    let unseen = matches!(inbox_row.state, InboxRowState::New | InboxRowState::Updated);
+    let dot = row().w(8.0).h(8.0).radius(4.0).fill(if unseen { k.c.warning.fg } else { Color::TRANSPARENT });
+    let role = match item.role {
+        InboxRole::Reviewer => "Requested reviewer",
+        InboxRole::Assignee => "Assignee",
+    };
+    let url = item.url.clone();
+    row()
+        .key(format!("inbox-{}", item.url))
+        .w_full()
+        .px(12.0)
+        .py(12.0)
+        .gap(12.0)
+        .items_center()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_base)
+        .hover(k.c.hover)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| s.open_url(url.clone()))
+        .child(dot)
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(text(item.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
+                .child(text(inbox_meta(item, now)).font(k.ty.small).color(k.c.text_muted)),
+        )
+        .child(text(role).font(k.ty.small).color(k.c.text_muted))
+        .child(row().w(200.0).justify_end().child(text(state).font(k.ty.small).color(color)))
+}
+
+/// `GitHub · acme/web #482 · maria · opened 2 h ago`; hosts other than github.com are named.
+fn inbox_meta(item: &InboxItem, now: i64) -> String {
+    let PullRequestRef { host, repo, number } = &item.id;
+    let (forge, sigil) = match item.kind {
+        ForgeKind::GitHub => ("GitHub", '#'),
+    };
+    let place = if host == "github.com" {
+        format!("{repo} {sigil}{number}")
+    } else {
+        format!("{host} · {repo} {sigil}{number}")
+    };
+    format!("{forge} · {place} · {} · opened {}", item.author, ago(now - item.created_at))
+}
+
+/// Roughly how long ago `seconds` ago was: `just now`, `5 min ago`, `2 h ago`, `3 d ago`.
+fn ago(seconds: i64) -> String {
+    match seconds {
+        ..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", seconds / 60),
+        3600..86_400 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 fn pull_request_opener(k: &Kit, s: &State) -> El {
@@ -1103,6 +1267,7 @@ fn scene_session(s: &mut State) {
     let unseen = other("unseen", "fix/inbox-refresh", Turn::Human, true);
     let working = other("working", "feat/publish", Turn::Agent, false);
     s.apply(vec![session, unseen, working]);
+    open_first_tab(s);
 }
 
 /// `--scene threads`: Review, file and suggestion Threads, with markdown bodies, an agent
@@ -1175,6 +1340,52 @@ fn scene_threads(s: &mut State) {
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
     s.apply(vec![session]);
+    open_first_tab(s);
+}
+
+/// Opens a scene's first Session (the scene's service has none, so nothing else would).
+fn open_first_tab(s: &mut State) {
+    if let Some(id) = s.tabs.first().map(|t| t.session.id.clone()) {
+        s.open_tab(id);
+    }
+}
+
+/// `--scene inbox`: the Inbox of design screen 3, with each row state.
+fn scene_inbox(s: &mut State) {
+    let now = now();
+    let item = |repo: &str, number: u64, title: &str, author: &str, opened_h: i64, role| InboxItem {
+        id: PullRequestRef { host: "github.com".into(), repo: repo.into(), number },
+        kind: ForgeKind::GitHub,
+        url: format!("https://github.com/{repo}/pull/{number}"),
+        title: title.into(),
+        author: author.into(),
+        created_at: now - opened_h * 3600,
+        updated_at: now - 600,
+        role,
+    };
+    let rows = vec![
+        (item("acme/web", 482, "Add SSO login", "maria", 2, InboxRole::Reviewer), InboxRowState::New),
+        (
+            item("platform/infra", 97, "Rotate database credentials", "tom", 24, InboxRole::Assignee),
+            InboxRowState::SessionOpen { session: SessionId::new("sample"), drafts: 2 },
+        ),
+        (
+            item("acme/api", 311, "Retry 429 responses with backoff", "lee", 72, InboxRole::Reviewer),
+            InboxRowState::Updated,
+        ),
+        (
+            item("acme/docs", 45, "Fix broken links in setup guide", "sam", 120, InboxRole::Reviewer),
+            InboxRowState::Seen,
+        ),
+    ];
+    scene_session(s);
+    s.open_inbox();
+    s.inbox = InboxView {
+        rows: rows.into_iter().map(|(item, state)| InboxRow { item, state }).collect(),
+        refreshed_at: Some(now - 60),
+        errors: Vec::new(),
+        attention: false,
+    };
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
