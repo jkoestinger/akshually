@@ -6,13 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Changeset, Side};
+use crate::{BinarySizes, Changeset, FileChange, Side};
 
 mod config;
 mod credentials;
 mod github;
 
-pub use config::{Config, ConfigError, ForgeKind, HostConfig};
+pub use config::{ForgeKind, HostConfig};
 pub use credentials::CredentialSources;
 pub use github::GitHub;
 
@@ -116,13 +116,28 @@ pub enum ForgeError {
     Unexpected { host: String, message: String },
 }
 
-/// The adapters for every host in `config`: github.com always, plus each configured host.
-pub fn adapters(config: &Config, sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
-    config
-        .hosts()
+/// The adapters for github.com and every configured host (`Settings::hosts`).
+pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
+    config::with_github_com(hosts)
         .into_iter()
         .map(|host| match host.kind {
             ForgeKind::GitHub => Box::new(GitHub::new(host, sources.clone())) as Box<dyn ForgeAdapter>,
         })
         .collect()
+}
+
+/// A changed file from its contents on each side: binary (a NUL in its first 8 KB, as git
+/// decides) is summarised by size, text is decoded lossily.
+pub(crate) fn file_change(path: String, old: Option<Vec<u8>>, new: Option<Vec<u8>>) -> FileChange {
+    let binary = |bytes: &Option<Vec<u8>>| bytes.as_ref().is_some_and(|b| b[..b.len().min(8192)].contains(&0));
+    if binary(&old) || binary(&new) {
+        let size = |bytes: &Option<Vec<u8>>| bytes.as_ref().map(|b| b.len() as u64);
+        let sizes = BinarySizes { old: size(&old), new: size(&new) };
+        let (old, new) = (old.map(|_| String::new()), new.map(|_| String::new()));
+        return FileChange { path, old, new, binary: Some(sizes), collapsed: None };
+    }
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    };
+    FileChange { path, old: old.map(text), new: new.map(text), binary: None, collapsed: None }
 }

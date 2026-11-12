@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
 };
-use akshually_core::{Anchor, Changeset, Error, FileChange, Party, Service, Side};
+use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn};
+use akshually_testkit::TestRepo;
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
 
@@ -42,11 +43,7 @@ impl ForgeAdapter for FakeForge {
         assert_eq!(pr.head_sha, "headsha");
         Ok(Changeset {
             base: "basesha".into(),
-            files: vec![FileChange {
-                path: "login.rs".into(),
-                old: Some("fn login() {}\n".into()),
-                new: Some("fn login() {\n    sso();\n}\n".into()),
-            }],
+            files: vec![FileChange::text("login.rs", Some("fn login() {}\n"), Some("fn login() {\n    sso();\n}\n"))],
         })
     }
 
@@ -71,6 +68,14 @@ impl ForgeAdapter for FakeForge {
                 diff_hunk: "@@ -1 +1,9 @@\n+    old_code();\n".into(),
                 comments: vec![RemoteComment { author: "lee".into(), body: "Gone now?".into() }],
             },
+            RemoteThread {
+                id: "RT_3".into(),
+                anchor: RemoteAnchor::File { path: "login.rs".into() },
+                outdated: false,
+                resolved: false,
+                diff_hunk: String::new(),
+                comments: vec![RemoteComment { author: "sam".into(), body: "Split this file?".into() }],
+            },
         ])
     }
 }
@@ -94,6 +99,23 @@ fn opening_a_pull_request_url_starts_a_session_with_its_changeset() {
     assert_eq!(session.branch, "sso");
     assert_eq!(session.changeset.base, "basesha");
     assert_eq!(session.changeset.files[0].path, "login.rs");
+    assert_eq!(session.turn, Turn::Human);
+}
+
+#[test]
+fn the_opened_pull_request_is_displayed_even_when_already_open() {
+    let (svc, _) = service();
+    let pr = svc.open_pull_request(URL).unwrap();
+    let repo = TestRepo::new();
+    repo.write("a.txt", "a\n").commit_all("base");
+    repo.write("a.txt", "b\n");
+    let local = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    svc.display(local.session()).unwrap();
+
+    svc.open_pull_request(URL).unwrap();
+
+    assert_eq!(svc.displayed(), Some(pr.clone()));
+    assert!(!svc.session(&pr).unwrap().attention);
 }
 
 #[test]
@@ -103,7 +125,7 @@ fn existing_threads_from_other_reviewers_are_shown_in_place() {
     let id = svc.open_pull_request(URL).unwrap();
 
     let threads = svc.session(&id).unwrap().threads;
-    assert_eq!(threads.len(), 2);
+    assert_eq!(threads.len(), 3);
     let t = &threads[0];
     assert_eq!(t.id.as_str(), "T1");
     assert_eq!(t.anchor, Anchor::lines(Side::New, "login.rs", 2..=2));
@@ -116,6 +138,17 @@ fn existing_threads_from_other_reviewers_are_shown_in_place() {
             (Party::Other("maria".into()), "Okta.", false)
         ]
     );
+}
+
+#[test]
+fn a_thread_on_a_whole_file_is_anchored_to_the_file() {
+    let (svc, _) = service();
+
+    let id = svc.open_pull_request(URL).unwrap();
+
+    let t = &svc.session(&id).unwrap().threads[2];
+    assert_eq!(t.anchor, Anchor::File { path: "login.rs".into() });
+    assert_eq!(t.comments[0].author, Party::Other("sam".into()));
 }
 
 #[test]
@@ -158,7 +191,7 @@ fn drafts_on_a_pull_request_session_are_kept_in_the_session() {
     let thread = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 1..=3), "Needs a test.").unwrap();
 
     let session = svc.session(&id).unwrap();
-    assert_eq!(thread.as_str(), "T3", "numbered after the existing Threads");
+    assert_eq!(thread.as_str(), "T4", "numbered after the existing Threads");
     let t = session.threads.iter().find(|t| t.id == thread).unwrap();
     assert_eq!(t.comments[0].author, Party::Human);
     assert!(t.comments[0].is_draft());

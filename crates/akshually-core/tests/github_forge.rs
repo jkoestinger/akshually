@@ -6,10 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use akshually_core::forge::{
-    Config, CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, PullRequest, PullRequestRef,
+    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, PullRequest, PullRequestRef,
     RemoteAnchor, RemoteComment, RemoteThread, adapters,
 };
-use akshually_core::{FileChange, Side};
+use akshually_core::{BinarySizes, FileChange, Settings, Side};
 use akshually_testkit::TestDirs;
 use mockito::{Matcher, Mock, Server, ServerGuard};
 
@@ -26,12 +26,18 @@ fn fake_gh(dir: &Path, host: &str, token: &str) -> PathBuf {
     let gh = dir.join("gh");
     let runs = dir.join("gh-runs");
     let script = format!(
-        "#!/bin/sh\necho run >> '{}'\nif [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi\n\
+        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\necho run >> '{}'\nif [ \"$*\" = 'auth token --hostname {host}' ]; then echo '{token}'; exit 0; fi\n\
          echo 'no oauth token' >&2\nexit 1\n",
         runs.display()
     );
     std::fs::write(&gh, script).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A child forked by another test thread while the script was open for writing keeps it
+    // "busy" (ETXTBSY) until that child execs; wait for it to be runnable.
+    while let Err(e) = std::process::Command::new(&gh).arg("--probe").status() {
+        assert_eq!(e.raw_os_error(), Some(26), "can't run the fake gh: {e}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     gh
 }
 
@@ -148,9 +154,13 @@ fn ignores_urls_that_are_not_one_of_its_pull_requests() {
 
 #[test]
 fn a_configured_enterprise_host_serves_its_own_urls() {
-    let config = Config::parse("[[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n").unwrap();
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(&file, "untracked = false\n\n[[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n")
+        .unwrap();
+    let settings = Settings::load(&file).unwrap();
 
-    let forges = adapters(&config, &CredentialSources { gh: "/nonexistent".into(), env: HashMap::new() });
+    let forges = adapters(&settings.hosts, &CredentialSources { gh: "/nonexistent".into(), env: HashMap::new() });
 
     let url = "https://github.example.com/platform/infra/pull/97";
     let recognised: Vec<_> = forges.iter().filter_map(|f| f.recognise(url)).collect();
@@ -203,11 +213,7 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
 
     reads.iter().for_each(Mock::assert);
     assert_eq!(changeset.base, "mb1");
-    let change = |path: &str, old: Option<&str>, new: Option<&str>| FileChange {
-        path: path.into(),
-        old: old.map(Into::into),
-        new: new.map(Into::into),
-    };
+    let change = FileChange::text;
     assert_eq!(
         changeset.files,
         vec![
@@ -218,6 +224,33 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
             change("src/b.rs", Some("fn b() {}\n"), None),
         ]
     );
+}
+
+#[test]
+fn a_binary_file_is_summarised_by_size() {
+    let mut h = Harness::new();
+    h.get("/repos/acme/web/compare/base1...head1", TOKEN, &fixture("compare.json"));
+    h.server
+        .mock("GET", "/repos/acme/web/pulls/482/files")
+        .match_query(Matcher::Any)
+        .with_body(r#"[{ "filename": "logo.png", "status": "modified", "additions": 0, "deletions": 0 }]"#)
+        .create();
+    h.server
+        .mock("GET", "/repos/acme/web/contents/logo.png")
+        .match_query(Matcher::UrlEncoded("ref".into(), "mb1".into()))
+        .with_body(b"\x89PNG\r\n\x1a\n\0\0old")
+        .create();
+    h.server
+        .mock("GET", "/repos/acme/web/contents/logo.png")
+        .match_query(Matcher::UrlEncoded("ref".into(), "head1".into()))
+        .with_body(b"\x89PNG\r\n\x1a\n\0\0newer")
+        .create();
+
+    let changeset = h.github().changeset(&sso_pull_request()).unwrap();
+
+    let file = &changeset.files[0];
+    assert_eq!(file.binary, Some(BinarySizes { old: Some(13), new: Some(15) }));
+    assert_eq!((file.old.as_deref(), file.new.as_deref()), (Some(""), Some("")));
 }
 
 #[test]

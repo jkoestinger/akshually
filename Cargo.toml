@@ -20,7 +20,7 @@ akshually-testkit = { path = "crates/akshually-testkit" }
 # Rune is pre-release: pin one `dev` revision and upgrade it deliberately (ADR 0001).
 # Only akshually-ui may depend on it.
 rune = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "71fcd21d677c96bfbba52cb92b4ceb9de55a0b2f", features = ["markdown"] }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
-toml = "1.2"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 # Blocking HTTP for the Forge adapters: no async runtime in the core.
 ureq = { version = "3.5", features = ["json"] }
 url = "2.5"

@@ -10,11 +10,12 @@ use ureq::http::Response;
 use ureq::{Body, RequestBuilder};
 use url::Url;
 
+use super::file_change;
 use super::{
     CredentialSources, ForgeAdapter, ForgeError, HostConfig, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment,
     RemoteThread,
 };
-use crate::{Changeset, FileChange, Side};
+use crate::{Changeset, Side};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
@@ -139,19 +140,17 @@ impl GitHub {
         }
     }
 
-    /// A file's text at `sha`, decoded lossily.
-    fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<String, ForgeError> {
+    /// A file's contents at `sha`.
+    fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
         let mut url = self.endpoint(&repo_segments(pr, &["contents"]));
         url.path_segments_mut().expect("a path").extend(path.split('/'));
         url.query_pairs_mut().append_pair("ref", sha);
-        let bytes = self
-            .get(url.as_str(), "application/vnd.github.raw+json")?
+        self.get(url.as_str(), "application/vnd.github.raw+json")?
             .body_mut()
             .with_config()
             .limit(MAX_FILE)
             .read_to_vec()
-            .map_err(|e| self.http(e))?;
-        Ok(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+            .map_err(|e| self.http(e))
     }
 
     fn http(&self, error: impl std::fmt::Display) -> ForgeError {
@@ -284,19 +283,15 @@ impl ForgeAdapter for GitHub {
             let old = |path: &str| self.file(id, path, &base).map(Some);
             let new = |path: &str| self.file(id, path, &pr.head_sha).map(Some);
             match file.status.as_str() {
-                "added" | "copied" => {
-                    files.push(FileChange { new: new(&file.filename)?, old: None, path: file.filename })
-                }
-                "removed" => files.push(FileChange { old: old(&file.filename)?, new: None, path: file.filename }),
+                "added" | "copied" => files.push(file_change(file.filename.clone(), None, new(&file.filename)?)),
+                "removed" => files.push(file_change(file.filename.clone(), old(&file.filename)?, None)),
                 "renamed" => {
                     let previous = file.previous_filename.unwrap_or_else(|| file.filename.clone());
-                    files.push(FileChange { old: old(&previous)?, new: None, path: previous });
-                    files.push(FileChange { new: new(&file.filename)?, old: None, path: file.filename });
+                    files.push(file_change(previous.clone(), old(&previous)?, None));
+                    files.push(file_change(file.filename.clone(), None, new(&file.filename)?));
                 }
                 "unchanged" => {}
-                _ => {
-                    files.push(FileChange { old: old(&file.filename)?, new: new(&file.filename)?, path: file.filename })
-                }
+                _ => files.push(file_change(file.filename.clone(), old(&file.filename)?, new(&file.filename)?)),
             }
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));

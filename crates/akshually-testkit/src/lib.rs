@@ -36,6 +36,11 @@ impl TestRepo {
 
     /// Writes `contents` to `file` (relative to the repository root), creating directories.
     pub fn write(&self, file: &str, contents: &str) -> &Self {
+        self.write_bytes(file, contents.as_bytes())
+    }
+
+    /// `write`, for contents that aren't text.
+    pub fn write_bytes(&self, file: &str, contents: &[u8]) -> &Self {
         let path = self.path.join(file);
         fs::create_dir_all(path.parent().unwrap()).expect("create parent dirs");
         fs::write(path, contents).expect("write file");
@@ -63,6 +68,15 @@ impl TestRepo {
     pub fn switch(&self, branch: &str) -> &Self {
         self.git(&["switch", "--quiet", branch]);
         self
+    }
+
+    /// Adds a linked worktree of this repository on a new `branch`, created at the current
+    /// commit. Keep `self` alive while the worktree is in use.
+    pub fn worktree(&self, branch: &str) -> TestRepo {
+        let dir = tempfile::Builder::new().prefix("akwt").tempdir().expect("create worktree dir");
+        let path = dir.path().canonicalize().expect("canonicalize worktree dir");
+        self.git(&["worktree", "add", "--quiet", "-b", branch, path.to_str().expect("UTF-8 temp path")]);
+        TestRepo { _dir: dir, path }
     }
 
     /// Runs git in the repository and returns its trimmed stdout, panicking on failure.
