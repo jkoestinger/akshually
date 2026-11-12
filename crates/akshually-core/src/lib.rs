@@ -9,12 +9,14 @@ pub mod ipc;
 mod paths;
 mod reanchor;
 mod service;
+mod settings;
 mod thread;
 
-pub use changeset::{Changeset, FileChange};
+pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
 pub use paths::Paths;
 pub use reanchor::reanchor;
-pub use service::{Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +25,8 @@ pub enum Error {
     Git(#[from] git::GitError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidRequest(String),
     #[error("no Session {0}")]
     UnknownSession(SessionId),
     #[error("can't anchor a Thread there: {0}")]
