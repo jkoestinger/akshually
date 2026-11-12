@@ -5,6 +5,7 @@ mod render;
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use akshually_core::ipc::{BindError, Server};
 use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings};
@@ -12,6 +13,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 /// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
+/// How often the app looks for changes on disk in Sessions waiting on the human.
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
 mod exit {
     pub const APPROVED: u8 = 0;
     pub const ERROR: u8 = 1;
@@ -148,6 +152,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         server.serve()?;
     } else {
         std::thread::spawn(move || server.serve());
+        // Offers changes on disk during the human's Turn as reloads (the banner).
+        service.watch_disk(DISK_CHECK_INTERVAL);
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
     }
     Ok(ExitCode::SUCCESS)

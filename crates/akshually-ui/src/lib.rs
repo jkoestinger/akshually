@@ -375,6 +375,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .child(row().key("tabbar").h(40.0).w_full().child(tabs))
                 .child(session_header(k, tab))
+                .child(disk_banner(k, tab))
                 .child(general_threads(k, s, tab))
                 .child(outdated_threads(k, tab))
                 .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab)))
@@ -388,11 +389,13 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(body.fill(k.c.bg_base), layer)
 }
 
-/// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
-/// working indicator during the agent's Turn.
+/// The tab's marker: attention when the Session became the human's Turn unseen, a dot when
+/// files changed on disk, a quiet working indicator during the agent's Turn.
 fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
     if session.attention {
         Some(TabItemStatus::Attention)
+    } else if !session.changed_on_disk.is_empty() {
+        Some(TabItemStatus::Unread)
     } else if session.turn == Turn::Agent {
         Some(TabItemStatus::Busy)
     } else {
@@ -470,6 +473,36 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                 })
                 .build(k),
         )
+}
+
+/// Offers the files that changed on disk during the human's Turn as a reload; the diff stays
+/// as it is until the human takes it.
+fn disk_banner(k: &Kit, tab: &SessionTab) -> El {
+    let changed = tab.session.changed_on_disk.len();
+    if changed == 0 {
+        return col();
+    }
+    let what = if changed == 1 { "1 file".to_owned() } else { format!("{changed} files") };
+    let id = tab.session.id.clone();
+    row().key("disk-banner").w_full().px(16.0).py(8.0).child(
+        row()
+            .w_full()
+            .px(16.0)
+            .py(4.0)
+            .gap(12.0)
+            .items_center()
+            .radius(6.0)
+            .fill(k.c.layer_01)
+            .border(1.0, k.c.warning.border)
+            .child(text(format!("{what} changed on disk during your Turn.")).font(k.ty.ui).color(k.c.text_base))
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Reload")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.act(&id, Service::reload))
+                    .build(k),
+            ),
+    )
 }
 
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
@@ -729,6 +762,7 @@ fn scene_session(s: &mut State) {
         ],
         turn: Turn::Human,
         attention: false,
+        changed_on_disk: Default::default(),
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
@@ -744,7 +778,8 @@ fn scene_session(s: &mut State) {
     s.apply(vec![session, unseen, working]);
 }
 
-/// `--scene threads`: Review, file and suggestion Threads, with markdown bodies.
+/// `--scene threads`: Review, file and suggestion Threads, with markdown bodies, under the
+/// banner offering files changed on disk.
 fn scene_threads(s: &mut State) {
     use akshually_core::Comment;
     let comment = |body: &str, suggestion: Option<&str>| Comment {
@@ -772,6 +807,7 @@ fn scene_threads(s: &mut State) {
         viewed: Default::default(),
         turn: Turn::Human,
         attention: false,
+        changed_on_disk: ["src/round.rs".to_owned(), "src/session.rs".to_owned()].into(),
         round: 1,
         threads: vec![
             thread(
