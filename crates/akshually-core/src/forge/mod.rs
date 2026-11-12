@@ -38,6 +38,13 @@ pub trait ForgeAdapter: Send + Sync {
     /// Sends `review` to `pr` as one review under the human's name, against `pr.head_sha`, and
     /// returns its web page. On failure nothing is left half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError>;
+
+    /// What was pushed to the Pull Request since `pr` was fetched: `None` while its head is
+    /// still `pr.head_sha`. Cheap enough to poll; adapters may answer from a conditional request.
+    fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
+        let now = self.pull_request(&pr.id)?;
+        Ok((now.head_sha != pr.head_sha).then_some(PullRequestUpdate { pull_request: now, commits: None }))
+    }
 }
 
 /// A finished Review as the Forge receives it at Publish, in Forge-neutral terms; each adapter
@@ -60,6 +67,15 @@ pub struct ReviewComment {
     /// Code to replace the anchored lines with, whole; only on new-side lines. The adapter
     /// writes it as the Forge's native suggestion.
     pub suggestion: Option<String>,
+}
+
+/// New commits on a Pull Request, offered as a reload until the human takes them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestUpdate {
+    /// The Pull Request at its new head.
+    pub pull_request: PullRequest,
+    /// How many commits the new head is ahead of the old one, when the Forge says.
+    pub commits: Option<u32>,
 }
 
 /// Names one Pull Request: a Pull Request Session's identity.
