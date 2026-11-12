@@ -4,9 +4,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use super::{
-    Call, ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Turn, Verdict, Waiter,
-};
+use super::handoff::{Call, Waiter};
+use super::{ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Turn, Verdict};
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
