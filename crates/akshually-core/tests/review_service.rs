@@ -426,6 +426,36 @@ fn a_review_call_overrides_the_untracked_setting() {
     assert_eq!(paths(&including, &excluded), ["tracked.txt"]);
 }
 
+/// Racy git: git trusts a file whose stat matches its index entry, unless the entry is no
+/// older than the index file itself. An edit that keeps a file's size, in the same timestamp
+/// tick as the commit before it (a whole second, for git built without nanosecond stats),
+/// matches the index, and only that check catches it. Staged a minute in the past, so the
+/// review can't land in a later tick by chance.
+#[test]
+fn a_same_size_edit_in_the_same_tick_as_the_index_write_is_reviewed() {
+    let repo = TestRepo::new();
+    // ctime can't be set from a test, so take it out of the stat comparison.
+    repo.git(&["config", "core.trustctime", "false"]);
+    let tick = std::time::SystemTime::now() - Duration::from_secs(60);
+    let set_mtime = |file: &str| {
+        let file = std::fs::File::options().write(true).open(repo.path().join(file)).unwrap();
+        file.set_modified(tick).unwrap();
+    };
+    repo.write("tracked.txt", "a\n");
+    set_mtime("tracked.txt");
+    repo.commit_all("base");
+    repo.write("tracked.txt", "b\n");
+    set_mtime("tracked.txt");
+    set_mtime(".git/index");
+    let status = repo.git(&["--no-optional-locks", "status", "--porcelain"]);
+    assert_eq!(status, "M tracked.txt", "git itself sees the edit");
+    let svc = Service::new();
+
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_eq!(paths(&svc, &pending), ["tracked.txt"]);
+}
+
 /// A repository on `feature` where the human has uncommitted work in progress (an edit to
 /// `shared.txt` and an untracked `notes.txt`) when the agent runs `start`.
 fn human_work_in_progress() -> TestRepo {
