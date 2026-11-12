@@ -51,7 +51,7 @@ impl GitHub {
     /// The adapter for `host`, whose API is at `host.api_base` or else derived: github.com's
     /// is `https://api.github.com`, an Enterprise host's `https://HOST/api/v3`.
     pub fn new(host: HostConfig, credentials: CredentialSources) -> Self {
-        let github_com = host.is_default();
+        let github_com = ForgeKind::GitHub.is_default_host(&host.host);
         let api = match &host.api_base {
             Some(base) => base.trim_end_matches('/').to_owned(),
             None if github_com => "https://api.github.com".to_owned(),

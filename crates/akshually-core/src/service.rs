@@ -371,13 +371,13 @@ impl SessionView {
     /// What the Session's tab marks it with, the first that applies: it needs attention, a
     /// reload is on offer (files changed on disk, or the Pull Request received pushes), or it's
     /// the agent's Turn. `None` otherwise.
-    pub fn status(&self) -> Option<SessionStatus> {
+    pub fn mark(&self) -> Option<SessionMark> {
         if self.attention {
-            Some(SessionStatus::Attention)
+            Some(SessionMark::Attention)
         } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() {
-            Some(SessionStatus::ReloadOffered)
+            Some(SessionMark::ReloadOffered)
         } else if self.turn == Turn::Agent {
-            Some(SessionStatus::AgentsTurn)
+            Some(SessionMark::AgentsTurn)
         } else {
             None
         }
@@ -489,9 +489,9 @@ pub struct PlacedThread {
     pub thread: ThreadId,
 }
 
-/// What a Session's tab marks it with (`SessionView::status`).
+/// What a Session's tab marks it with (`SessionView::mark`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionStatus {
+pub enum SessionMark {
     /// It became the human's Turn while another tab was displayed.
     Attention,
     /// Files changed on disk, or the Pull Request received pushes: a reload is on offer.
@@ -987,9 +987,8 @@ impl Service {
         };
         // Closing a Pull Request before Publish tells its co-Reviewer, if any, it was Abandoned.
         match end {
-            Ending::Close => self.close(id),
-            Ending::Abandon if pull_request => self.close(id),
-            Ending::Abandon => self.end(id, Outcome::Abandoned),
+            Ending::Abandon if !pull_request => self.end(id, Outcome::Abandoned),
+            _ => self.close(id),
         }
     }
 
@@ -1038,13 +1037,8 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        let view = &session.view;
-        if outcome == Outcome::Approved && view.actions().verdict != Some(VerdictAction::Approve) {
-            return Err(match view.pull_request() {
-                Some(_) => Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()),
-                None if view.turn != Turn::Human => Error::NotYourTurn,
-                None => Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()),
-            });
+        if outcome == Outcome::Approved {
+            session.view.check_approve()?;
         }
         session.conclude(outcome);
         inner.reap();

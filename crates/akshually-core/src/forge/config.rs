@@ -39,11 +39,6 @@ impl HostConfig {
     pub fn new(kind: ForgeKind, host: impl Into<String>) -> Self {
         HostConfig { kind, host: host.into(), api_base: None, token: None }
     }
-
-    /// Whether this is its Forge's own public host, github.com or gitlab.com.
-    pub fn is_default(&self) -> bool {
-        self.kind.is_default_host(&self.host)
-    }
 }
 
 /// Which Forge a host runs.
@@ -89,7 +84,7 @@ impl ForgeKind {
 /// Every host to serve: `configured`, plus github.com unless configured.
 pub(super) fn with_github_com(configured: &[HostConfig]) -> Vec<HostConfig> {
     let mut hosts = configured.to_vec();
-    if !hosts.iter().any(|h| h.kind == ForgeKind::GitHub && h.is_default()) {
+    if !hosts.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host)) {
         hosts.insert(0, HostConfig::new(ForgeKind::GitHub, ForgeKind::GitHub.default_host()));
     }
     hosts

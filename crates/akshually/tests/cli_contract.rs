@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Party, Side};
+use akshually_core::{Anchor, Party, Side, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
 
@@ -143,6 +143,30 @@ fn review_format_json_prints_the_verdict_as_json() {
     let out = finish(child);
     assert_eq!(out.status.code(), Some(EXIT_APPROVED));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"outcome\":\"approved\"}\n");
+}
+
+#[test]
+fn review_format_json_prints_who_resolved_a_thread_in_the_round() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+    let second = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
+    app.wait_for_review(&session.id);
+    let t1 = ThreadRef::new(&session.id, &akshually_core::ThreadId::new("T1"));
+    app.service.reply_in_thread(&t1, "Fine as it is.").unwrap();
+    app.service.resolve_thread(&t1).unwrap();
+
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(second);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(printed["threads"][0]["id"], "T1");
+    assert_eq!(printed["threads"][0]["resolved"], "human", "{printed:#}");
 }
 
 #[test]

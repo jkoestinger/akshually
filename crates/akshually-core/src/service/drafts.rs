@@ -1,7 +1,7 @@
 //! Draft rules: the human's Drafts, what the next Round carries, handing it over or taking it
 //! back, and the co-Reviewer's Drafts the human keeps, edits or discards.
 
-use super::{ChangesetView, Outcome, Service, SessionId, SessionView, ThreadRef, Turn, VerdictAction};
+use super::{ChangesetView, Outcome, Service, SessionId, SessionView, ThreadRef, Turn};
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Changeset, Error};
 
@@ -37,13 +37,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        if !session.view.actions().hand_over.is_some_and(|h| h.offered) {
-            return Err(match &session.view {
-                view if view.ended.is_some() => Error::Ended,
-                view if view.turn != Turn::Human => Error::NotYourTurn,
-                _ => Error::NoDrafts,
-            });
-        }
+        session.view.check_hand_over()?;
         let number = session.view.round;
         let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
@@ -86,15 +80,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        if session.view.actions().verdict != Some(VerdictAction::TakeTurnBack) {
-            return Err(match &session.view {
-                view if view.ended.is_some() => Error::Ended,
-                view if view.turn == Turn::Human => Error::AlreadyYourTurn,
-                _ => Error::InvalidRequest(
-                    "a Pull Request's co-Reviewer gives the Turn back with its next `akshually review --pr`".into(),
-                ),
-            });
-        }
+        session.view.check_take_turn_back()?;
         // Rounds no agent received yet go back to being Drafts, for the human to keep editing,
         // and the last Round is the one before them again.
         let first = session.queued.iter().find_map(|o| match o {
@@ -169,16 +155,11 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let view = &mut inner.sessions[at].view;
-        let actions = view.actions();
-        let offered = actions.thread(thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
-        if view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        if !offered.agent_draft {
+        if !view.thread_offered(thread)?.agent_draft {
             return Err(Error::NotAnAgentDraft(thread.clone()));
         }
         let threads = &mut view.threads;
-        let found = threads.iter().position(|t| &t.id == thread).expect("`actions` lists the Session's Threads");
+        let found = threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
         let result = f(threads, found);
         inner.notify();
         Ok(result)

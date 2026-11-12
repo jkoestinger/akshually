@@ -19,7 +19,7 @@ use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Ending, FileChange, HandOver, InboxRow,
     InboxRowState, InboxView, NewComment, Outcome, Party, PublishPlan, Role, Service, SessionActions, SessionId,
-    SessionStatus, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, Verdict, VerdictAction,
+    SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, Verdict, VerdictAction,
     fence_for,
 };
 
@@ -962,7 +962,9 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
             .child(text("VERDICT").font(k.ty.small).color(k.c.text_faint))
             .child(verdicts)
             .children(own.then(|| {
-                text("Your own Pull Request: the Forge takes feedback only.").font(k.ty.small).color(k.c.text_muted)
+                text("Your own Pull Request: the Forge offers only the Verdicts above.")
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
             }))
             .child(
                 TextArea::new(&s.summary)
@@ -1134,10 +1136,10 @@ fn verdict_label(verdict: Verdict) -> &'static str {
 /// The tab's marker: attention, a dot for a reload on offer, a quiet working indicator during
 /// the agent's Turn.
 fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
-    session.status().map(|status| match status {
-        SessionStatus::Attention => TabItemStatus::Attention,
-        SessionStatus::ReloadOffered => TabItemStatus::Unread,
-        SessionStatus::AgentsTurn => TabItemStatus::Busy,
+    session.mark().map(|mark| match mark {
+        SessionMark::Attention => TabItemStatus::Attention,
+        SessionMark::ReloadOffered => TabItemStatus::Unread,
+        SessionMark::AgentsTurn => TabItemStatus::Busy,
     })
 }
 
@@ -1764,6 +1766,8 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             n => format!("{n} Comments"),
         };
         let at = ThreadRef::new(&tab.session.id, &thread.id);
+        // `actions` is worked out from the same Session, so it has every Thread.
+        let resolve = tab.actions.thread(&thread.id).and_then(|o| resolve_button(k, thread, &tab.session.id, o));
         let summary = row()
             .w_full()
             .gap(8.0)
@@ -1774,7 +1778,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
                     .color(k.c.text_muted),
             )
             .child(row().grow(1.0))
-            .children(tab.actions.thread(&thread.id).and_then(|o| resolve_button(k, thread, &tab.session.id, o)))
+            .children(resolve)
             .child(
                 Button::new(if expanded { "Hide" } else { "Show" })
                     .variant(ButtonVariant::Ghost)

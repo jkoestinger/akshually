@@ -9,8 +9,8 @@ use akshually_core::forge::{
 };
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Comment, Ending, Error, FileChange, HandOver, Outcome, Party, ReviewRequest,
-    Role, Service, SessionId, SessionStatus, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef,
-    Turn, Verdict, VerdictAction,
+    Role, Service, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn,
+    Verdict, VerdictAction,
 };
 use akshually_testkit::TestRepo;
 
@@ -83,30 +83,44 @@ fn published() -> Option<Outcome> {
 
 // --- The Verdict and how the Session ends ---
 
-#[test]
-fn the_verdict_and_the_ending_follow_source_role_turn_and_whether_the_session_ended() {
-    use Ending::{Abandon, Close};
+/// Every Session the table covers: Source × agent role × Turn × ended, named.
+fn every_session() -> [(&'static str, SessionView); 11] {
     use Role::{Author, CoReviewer};
     use Turn::{Agent, Human};
-    use VerdictAction::{Approve, TakeTurnBack};
-    let cases = [
-        ("local work, the human's Turn", local(Author, Human, None), Some(Approve), Abandon),
-        ("local work, the agent's Turn", local(Author, Agent, None), Some(TakeTurnBack), Abandon),
-        ("local work approved", local(Author, Human, Some(Outcome::Approved)), None, Close),
-        ("local work abandoned", local(Author, Agent, Some(Outcome::Abandoned)), None, Close),
-        ("a local co-review, the human's Turn", local(CoReviewer, Human, None), None, Close),
-        ("a local co-review, the agent's Turn", local(CoReviewer, Agent, None), Some(TakeTurnBack), Close),
-        ("a local co-review closed", local(CoReviewer, Human, Some(Outcome::Closed)), None, Close),
-        ("a Pull Request alone", pull_request(None, Human, None), None, Abandon),
-        ("a Pull Request, the co-Reviewer's Turn", pull_request(Some(CoReviewer), Agent, None), None, Abandon),
-        ("a Pull Request, the human's Turn", pull_request(Some(CoReviewer), Human, None), None, Abandon),
-        ("a Pull Request Published", pull_request(None, Human, published()), None, Close),
-    ];
-    for (what, session, verdict, end) in cases {
-        let actions = session.actions();
+    [
+        ("local work, the human's Turn", local(Author, Human, None)),
+        ("local work, the agent's Turn", local(Author, Agent, None)),
+        ("local work approved", local(Author, Human, Some(Outcome::Approved))),
+        ("local work abandoned", local(Author, Agent, Some(Outcome::Abandoned))),
+        ("a local co-review, the human's Turn", local(CoReviewer, Human, None)),
+        ("a local co-review, the agent's Turn", local(CoReviewer, Agent, None)),
+        ("a local co-review closed", local(CoReviewer, Human, Some(Outcome::Closed))),
+        ("a Pull Request alone", pull_request(None, Human, None)),
+        ("a Pull Request, the co-Reviewer's Turn", pull_request(Some(CoReviewer), Agent, None)),
+        ("a Pull Request, the human's Turn", pull_request(Some(CoReviewer), Human, None)),
+        ("a Pull Request Published", pull_request(None, Human, published())),
+    ]
+}
 
-        assert_eq!((actions.verdict, actions.end), (verdict, end), "{what}");
-    }
+#[test]
+fn the_verdict_is_approve_in_the_humans_turn_and_take_turn_back_in_the_agents_on_local_work_only() {
+    use VerdictAction::{Approve, TakeTurnBack};
+    let expected =
+        [Some(Approve), Some(TakeTurnBack), None, None, None, Some(TakeTurnBack), None, None, None, None, None];
+
+    let verdicts = every_session().map(|(what, session)| (what, session.actions().verdict));
+
+    assert_eq!(verdicts, std::array::from_fn(|i| (every_session()[i].0, expected[i])));
+}
+
+#[test]
+fn a_session_ends_by_abandoning_it_unless_it_has_its_outcome_or_is_a_local_co_review() {
+    use Ending::{Abandon, Close};
+    let expected = [Abandon, Abandon, Close, Close, Close, Close, Close, Abandon, Abandon, Abandon, Close];
+
+    let endings = every_session().map(|(what, session)| (what, session.actions().end));
+
+    assert_eq!(endings, std::array::from_fn(|i| (every_session()[i].0, expected[i])));
 }
 
 // --- Handing a Round over ---
@@ -155,15 +169,23 @@ fn a_round_with_nothing_to_carry_can_t_be_handed_over() {
 }
 
 #[test]
-fn a_round_can_t_be_handed_over_in_the_agents_turn_or_once_the_session_ended() {
-    let drafts = || vec![thread("T1", vec![comment(Party::Human, None)])];
-    let agents_turn = with_threads(local(Role::Author, Turn::Agent, None), drafts());
-    let ended = with_threads(local(Role::Author, Turn::Human, Some(Outcome::Approved)), drafts());
+fn a_round_can_t_be_handed_over_in_the_agents_turn() {
+    let drafts = vec![thread("T1", vec![comment(Party::Human, None)])];
+    let session = with_threads(local(Role::Author, Turn::Agent, None), drafts);
 
-    let (during, after) = (agents_turn.actions().hand_over, ended.actions().hand_over);
+    let hand_over = session.actions().hand_over;
 
-    assert_eq!(during, Some(HandOver { items: 1, offered: false }), "during the agent's Turn");
-    assert_eq!(after, Some(HandOver { items: 1, offered: false }), "once ended");
+    assert_eq!(hand_over, Some(HandOver { items: 1, offered: false }));
+}
+
+#[test]
+fn a_round_can_t_be_handed_over_once_the_session_ended() {
+    let drafts = vec![thread("T1", vec![comment(Party::Human, None)])];
+    let session = with_threads(local(Role::Author, Turn::Human, Some(Outcome::Approved)), drafts);
+
+    let hand_over = session.actions().hand_over;
+
+    assert_eq!(hand_over, Some(HandOver { items: 1, offered: false }));
 }
 
 #[test]
@@ -412,14 +434,14 @@ fn attention_is_marked_before_a_reload_on_offer_and_a_reload_before_the_agents_t
         (
             "needs attention",
             SessionView { changed_on_disk: on_disk.changed_on_disk.clone(), ..attention },
-            Some(SessionStatus::Attention),
+            Some(SessionMark::Attention),
         ),
-        ("changed on disk", on_disk, Some(SessionStatus::ReloadOffered)),
-        ("pushed to", pushed, Some(SessionStatus::ReloadOffered)),
-        ("the agent's Turn", working, Some(SessionStatus::AgentsTurn)),
+        ("changed on disk", on_disk, Some(SessionMark::ReloadOffered)),
+        ("pushed to", pushed, Some(SessionMark::ReloadOffered)),
+        ("the agent's Turn", working, Some(SessionMark::AgentsTurn)),
         ("the human's Turn, seen", yours, None),
     ];
-    for (what, session, status) in cases {
-        assert_eq!(session.status(), status, "{what}");
+    for (what, session, mark) in cases {
+        assert_eq!(session.mark(), mark, "{what}");
     }
 }

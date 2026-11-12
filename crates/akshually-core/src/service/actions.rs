@@ -2,6 +2,7 @@
 //! actions) and the service (which refuses every other) go by (#38).
 
 use super::{Role, SessionView, Source, Turn};
+use crate::Error;
 use crate::thread::{Comment, Thread, ThreadId};
 
 /// What the human can do in a Session now, worked out from its Source, agent role, Turn and
@@ -95,6 +96,59 @@ impl SessionView {
         let threads = self.threads.iter().map(|t| thread_actions(t, ended)).collect();
         SessionActions { verdict, end, hand_over, threads }
     }
+
+    // Why the service refuses an action `actions()` doesn't offer, next to the table so the
+    // reasons follow its rules.
+
+    /// Refuses approving unless the Session offers it.
+    pub(super) fn check_approve(&self) -> Result<(), Error> {
+        if self.actions().verdict == Some(VerdictAction::Approve) {
+            return Ok(());
+        }
+        Err(match self.pull_request() {
+            _ if self.ended.is_some() => Error::Ended,
+            Some(_) => Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()),
+            None if self.turn != Turn::Human => Error::NotYourTurn,
+            None => Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()),
+        })
+    }
+
+    /// Refuses taking the Turn back unless the Session offers it.
+    pub(super) fn check_take_turn_back(&self) -> Result<(), Error> {
+        if self.actions().verdict == Some(VerdictAction::TakeTurnBack) {
+            return Ok(());
+        }
+        Err(match self {
+            _ if self.ended.is_some() => Error::Ended,
+            _ if self.turn == Turn::Human => Error::AlreadyYourTurn,
+            _ => Error::InvalidRequest(
+                "a Pull Request's co-Reviewer gives the Turn back with its next `akshually review --pr`".into(),
+            ),
+        })
+    }
+
+    /// Refuses handing the Round over unless the Session offers it.
+    pub(super) fn check_hand_over(&self) -> Result<(), Error> {
+        if self.actions().hand_over.is_some_and(|h| h.offered) {
+            return Ok(());
+        }
+        Err(match self {
+            _ if self.ended.is_some() => Error::Ended,
+            _ if self.turn != Turn::Human => Error::NotYourTurn,
+            _ => Error::NoDrafts,
+        })
+    }
+
+    /// What the Session offers in `thread`; refused outright for a Thread it doesn't have, or
+    /// once it has ended.
+    pub(super) fn thread_offered(&self, thread: &ThreadId) -> Result<ThreadActions, Error> {
+        let found =
+            self.threads.iter().find(|t| &t.id == thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
+        if self.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        Ok(thread_actions(found, false))
+    }
 }
 
 /// What the human can do in `thread`, nothing once the Session has `ended`.
@@ -113,6 +167,6 @@ fn thread_actions(thread: &Thread, ended: bool) -> ThreadActions {
 
 /// Whether the agent (or the Forge) has `thread`: a Thread still all Drafts goes out whole with
 /// the next Round, so there's nothing to reply to or resolve yet.
-pub(super) fn is_sent(thread: &Thread) -> bool {
+fn is_sent(thread: &Thread) -> bool {
     thread.comments.iter().any(|c| !c.is_draft())
 }

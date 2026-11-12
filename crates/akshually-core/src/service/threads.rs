@@ -99,13 +99,8 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let view = &mut inner.sessions[at].view;
-        let actions = view.actions();
-        let actions = actions.thread(thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
-        if view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        offered(actions)?;
-        let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`actions` lists the Session's Threads");
+        offered(&view.thread_offered(thread)?)?;
+        let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`thread_offered` found it");
         f(found);
         inner.notify();
         Ok(())

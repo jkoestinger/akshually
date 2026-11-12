@@ -23,7 +23,7 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, DiffLayout, Ending, HandOver, InboxRow, InboxRowState, InboxView, Outcome,
-    PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions, SessionId, SessionStatus,
+    PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark,
     SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, Verdict, VerdictAction,
 };
 pub use settings::{Settings, SettingsError};
