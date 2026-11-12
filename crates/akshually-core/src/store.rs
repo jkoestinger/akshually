@@ -1,5 +1,6 @@
 //! Persistence: one JSON file per open Session under the state directory, never inside the
-//! repository under Review, plus one file for the Session bases recorded by `start`.
+//! repository under Review, plus one file each for the Session bases recorded by `start`, the
+//! Inbox, and the diff layout.
 //!
 //! The store mirrors the service's Sessions after every change: it rewrites the files whose
 //! content changed and deletes the files of Sessions that ended. Whatever a Session serialises
@@ -27,6 +28,8 @@ pub(crate) struct Store {
     /// The Inbox as last refreshed, and what the human has seen of it.
     inbox: PathBuf,
     inbox_written: Option<u64>,
+    /// The window's diff layout, which the human chooses there.
+    diff_layout: PathBuf,
 }
 
 impl Store {
@@ -47,6 +50,7 @@ impl Store {
             bases_written: None,
             inbox: state_dir.join("inbox.json"),
             inbox_written: None,
+            diff_layout: state_dir.join("diff-layout.json"),
         };
         let bases = match fs::read_to_string(&store.bases) {
             Ok(json) => match serde_json::from_str(&json) {
@@ -96,24 +100,9 @@ impl Store {
     /// Reads the saved Inbox; the default when there is none or it can't be read (it's only a
     /// cache of the Forges, plus what the human has seen).
     pub(crate) fn load_inbox<I: DeserializeOwned + Default>(&mut self) -> I {
-        let json = match fs::read_to_string(&self.inbox) {
-            Ok(json) => json,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return I::default(),
-            Err(error) => {
-                eprintln!("akshually: skipping unreadable {}: {error}", self.inbox.display());
-                return I::default();
-            }
-        };
-        match serde_json::from_str(&json) {
-            Ok(inbox) => {
-                self.inbox_written = Some(hash(&json));
-                inbox
-            }
-            Err(error) => {
-                eprintln!("akshually: skipping unreadable {}: {error}", self.inbox.display());
-                I::default()
-            }
-        }
+        let (inbox, json) = load_or_default(&self.inbox);
+        self.inbox_written = json.as_deref().map(hash);
+        inbox
     }
 
     /// Saves the Inbox, if it changed since last time.
@@ -125,6 +114,17 @@ impl Store {
             self.inbox_written = Some(hash);
         }
         Ok(())
+    }
+
+    /// Reads the saved diff layout; the default when there is none or it can't be read.
+    pub(crate) fn load_diff_layout<L: DeserializeOwned + Default>(&self) -> L {
+        load_or_default(&self.diff_layout).0
+    }
+
+    /// Saves the diff layout.
+    pub(crate) fn save_diff_layout<L: Serialize>(&self, layout: &L) -> Result<(), Error> {
+        let json = serde_json::to_string(layout).map_err(std::io::Error::from)?;
+        write_atomically(&self.diff_layout, &json)
     }
 
     /// Makes the files match `sessions`: writes new and changed ones, deletes ended ones.
@@ -159,6 +159,27 @@ impl Store {
 
     fn write(&self, id: &SessionId, json: &str) -> Result<(), Error> {
         write_atomically(&self.path(id), json)
+    }
+}
+
+/// Reads the file at `path`, and the JSON it held when that parsed. A missing file gives the
+/// default; so does one that can't be read, which is reported: what it held isn't worth
+/// stopping the app for.
+fn load_or_default<T: DeserializeOwned + Default>(path: &Path) -> (T, Option<String>) {
+    let json = match fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (T::default(), None),
+        Err(error) => {
+            eprintln!("akshually: skipping unreadable {}: {error}", path.display());
+            return (T::default(), None);
+        }
+    };
+    match serde_json::from_str(&json) {
+        Ok(value) => (value, Some(json)),
+        Err(error) => {
+            eprintln!("akshually: skipping unreadable {}: {error}", path.display());
+            (T::default(), None)
+        }
     }
 }
 

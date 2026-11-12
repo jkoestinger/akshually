@@ -8,18 +8,18 @@
 use std::sync::Arc;
 
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
-use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
+use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, Select, SelectAppearance,
-    TextArea, TextInput,
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, SegmentedControl, Select,
+    SelectAppearance, TextArea, TextInput,
 };
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
-    Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, ThreadRef,
-    Turn, Verdict, fence_for,
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, FileChange, InboxRow, InboxRowState, InboxView,
+    NewComment, Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId,
+    ThreadRef, Turn, Verdict, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -166,8 +166,9 @@ struct SessionTab {
 }
 
 impl SessionTab {
-    fn new(session: SessionView) -> Self {
+    fn new(session: SessionView, layout: DiffLayout) -> Self {
         let mut diff = DiffState::new(Vec::new());
+        diff.set_mode(diff_mode(layout));
         show_files(&mut diff, session.shown());
         let mut tab = SessionTab { session, diff, expanded: Vec::new(), choosing_view: false };
         tab.annotate(None);
@@ -183,6 +184,13 @@ impl SessionTab {
             .collect();
         notes.extend(composer.filter(|c| c.session == self.session.id).and_then(|c| c.at.clone()));
         self.diff.set_annotations(notes);
+    }
+}
+
+fn diff_mode(layout: DiffLayout) -> DiffMode {
+    match layout {
+        DiffLayout::Stacked => DiffMode::Unified,
+        DiffLayout::SideBySide => DiffMode::Split,
     }
 }
 
@@ -290,6 +298,7 @@ impl State {
     /// rebuilding its diff only when its Changeset changed.
     pub fn apply(&mut self, sessions: Vec<SessionView>) {
         let mut old = std::mem::take(&mut self.tabs);
+        let layout = self.service.diff_layout();
         self.tabs = sessions
             .into_iter()
             .map(|session| match old.iter().position(|t| t.session.id == session.id) {
@@ -305,7 +314,7 @@ impl State {
                     tab.session = session;
                     tab
                 }
-                None => SessionTab::new(session),
+                None => SessionTab::new(session, layout),
             })
             .collect();
         if self.composer.as_ref().is_some_and(|c| !self.tabs.iter().any(|t| t.session.id == c.session)) {
@@ -453,6 +462,14 @@ impl State {
         // The Session may have ended meanwhile; its tab goes with the next update.
         let _ = self.service.display(&id);
         self.active = Some(id);
+    }
+
+    /// Lays out every tab's diff as `layout`, and keeps it for tabs opened later.
+    fn set_diff_layout(&mut self, layout: DiffLayout) {
+        self.service.set_diff_layout(layout);
+        for tab in &mut self.tabs {
+            tab.diff.set_mode(diff_mode(layout));
+        }
     }
 
     fn show(&self, id: &SessionId, view: ChangesetView) {
@@ -857,6 +874,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
+        .child(layout_control(k, tab))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
         .child(
             Button::new("Comment on Review")
@@ -1075,6 +1093,31 @@ fn view_dropdown(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
     Some(view_select)
 }
 
+/// The header's diff layout control. It shows the layout of the tab's own diff, which every
+/// tab shares; picking one lays out every tab's diff that way.
+fn layout_control(k: &Kit, tab: &SessionTab) -> El {
+    let selected = DIFF_LAYOUTS.iter().position(|&layout| diff_mode(layout) == tab.diff.mode());
+    SegmentedControl::new(&DIFF_LAYOUTS.map(layout_label), selected)
+        .label("Diff layout")
+        .fit()
+        .on_pick(|s: &mut State, at: usize, _: &mut Tx| {
+            if let Some(&layout) = DIFF_LAYOUTS.get(at) {
+                s.set_diff_layout(layout);
+            }
+        })
+        .build(k)
+}
+
+/// The diff layouts the header offers, in this order.
+const DIFF_LAYOUTS: [DiffLayout; 2] = [DiffLayout::Stacked, DiffLayout::SideBySide];
+
+fn layout_label(layout: DiffLayout) -> &'static str {
+    match layout {
+        DiffLayout::Stacked => "Stacked",
+        DiffLayout::SideBySide => "Side by side",
+    }
+}
+
 fn view_label(view: ChangesetView) -> &'static str {
     match view {
         ChangesetView::SinceLastRound => "Since last Round",
@@ -1153,6 +1196,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
+        .child(layout_control(k, tab))
         .children(view_select)
         .child(
             Button::new("Comment on Review")

@@ -23,3 +23,5 @@ rune-notify.workspace = true
 
 [dev-dependencies]
 akshually-testkit.workspace = true
+# Reads the headless window's accessibility tree.
+serde_json.workspace = true

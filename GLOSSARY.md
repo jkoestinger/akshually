@@ -12,6 +12,10 @@ _Avoid_: Code review session, inspection
 The set of changes under Review, shown as a diff against a base.
 _Avoid_: Diff, patch, PR (a PR is one possible Source of a Changeset)
 
+**Diff layout**:
+How the window shows every Changeset's old and new lines: stacked in one column, or side by side. One for the whole window, kept across restarts.
+_Avoid_: Diff mode, view (a Changeset view is which Changeset is shown, not how)
+
 **Session base**:
 A snapshot of the working tree taken before an agent starts, so its Changeset can exclude work that was already there.
 _Avoid_: Checkpoint, baseline

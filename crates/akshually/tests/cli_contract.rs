@@ -160,6 +160,7 @@ fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
     let mut second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
 
     assert!(still_running(&mut second), "the second call didn't wait for the human");
+    app.wait_for_review(&session.id);
     let sessions = app.service.sessions();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, session.id);
@@ -480,6 +481,7 @@ fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
     assert!(stdout.starts_with("# Round 1\n"), "{stdout}");
     let mut third = app.akshually(repo.path(), &["review"]).spawn().unwrap();
     assert!(still_running(&mut third), "the Round was delivered twice");
+    app.wait_for_review(&session.id);
     app.service.approve(&session.id).unwrap();
     assert_eq!(finish(third).status.code(), Some(EXIT_APPROVED));
 }
