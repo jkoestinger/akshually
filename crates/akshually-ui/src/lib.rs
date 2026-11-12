@@ -171,7 +171,9 @@ impl SessionTab {
 
     fn title(&self) -> String {
         if let Some(pr) = &self.session.pull_request {
-            return format!("{} #{}", pr.id.repo, pr.id.number);
+            // GitLab numbers merge requests `!97`, and only its URLs have `/-/merge_requests/`.
+            let sigil = if pr.url.contains("/-/merge_requests/") { '!' } else { '#' };
+            return format!("{} {sigil}{}", pr.id.repo, pr.id.number);
         }
         let repo = self
             .session
@@ -736,13 +738,15 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
         .child(row().w(200.0).justify_end().child(text(state).font(k.ty.small).color(color)))
 }
 
-/// `GitHub · acme/web #482 · maria · opened 2 h ago`; hosts other than github.com are named.
+/// `GitHub · acme/web #482 · maria · opened 2 h ago`, or `GitLab · gitlab.example.com ·
+/// platform/infra !97 · …`: hosts other than github.com and gitlab.com are named.
 fn inbox_meta(item: &InboxItem, now: i64) -> String {
     let PullRequestRef { host, repo, number } = &item.id;
     let (forge, sigil) = match item.kind {
         ForgeKind::GitHub => ("GitHub", '#'),
+        ForgeKind::GitLab => ("GitLab", '!'),
     };
-    let place = if host == "github.com" {
+    let place = if host == "github.com" || host == "gitlab.com" {
         format!("{repo} {sigil}{number}")
     } else {
         format!("{host} · {repo} {sigil}{number}")
@@ -1643,7 +1647,12 @@ fn scene_inbox(s: &mut State) {
     let rows = vec![
         (item("acme/web", 482, "Add SSO login", "maria", 2, InboxRole::Reviewer), InboxRowState::New),
         (
-            item("platform/infra", 97, "Rotate database credentials", "tom", 24, InboxRole::Assignee),
+            InboxItem {
+                id: PullRequestRef { host: "gitlab.example.com".into(), repo: "platform/infra".into(), number: 97 },
+                kind: ForgeKind::GitLab,
+                url: "https://gitlab.example.com/platform/infra/-/merge_requests/97".into(),
+                ..item("platform/infra", 97, "Rotate database credentials", "tom", 24, InboxRole::Assignee)
+            },
             InboxRowState::SessionOpen { session: SessionId::new("sample"), drafts: 2 },
         ),
         (

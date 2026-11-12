@@ -1,4 +1,4 @@
-//! Forge adapters: how the core reads Pull Requests from GitHub (and later GitLab).
+//! Forge adapters: how the core reads Pull Requests from GitHub and GitLab.
 //!
 //! The review service holds a set of [`ForgeAdapter`]s, one per configured host, and asks each
 //! whether it recognises a Pull Request URL. Adapters return plain core data (a [`Changeset`],
@@ -11,10 +11,12 @@ use crate::{BinarySizes, Changeset, FileChange, Side, Verdict};
 mod config;
 mod credentials;
 mod github;
+mod gitlab;
 
 pub use config::{ForgeKind, HostConfig};
 pub use credentials::CredentialSources;
 pub use github::GitHub;
+pub use gitlab::GitLab;
 
 /// Every host the Forge adapters serve: `configured` (`Settings::hosts`), plus github.com.
 pub fn served_hosts(configured: &[HostConfig]) -> Vec<HostConfig> {
@@ -175,7 +177,8 @@ pub struct PullRequest {
     pub head_branch: String,
     /// The commit the Changeset shows; a new push changes it.
     pub head_sha: String,
-    /// The target branch's commit the Pull Request was compared against when fetched.
+    /// The target branch's commit the Pull Request was compared against when fetched: its tip
+    /// on GitHub, the merge-base on GitLab (`diff_refs.base_sha`).
     pub base_sha: String,
 }
 
@@ -216,8 +219,9 @@ pub struct RemoteComment {
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
     #[error(
-        "no credentials for {host}: run `gh auth login --hostname {host}`, set a token in the environment, \
-         or paste a token into akshually's config"
+        "no credentials for {host}: log in with `gh auth login --hostname {host}` (GitHub) or \
+         `glab auth login --hostname {host}` (GitLab), set a token in the environment, or paste a token \
+         into akshually's config"
     )]
     NoCredentials { host: String },
     #[error("{host} refused the token (HTTP {status}); check it is valid and can read this repository")]
@@ -230,6 +234,8 @@ pub enum ForgeError {
     Http { host: String, message: String },
     #[error("unexpected answer from {host}: {message}")]
     Unexpected { host: String, message: String },
+    #[error("akshually can't {what} on {host} yet")]
+    Unsupported { host: String, what: &'static str },
 }
 
 /// The adapters for github.com and every configured host (`Settings::hosts`).
@@ -238,6 +244,7 @@ pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dy
         .into_iter()
         .map(|host| match host.kind {
             ForgeKind::GitHub => Box::new(GitHub::new(host, sources.clone())) as Box<dyn ForgeAdapter>,
+            ForgeKind::GitLab => Box::new(GitLab::new(host, sources.clone())),
         })
         .collect()
 }
