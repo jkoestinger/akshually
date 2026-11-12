@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
-    ReviewComment,
+    ReviewComment, ReviewReply,
 };
-use akshually_core::{Anchor, Changeset, Error, FileChange, NewComment, Outcome, Service, Side, Verdict};
+use akshually_core::{
+    Anchor, Changeset, Error, FileChange, ForgeThread, Hunk, NewComment, Outcome, Service, Side, Verdict,
+};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
 
@@ -23,6 +25,20 @@ struct FakeForge {
     refuse: bool,
     /// Publish says it started, then waits to be let through.
     hold: Option<Hold>,
+    /// The Threads already on the Pull Request.
+    remote: Vec<RemoteThread>,
+}
+
+/// The one Thread on the Pull Request unless a test says otherwise: `RT_1`, on README.md.
+fn readme_thread() -> RemoteThread {
+    RemoteThread {
+        id: "RT_1".into(),
+        anchor: RemoteAnchor::File { path: "README.md".into() },
+        outdated: false,
+        resolved_by: None,
+        diff_hunk: String::new(),
+        comments: vec![RemoteComment { author: "lee".into(), body: "Mention Okta?".into() }],
+    }
 }
 
 fn pr_ref() -> PullRequestRef {
@@ -52,19 +68,13 @@ impl ForgeAdapter for FakeForge {
             files: vec![
                 FileChange::text("login.rs", Some("fn login() {}\n"), Some("fn login() {\n    sso();\n}\n")),
                 FileChange::text("README.md", Some("# Web\n"), Some("# Web\n\nSSO.\n")),
+                config_rs(),
             ],
         })
     }
 
     fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
-        Ok(vec![RemoteThread {
-            id: "RT_1".into(),
-            anchor: RemoteAnchor::File { path: "README.md".into() },
-            outdated: false,
-            resolved_by: None,
-            diff_hunk: String::new(),
-            comments: vec![RemoteComment { author: "lee".into(), body: "Mention Okta?".into() }],
-        }])
+        Ok(self.remote.clone())
     }
 
     fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
@@ -87,7 +97,13 @@ impl ForgeAdapter for FakeForge {
 
 fn service_for(author: &str) -> (Service, Arc<Mutex<Vec<Review>>>) {
     let published = Arc::new(Mutex::new(Vec::new()));
-    let forge = FakeForge { author: author.into(), published: published.clone(), refuse: false, hold: None };
+    let forge = FakeForge {
+        author: author.into(),
+        published: published.clone(),
+        refuse: false,
+        hold: None,
+        remote: vec![readme_thread()],
+    };
     (Service::new().with_forges(vec![Box::new(forge)]), published)
 }
 
@@ -130,6 +146,9 @@ fn publish_sends_one_review_with_every_kept_draft_the_summary_and_the_verdict() 
                     suggestion: None,
                 },
             ],
+            replies: Vec::new(),
+            resolve: Vec::new(),
+            reopen: Vec::new(),
         }
     );
 }
@@ -176,7 +195,13 @@ fn after_publish_the_session_has_its_verdict_and_can_be_closed() {
 
 #[test]
 fn when_the_forge_refuses_the_review_the_session_and_its_drafts_stay_as_they_were() {
-    let forge = FakeForge { author: "maria".into(), published: Arc::default(), refuse: true, hold: None };
+    let forge = FakeForge {
+        author: "maria".into(),
+        published: Arc::default(),
+        refuse: true,
+        hold: None,
+        remote: vec![readme_thread()],
+    };
     let svc = Service::new().with_forges(vec![Box::new(forge)]);
     let id = svc.open_pull_request(URL).unwrap();
     svc.comment(&id, Anchor::file("README.md"), "Link the docs.").unwrap();
@@ -194,7 +219,13 @@ fn a_session_being_published_is_not_published_twice() {
     let (release, release_rx) = channel();
     let published = Arc::new(Mutex::new(Vec::new()));
     let hold = Some((Mutex::new(started_tx), Mutex::new(release_rx)));
-    let forge = FakeForge { author: "maria".into(), published: published.clone(), refuse: false, hold };
+    let forge = FakeForge {
+        author: "maria".into(),
+        published: published.clone(),
+        refuse: false,
+        hold,
+        remote: vec![readme_thread()],
+    };
     let svc = Arc::new(Service::new().with_forges(vec![Box::new(forge)]));
     let id = svc.open_pull_request(URL).unwrap();
     svc.comment(&id, Anchor::file("README.md"), "Link the docs.").unwrap();
@@ -224,12 +255,13 @@ fn feedback_with_nothing_to_say_is_refused() {
 }
 
 #[test]
-fn the_plan_lists_what_will_be_sent_and_what_will_not() {
+fn the_plan_lists_new_threads_and_replies_on_existing_ones_and_publish_sends_them() {
     let (svc, published) = service_for("maria");
     let id = svc.open_pull_request(URL).unwrap();
     let new = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 1..=3), "Needs a test.").unwrap();
     let existing = svc.session(&id).unwrap().threads[0].id.clone();
     svc.reply_in_thread(&id, &existing, "Agreed.").unwrap();
+    svc.reply_in_thread(&id, &existing, "Okta and Entra.").unwrap();
 
     let plan = svc.publish_plan(&id).unwrap();
 
@@ -237,13 +269,38 @@ fn the_plan_lists_what_will_be_sent_and_what_will_not() {
         threads.iter().map(|t| (t.id.clone(), t.comments.iter().map(|c| c.body.clone()).collect())).collect()
     };
     let kept: Vec<(_, Vec<String>)> = listed(&plan.kept);
-    let discarded: Vec<(_, Vec<String>)> = listed(&plan.discarded);
-    assert_eq!(kept, vec![(new, vec!["Needs a test.".to_owned()])]);
-    assert_eq!(discarded, vec![(existing, vec!["Agreed.".to_owned()])], "replies go out from #26 on");
+    let expected = vec![
+        (existing.clone(), vec!["Agreed.".to_owned(), "Okta and Entra.".to_owned()]),
+        (new, vec!["Needs a test.".to_owned()]),
+    ];
+    assert_eq!(kept, expected);
+    assert!(plan.discarded.is_empty());
     assert_eq!(plan.verdicts, Verdict::ALL.to_vec());
 
     svc.publish(&id, Verdict::Feedback, "").unwrap();
-    assert_eq!(published.lock().unwrap()[0].comments.len(), 1, "only what was kept is sent");
+
+    let published = published.lock().unwrap();
+    assert_eq!(published[0].comments.len(), 1, "one new Thread");
+    assert_eq!(
+        published[0].replies,
+        vec![ReviewReply { thread: "RT_1".into(), body: "Agreed.\n\nOkta and Entra.".into() }],
+        "one reply in the existing Thread, by its Forge id"
+    );
+    let session = svc.session(&id).unwrap();
+    let thread = session.threads.iter().find(|t| t.id == existing).unwrap();
+    assert!(thread.comments.iter().all(|c| !c.is_draft()), "the replies went out");
+}
+
+#[test]
+fn a_reply_alone_is_enough_for_feedback() {
+    let (svc, published) = service_for("maria");
+    let id = svc.open_pull_request(URL).unwrap();
+    let existing = svc.session(&id).unwrap().threads[0].id.clone();
+    svc.reply_in_thread(&id, &existing, "Done in the next PR.").unwrap();
+
+    svc.publish(&id, Verdict::Feedback, "").unwrap();
+
+    assert_eq!(published.lock().unwrap()[0].replies.len(), 1);
 }
 
 #[test]
@@ -259,4 +316,105 @@ fn a_verdict_the_forge_would_reject_is_refused_and_nothing_is_sent() {
     let session = svc.session(&id).unwrap();
     assert_eq!(session.ended, None);
     assert!(session.threads[1].comments[0].is_draft(), "the Draft stays");
+}
+
+#[test]
+fn existing_threads_keep_their_forge_ids() {
+    let (svc, _) = service_for("maria");
+    let id = svc.open_pull_request(URL).unwrap();
+
+    let session = svc.session(&id).unwrap();
+
+    assert_eq!(session.threads[0].forge, Some(ForgeThread { id: "RT_1".into(), resolved: false }));
+}
+
+/// `RT_2`, on login.rs, which `lee` resolved.
+fn resolved_thread() -> RemoteThread {
+    RemoteThread {
+        id: "RT_2".into(),
+        anchor: RemoteAnchor::Lines { path: "login.rs".into(), side: Side::New, start: 2, end: 2 },
+        resolved_by: Some("lee".into()),
+        comments: vec![RemoteComment { author: "lee".into(), body: "Typo.".into() }],
+        ..readme_thread()
+    }
+}
+
+fn service_with(remote: Vec<RemoteThread>) -> (Service, Arc<Mutex<Vec<Review>>>) {
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let forge = FakeForge { author: "maria".into(), published: published.clone(), refuse: false, hold: None, remote };
+    (Service::new().with_forges(vec![Box::new(forge)]), published)
+}
+
+#[test]
+fn resolving_and_reopening_existing_threads_is_listed_and_published_with_the_review() {
+    let (svc, published) = service_with(vec![readme_thread(), resolved_thread()]);
+    let id = svc.open_pull_request(URL).unwrap();
+    let threads = svc.session(&id).unwrap().threads;
+    let (open, resolved) = (threads[0].id.clone(), threads[1].id.clone());
+    svc.resolve_thread(&id, &open).unwrap();
+    svc.reopen_thread(&id, &resolved).unwrap();
+
+    let plan = svc.publish_plan(&id).unwrap();
+
+    let ids = |threads: &[akshually_core::Thread]| threads.iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&plan.resolve), vec![open.clone()]);
+    assert_eq!(ids(&plan.reopen), vec![resolved.clone()]);
+
+    svc.publish(&id, Verdict::Approve, "").unwrap();
+
+    let review = published.lock().unwrap()[0].clone();
+    assert_eq!((review.resolve, review.reopen), (vec!["RT_1".to_owned()], vec!["RT_2".to_owned()]));
+    let threads = svc.session(&id).unwrap().threads;
+    assert_eq!(threads[0].forge, Some(ForgeThread { id: "RT_1".into(), resolved: true }), "resolved there now");
+    assert_eq!(threads[1].forge, Some(ForgeThread { id: "RT_2".into(), resolved: false }), "reopened there now");
+}
+
+#[test]
+fn a_thread_resolved_and_reopened_again_before_publish_is_left_alone() {
+    let (svc, published) = service_with(vec![readme_thread()]);
+    let id = svc.open_pull_request(URL).unwrap();
+    let thread = svc.session(&id).unwrap().threads[0].id.clone();
+    svc.resolve_thread(&id, &thread).unwrap();
+    svc.reopen_thread(&id, &thread).unwrap();
+
+    let plan = svc.publish_plan(&id).unwrap();
+    svc.publish(&id, Verdict::Approve, "").unwrap();
+
+    assert!(plan.resolve.is_empty() && plan.reopen.is_empty());
+    let review = published.lock().unwrap()[0].clone();
+    assert!(review.resolve.is_empty() && review.reopen.is_empty());
+}
+
+/// 20 lines, of which the Forge's diff shows two hunks: new lines 3-9 (old 3-8) and 15-20
+/// (old 14-19).
+fn config_rs() -> FileChange {
+    let old: String = (1..=19).map(|n| format!("old {n}\n")).collect();
+    let new: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    FileChange {
+        hunks: Some(vec![
+            Hunk { old_start: 3, old_lines: 6, new_start: 3, new_lines: 7 },
+            Hunk { old_start: 14, old_lines: 6, new_start: 15, new_lines: 6 },
+        ]),
+        ..FileChange::text("config.rs", Some(&old), Some(&new))
+    }
+}
+
+#[test]
+fn line_comments_outside_the_forge_s_diff_are_refused_and_the_file_is_offered_instead() {
+    let (svc, _) = service_for("maria");
+    let id = svc.open_pull_request(URL).unwrap();
+
+    let refused = |anchor| svc.comment(&id, anchor, "Hm.").unwrap_err();
+    let outside = refused(Anchor::lines(Side::New, "config.rs", 1..=1));
+    let across = refused(Anchor::lines(Side::New, "config.rs", 8..=16));
+    let old_side = refused(Anchor::lines(Side::Old, "config.rs", 9..=9));
+
+    for error in [&outside, &across, &old_side] {
+        assert!(matches!(error, Error::OutsideDiff { path, .. } if path == "config.rs"), "{error:?}");
+    }
+    assert!(outside.to_string().contains("whole file"), "{outside}");
+    svc.comment(&id, Anchor::lines(Side::New, "config.rs", 3..=9), "In the first hunk.").unwrap();
+    svc.comment(&id, Anchor::lines(Side::Old, "config.rs", 14..=19), "In the second.").unwrap();
+    svc.comment(&id, Anchor::file("config.rs"), "On the file.").unwrap();
+    assert_eq!(svc.session(&id).unwrap().threads.len(), 4, "RT_1 and three Drafts");
 }

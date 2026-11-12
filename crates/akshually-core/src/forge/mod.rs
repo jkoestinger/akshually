@@ -125,6 +125,21 @@ pub struct Review {
     pub body: String,
     /// One per new Thread, in the order they were opened.
     pub comments: Vec<ReviewComment>,
+    /// One per Thread already on the Forge that the human replied in.
+    pub replies: Vec<ReviewReply>,
+    /// The Forge ids of Threads to mark Resolved there.
+    pub resolve: Vec<String>,
+    /// The Forge ids of Threads Resolved there to reopen.
+    pub reopen: Vec<String>,
+}
+
+/// A reply in a Thread already on the Forge, sent within the [`Review`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewReply {
+    /// The Forge's id for the Thread ([`RemoteThread::id`]).
+    pub thread: String,
+    /// Markdown: the human's reply Drafts, joined.
+    pub body: String,
 }
 
 /// A new Thread's opening Comment in a [`Review`].
@@ -250,10 +265,10 @@ pub(crate) fn file_change(path: String, old: Option<Vec<u8>>, new: Option<Vec<u8
         let size = |bytes: &Option<Vec<u8>>| bytes.as_ref().map(|b| b.len() as u64);
         let sizes = BinarySizes { old: size(&old), new: size(&new) };
         let (old, new) = (old.map(|_| String::new()), new.map(|_| String::new()));
-        return FileChange { path, old, new, binary: Some(sizes), collapsed: None };
+        return FileChange { path, old, new, binary: Some(sizes), collapsed: None, hunks: None };
     }
     let text = |bytes: Vec<u8>| {
         String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
     };
-    FileChange { path, old: old.map(text), new: new.map(text), binary: None, collapsed: None }
+    FileChange { path, old: old.map(text), new: new.map(text), binary: None, collapsed: None, hunks: None }
 }

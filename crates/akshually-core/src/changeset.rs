@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::git::{self, GitError};
-use crate::{Error, Settings};
+use crate::{Anchor, Error, Settings, Side};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Changeset {
@@ -32,9 +32,62 @@ pub struct FileChange {
     /// Set for a file shown collapsed until the human expands it, and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapsed: Option<Collapsed>,
+    /// The hunks of the Forge's own diff of this file, the only lines where it takes line
+    /// comments; `None` where any line will do (local work), or the Forge didn't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<Hunk>>,
+}
+
+/// One hunk of a diff, as its `@@ -old_start,old_lines +new_start,new_lines @@` header gives it
+/// (1-based; a side without lines starts at the line before).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hunk {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+}
+
+impl Hunk {
+    /// The hunks in a unified diff `patch`, from their headers.
+    pub(crate) fn parse_patch(patch: &str) -> Vec<Hunk> {
+        // `-start[,lines]`, where `lines` defaults to 1.
+        fn span(text: &str) -> Option<(u32, u32)> {
+            let (start, lines) = text.split_once(',').unwrap_or((text, "1"));
+            Some((start.parse().ok()?, lines.parse().ok()?))
+        }
+        let header = |line: &str| {
+            let mut parts = line.strip_prefix("@@ ")?.split(' ');
+            let (old_start, old_lines) = span(parts.next()?.strip_prefix('-')?)?;
+            let (new_start, new_lines) = span(parts.next()?.strip_prefix('+')?)?;
+            Some(Hunk { old_start, old_lines, new_start, new_lines })
+        };
+        patch.lines().filter_map(header).collect()
+    }
+
+    /// Lines `start..=end` on `side` are all in this hunk.
+    fn holds(&self, side: Side, start: u32, end: u32) -> bool {
+        let (first, lines) = match side {
+            Side::Old => (self.old_start, self.old_lines),
+            Side::New => (self.new_start, self.new_lines),
+        };
+        lines > 0 && first <= start && end < first + lines
+    }
 }
 
 impl Changeset {
+    /// Whether the Forge takes a comment at `anchor` in this Changeset: a line range must lie
+    /// in one hunk of its file's diff there, when the Forge said which (GitHub refuses the
+    /// rest). Other Anchors always fit.
+    pub fn takes_comment_at(&self, anchor: &Anchor) -> bool {
+        let Anchor::Lines { path, side, start, end } = anchor else { return true };
+        let file = self.files.iter().find(|f| &f.path == path);
+        match file.and_then(|f| f.hunks.as_ref()) {
+            Some(hunks) => hunks.iter().any(|h| h.holds(*side, *start, *end)),
+            None => true,
+        }
+    }
+
     /// What changed between `earlier` (a Round snapshot) and this Changeset: one file per path
     /// whose new side differs, with `earlier`'s new side as `old`. A file missing from one of
     /// the two is taken to be at the base there, so both should share the same base.
@@ -72,6 +125,7 @@ impl FileChange {
             new: new.map(Into::into),
             binary: None,
             collapsed: None,
+            hunks: None,
         }
     }
 }
@@ -228,7 +282,7 @@ fn diff(repo: &Path, base: String, new: &str, excluded: &HashSet<String>) -> Res
                 new: in_new.then(|| size(new)).transpose()?,
             };
             let (old, new) = (in_old.then(String::new), in_new.then(String::new));
-            files.push(FileChange { path, old, new, binary: Some(sizes), collapsed: None });
+            files.push(FileChange { path, old, new, binary: Some(sizes), collapsed: None, hunks: None });
             continue;
         };
         let blob = |tree: &str| git::git_bytes(repo, &["cat-file", "blob", &object(tree)]).map(text);
@@ -247,7 +301,7 @@ fn diff(repo: &Path, base: String, new: &str, excluded: &HashSet<String>) -> Res
         } else {
             None
         };
-        files.push(FileChange { path, old, new, binary: None, collapsed });
+        files.push(FileChange { path, old, new, binary: None, collapsed, hunks: None });
     }
     Ok(Changeset { base, files })
 }

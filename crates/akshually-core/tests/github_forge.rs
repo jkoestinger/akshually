@@ -9,7 +9,7 @@ use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, adapters,
 };
-use akshually_core::{BinarySizes, FileChange, Settings, Side};
+use akshually_core::{BinarySizes, FileChange, Hunk, Settings, Side};
 use akshually_testkit::TestDirs;
 use mockito::{Matcher, Mock, Server, ServerGuard};
 
@@ -213,15 +213,24 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
 
     reads.iter().for_each(Mock::assert);
     assert_eq!(changeset.base, "mb1");
-    let change = FileChange::text;
+    // Line comments only fit GitHub's own diff: its hunks, and none on a rename's lines.
+    let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| {
+        let hunks = hunks.iter().map(|&(old_start, old_lines, new_start, new_lines)| Hunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        });
+        FileChange { hunks: Some(hunks.collect()), ..FileChange::text(path, old, new) }
+    };
     assert_eq!(
         changeset.files,
         vec![
-            change("docs/new.md", None, Some("# New\n")),
-            change("lib/b.rs", None, Some("fn b() {}\n")),
-            change("old.txt", Some("bye\n"), None),
-            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n")),
-            change("src/b.rs", Some("fn b() {}\n"), None),
+            change("docs/new.md", None, Some("# New\n"), &[(0, 0, 1, 1)]),
+            change("lib/b.rs", None, Some("fn b() {}\n"), &[]),
+            change("old.txt", Some("bye\n"), None, &[(1, 1, 0, 0)]),
+            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n"), &[(1, 1, 1, 1)]),
+            change("src/b.rs", Some("fn b() {}\n"), None, &[]),
         ]
     );
 }
@@ -251,6 +260,7 @@ fn a_binary_file_is_summarised_by_size() {
     let file = &changeset.files[0];
     assert_eq!(file.binary, Some(BinarySizes { old: Some(13), new: Some(15) }));
     assert_eq!((file.old.as_deref(), file.new.as_deref()), (Some(""), Some("")));
+    assert_eq!(file.hunks, None, "GitHub gave no patch to take hunks from");
 }
 
 #[test]

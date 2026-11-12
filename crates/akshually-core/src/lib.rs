@@ -15,7 +15,7 @@ mod settings;
 mod store;
 mod thread;
 
-pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
+pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, Hunk, LocalOptions};
 pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
@@ -24,7 +24,7 @@ pub use service::{
     ReviewRequest, Service, SessionId, SessionView, Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
-pub use thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -68,4 +68,9 @@ pub enum Error {
     EmptyReview,
     #[error("this Session is being published")]
     Publishing,
+    #[error(
+        "{path}: {side} lines {start}-{end} aren't within one hunk of the Pull Request's diff, the only place \
+         the Forge takes line comments; comment on the whole file instead"
+    )]
+    OutsideDiff { path: String, side: Side, start: u32, end: u32 },
 }

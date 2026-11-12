@@ -122,6 +122,9 @@ struct Composer {
     /// Where the composer shows in the diff: a line range's last line. File and Review
     /// composers show above the diff instead.
     at: Option<Annotation>,
+    /// Why the Draft can't be saved as it is: on a Pull Request, lines out of the Forge's diff
+    /// are refused as soon as they're picked.
+    error: Option<String>,
 }
 
 struct SessionTab {
@@ -489,7 +492,8 @@ impl State {
 
     fn open_composer(&mut self, anchor: Anchor, at: Option<Annotation>) {
         let Some(tab) = self.active_tab() else { return };
-        self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
+        let error = outside_diff(&tab.session, &anchor);
+        self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at, error });
         self.composer_text = TextEdit::new("");
         self.annotate();
     }
@@ -506,8 +510,22 @@ impl State {
         let comment = NewComment::from_markdown(&self.composer_text.text);
         match self.service.comment(&composer.session, composer.anchor.clone(), comment) {
             Ok(_) => self.close_composer(),
-            Err(error) => eprintln!("akshually: {error}"),
+            Err(error) => {
+                if let Some(composer) = &mut self.composer {
+                    composer.error = Some(error.to_string());
+                }
+            }
         }
+    }
+
+    /// Moves the composer, text and all, from lines the Forge refuses to their whole file.
+    fn compose_on_file(&mut self) {
+        let Some(composer) = &mut self.composer else { return };
+        let Anchor::Lines { path, .. } = &composer.anchor else { return };
+        composer.anchor = Anchor::file(path.clone());
+        composer.at = None;
+        composer.error = None;
+        self.annotate();
     }
 
     /// Opens the reply composer in `thread`.
@@ -826,7 +844,11 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
         for (thread, kept) in plan.kept.iter().map(|t| (t, true)).chain(plan.discarded.iter().map(|t| (t, false))) {
             list = list.child(publish_row(k, thread, kept));
         }
-        if plan.kept.is_empty() && plan.discarded.is_empty() {
+        let resolutions = plan.resolve.iter().map(|t| (t, "Resolve")).chain(plan.reopen.iter().map(|t| (t, "Reopen")));
+        for (thread, what) in resolutions {
+            list = list.child(resolution_row(k, thread, what));
+        }
+        if [&plan.kept, &plan.discarded, &plan.resolve, &plan.reopen].iter().all(|l| l.is_empty()) {
             list =
                 list.child(text("No Drafts: only the Verdict and summary go out.").font(k.ty.ui).color(k.c.text_muted));
         }
@@ -911,13 +933,9 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
 
 /// One Thread's Drafts in the Publish dialog, ticked when they're sent.
 fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
-    let on = match &thread.anchor {
-        Anchor::Lines { path, side: Side::New, start, end } if start == end => format!("{path}:{end}"),
-        Anchor::Lines { path, side: Side::New, start, end } => format!("{path}:{start}-{end}"),
-        Anchor::Lines { path, side: Side::Old, start, end } => format!("{path}, old {start}-{end}"),
-        anchor => general_label(anchor).unwrap_or_default(),
-    };
+    let on = publish_place(thread);
     let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let on = if thread.forge.is_some() { format!("Reply in {} on {on}", thread.id) } else { on };
     let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
     let suggestion = thread.comments.iter().any(|c| c.suggestion.is_some());
     row()
@@ -927,6 +945,28 @@ fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
         .child(Checkbox::new(kept).disabled(true).build(k))
         .child(text(what).font(k.ty.ui).color(if kept { k.c.text_base } else { k.c.text_faint }).grow(1.0).min_w(0.0))
         .children(suggestion.then(|| text("suggestion").font(k.ty.small).color(k.c.text_faint)))
+}
+
+/// Where a Thread is, as the Publish dialog names it.
+fn publish_place(thread: &Thread) -> String {
+    match &thread.anchor {
+        Anchor::Lines { path, side: Side::New, start, end } if start == end => format!("{path}:{end}"),
+        Anchor::Lines { path, side: Side::New, start, end } => format!("{path}:{start}-{end}"),
+        Anchor::Lines { path, side: Side::Old, start, end } => format!("{path}, old {start}-{end}"),
+        anchor => general_label(anchor).unwrap_or_default(),
+    }
+}
+
+/// A Thread Publish resolves or reopens on the Forge (`what`), in the Publish dialog.
+fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
+    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let line = format!("{what} {} on {} — {first}", thread.id, publish_place(thread));
+    row()
+        .w_full()
+        .gap(8.0)
+        .items_center()
+        .child(Checkbox::new(true).disabled(true).build(k))
+        .child(text(line).font(k.ty.ui).color(k.c.text_base).grow(1.0).min_w(0.0))
 }
 
 fn verdict_label(verdict: Verdict) -> &'static str {
@@ -1452,9 +1492,13 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
 }
 
 fn composer(k: &Kit, s: &State) -> El {
+    let error = s.composer.as_ref().and_then(|c| c.error.clone());
+    // Lines the Forge refuses can still go on their file.
+    let on_lines = s.composer.as_ref().is_some_and(|c| matches!(c.anchor, Anchor::Lines { .. }));
     card(k)
         .key("composer")
         .child(text(composer_title(s)).font(k.ty.small).color(k.c.text_faint))
+        .children(error.map(|e| text(e).font(k.ty.small).color(k.c.danger.fg).wrap()))
         .child(
             TextArea::new(&s.composer_text)
                 .placeholder("Comment…")
@@ -1471,6 +1515,12 @@ fn composer(k: &Kit, s: &State) -> El {
                 .items_center()
                 .child(text("Markdown · suggestion: ```suggestion").font(k.ty.small).color(k.c.text_faint))
                 .child(row().grow(1.0))
+                .children((on_lines && s.composer.as_ref().is_some_and(|c| c.error.is_some())).then(|| {
+                    Button::new("Comment on the file")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut State| s.compose_on_file())
+                        .build(k)
+                }))
                 .child(
                     Button::new("Discard")
                         .variant(ButtonVariant::Ghost)
@@ -1484,6 +1534,14 @@ fn composer(k: &Kit, s: &State) -> El {
                         .build(k),
                 ),
         )
+}
+
+/// Why the Forge would refuse a Comment at `anchor` in `session`, if it would.
+fn outside_diff(session: &SessionView, anchor: &Anchor) -> Option<String> {
+    let Anchor::Lines { path, side, start, end } = anchor else { return None };
+    let refused = session.pull_request.is_some() && !session.changeset.takes_comment_at(anchor);
+    let (path, side, start, end) = (path.clone(), *side, *start, *end);
+    refused.then(|| akshually_core::Error::OutsideDiff { path, side, start, end }.to_string())
 }
 
 fn composer_title(s: &State) -> String {
@@ -1565,6 +1623,7 @@ fn scene_threads(s: &mut State) {
         resolved: None,
         outdated: false,
         reopened: false,
+        forge: None,
     };
     let session = SessionView {
         id: SessionId::new("sample"),
@@ -1681,6 +1740,12 @@ fn scene_publish(s: &mut State) {
     suggested.comments[0].suggestion = Some("    let before = self.changeset.snapshot()?;\n".into());
     let mut reply = sample_thread("T2", 1..=1, "Agreed, the env var name is enough.", None);
     reply.anchor = Anchor::file("README.md");
+    reply.forge = Some(akshually_core::ForgeThread { id: "PRRT_2".into(), resolved: false });
+    let mut outdated = sample_thread("T4", 2..=2, "Typo in the doc comment.", None);
+    outdated.outdated = true;
+    let mut answered = sample_thread("T5", 4..=4, "Is the round number still needed?", None);
+    answered.comments[0].author = Party::Other("lee".into());
+    answered.forge = Some(akshually_core::ForgeThread { id: "PRRT_5".into(), resolved: false });
     let session = SessionView {
         id: SessionId::new("pr"),
         branch: "sso".into(),
@@ -1693,8 +1758,10 @@ fn scene_publish(s: &mut State) {
     s.apply(vec![session]);
     let plan = PublishPlan {
         verdicts: Verdict::ALL.to_vec(),
-        kept: vec![suggested, sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
-        discarded: vec![reply],
+        kept: vec![reply, suggested, sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
+        discarded: vec![outdated],
+        resolve: vec![answered],
+        reopen: Vec::new(),
     };
     s.publish = Some(Publish {
         session: SessionId::new("pr"),
@@ -1715,6 +1782,7 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
         resolved: None,
         outdated: false,
         reopened: false,
+        forge: None,
     }
 }
 
@@ -1725,6 +1793,7 @@ fn sample_changeset() -> Changeset {
             FileChange {
                 binary: None,
                 collapsed: None,
+                hunks: None,
                 path: "src/session.rs".into(),
                 old: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let round = Round::new(drafts);\n    Ok(round)\n}\n".into()),
                 new: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let snapshot = self.changeset.snapshot()?;\n    let round = Round::new(drafts, snapshot);\n    Ok(round)\n}\n".into()),
