@@ -70,7 +70,11 @@ impl Harness {
             Some(token) => fake_gh(self.dirs.path(), "github.com", token),
             None => self.dirs.path().join("no-gh-here"),
         };
-        CredentialSources { gh, env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
+        CredentialSources {
+            gh,
+            glab: "/nonexistent".into(),
+            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
     }
 
     fn adapter(&self, host: HostConfig, sources: CredentialSources) -> GitHub {
@@ -160,7 +164,10 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
         .unwrap();
     let settings = Settings::load(&file).unwrap();
 
-    let forges = adapters(&settings.hosts, &CredentialSources { gh: "/nonexistent".into(), env: HashMap::new() });
+    let forges = adapters(
+        &settings.hosts,
+        &CredentialSources { gh: "/nonexistent".into(), glab: "/nonexistent".into(), env: HashMap::new() },
+    );
 
     let url = "https://github.example.com/platform/infra/pull/97";
     let recognised: Vec<_> = forges.iter().filter_map(|f| f.recognise(url)).collect();
@@ -371,7 +378,11 @@ fn when_gh_has_no_token_for_the_host_the_environment_is_next() {
     let gh = fake_gh(h.dirs.path(), "github.example.com", "other-host");
     let github = h.adapter(
         h.host("github.com"),
-        CredentialSources { gh, env: HashMap::from([("GITHUB_TOKEN".into(), "from-env".into())]) },
+        CredentialSources {
+            gh,
+            glab: "/nonexistent".into(),
+            env: HashMap::from([("GITHUB_TOKEN".into(), "from-env".into())]),
+        },
     );
 
     github.pull_request(&pr_ref()).unwrap();
@@ -398,7 +409,7 @@ fn enterprise_hosts_ask_gh_for_their_host_and_never_get_the_github_com_token() {
     let mock = h.get("/repos/acme/web/pulls/482", "ghe-from-gh", &fixture("pull.json"));
     let gh = fake_gh(h.dirs.path(), "github.example.com", "ghe-from-gh");
     let env = HashMap::from([("GITHUB_TOKEN".into(), "github-com-token".into())]);
-    let github = h.adapter(h.host("github.example.com"), CredentialSources { gh, env });
+    let github = h.adapter(h.host("github.example.com"), CredentialSources { gh, glab: "/nonexistent".into(), env });
 
     github.pull_request(&ghe).unwrap();
 
