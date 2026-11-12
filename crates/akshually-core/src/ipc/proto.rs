@@ -2,7 +2,7 @@
 //! exactly one reply (possibly after a long wait).
 //!
 //! ```jsonc
-//! {"v":1,"op":"review","cwd":"/abs/repo"}            // client → app
+//! {"v":1,"op":"review","cwd":"/abs/repo","base":"main"} // client → app; options optional
 //! {"v":1,"ok":{"outcome":"approved"}}                // app → client
 //! {"v":1,"err":{"code":"version","message":"…"}}
 //! ```
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionId, SessionView, ThreadId};
+use crate::{LocalOptions, SessionId, SessionView, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -20,7 +20,13 @@ pub const VERSION: u32 = 1;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Blocks until the human answers; replies with an `Outcome`.
-    Review { cwd: PathBuf },
+    Review {
+        cwd: PathBuf,
+        #[serde(flatten)]
+        local: LocalOptions,
+    },
+    /// Records the Session base; replies `{}` at once.
+    Start { cwd: PathBuf },
     /// The agent replies to a Thread in the Session for `cwd`. Replies `{}` at once.
     Reply { cwd: PathBuf, thread: ThreadId, body: String },
     /// The agent resolves a Thread in the Session for `cwd`. Replies `{}` at once.

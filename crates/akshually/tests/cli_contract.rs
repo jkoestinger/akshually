@@ -3,6 +3,7 @@
 
 mod support;
 
+use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Party, Side};
 use akshually_testkit::{TestDirs, TestRepo};
@@ -269,6 +270,85 @@ fn test_control_is_refused_by_an_app_not_started_for_tests() {
     let refused = ipc::connect(&app.paths()).unwrap().test_state();
 
     assert!(matches!(refused, Err(ClientError::App(e)) if e.code == ErrorCode::Forbidden));
+}
+
+/// `topic` forks from `main`, and `agent` from `topic`. Each branch adds the file named after
+/// it, and `forgot.txt` is untracked.
+fn stacked_branches() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("main.txt", "main\n").commit_all("main");
+    repo.branch("topic").write("topic.txt", "topic\n").commit_all("topic");
+    repo.branch("agent").write("agent.txt", "agent\n").commit_all("agent");
+    repo.write("forgot.txt", "forgot\n");
+    repo
+}
+
+/// Runs `review args` until its Session opens, abandons it, and returns the Session's paths.
+fn reviewed_paths(app: &HostedApp, repo: &TestRepo, args: &[&str]) -> Vec<String> {
+    let call = app.akshually(repo.path(), &[&["review"], args].concat()).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.abandon(&session.id).unwrap();
+    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+    session.shown().files.iter().map(|f| f.path.clone()).collect()
+}
+
+#[test]
+fn review_takes_a_base_and_the_untracked_override() {
+    let app = HostedApp::start();
+    let repo = stacked_branches();
+
+    assert_eq!(reviewed_paths(&app, &repo, &[]), ["agent.txt", "forgot.txt", "topic.txt"]);
+    assert_eq!(reviewed_paths(&app, &repo, &["--base", "topic", "--no-untracked"]), ["agent.txt"]);
+    app.service.set_settings(Settings { untracked: false });
+    assert_eq!(reviewed_paths(&app, &repo, &["--base", "topic", "--untracked"]), ["agent.txt", "forgot.txt"]);
+}
+
+#[test]
+fn review_takes_a_commit_range() {
+    let app = HostedApp::start();
+    let repo = stacked_branches();
+
+    assert_eq!(reviewed_paths(&app, &repo, &["main..topic"]), ["topic.txt"]);
+}
+
+#[test]
+fn review_refuses_a_base_together_with_a_range() {
+    let app = HostedApp::start();
+    let repo = stacked_branches();
+
+    let out = finish(app.akshually(repo.path(), &["review", "--base", "main", "main..topic"]).spawn().unwrap());
+
+    assert_eq!(out.status.code(), Some(2), "a usage error");
+    assert!(app.service.sessions().is_empty());
+}
+
+#[test]
+fn start_records_the_session_base_and_returns_at_once() {
+    let app = HostedApp::start();
+    let repo = stacked_branches();
+
+    let started = finish(app.akshually(repo.path(), &["start"]).spawn().unwrap());
+    repo.write("later.txt", "after start\n");
+
+    assert_eq!(started.status.code(), Some(0));
+    assert!(!started.stdout.is_empty(), "start says what it did");
+    assert_eq!(reviewed_paths(&app, &repo, &[]), ["later.txt"]);
+}
+
+#[test]
+fn the_app_reads_the_untracked_setting_from_its_config_file() {
+    let app = LaunchedApp::new();
+    let repo = stacked_branches();
+    let config = app.dirs.path().join("config.toml");
+    std::fs::write(&config, "untracked = false\n").unwrap();
+
+    let call = app.akshually(repo.path(), &["review"]).env("AKSHUALLY_CONFIG", &config).spawn().unwrap();
+    let state = app.wait_for("the Session", |s| s.sessions.len() == 1);
+
+    let paths: Vec<&str> = state.sessions[0].changeset.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["agent.txt", "topic.txt"]);
+    app.human(HumanCommand::Abandon { session: state.sessions[0].id.clone() });
+    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
 }
 
 #[test]

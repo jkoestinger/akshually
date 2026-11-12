@@ -5,7 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{Paths, ReviewRequest, Service};
+use crate::{LocalOptions, Paths, ReviewRequest, Service};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
@@ -79,7 +79,8 @@ impl Server {
 
     fn answer(&self, request: Request) -> Reply {
         let result = match request {
-            Request::Review { cwd } => self.review(cwd),
+            Request::Review { cwd, local } => self.review(cwd, local),
+            Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
             Request::Reply { cwd, thread, body } => {
                 self.service.reply(&cwd, &thread, body).map(|()| serde_json::json!({})).map_err(failed)
             }
@@ -98,8 +99,8 @@ impl Server {
         }
     }
 
-    fn review(&self, cwd: std::path::PathBuf) -> Result<serde_json::Value, ErrorReply> {
-        let pending = self.service.review(ReviewRequest::new(cwd)).map_err(failed)?;
+    fn review(&self, cwd: std::path::PathBuf, local: LocalOptions) -> Result<serde_json::Value, ErrorReply> {
+        let pending = self.service.review(ReviewRequest { cwd, local }).map_err(failed)?;
         match pending.wait() {
             Some(outcome) => Ok(json(outcome)),
             None => Err(ErrorReply::new(ErrorCode::Failed, "the Session stopped waiting for this call")),

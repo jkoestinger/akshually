@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use akshually_core::ipc::{BindError, Connection, Server};
-use akshually_core::{Outcome, Paths, Service, ThreadId};
+use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings, ThreadId};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -30,15 +30,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Snapshot the working tree as the Session base before you start working, so `review`
+    /// shows the human only your changes, not uncommitted work that was already there.
+    /// Returns at once.
+    Start,
     /// Ask the human to review your local work: this branch against its merge-base with the
-    /// default branch, plus uncommitted changes. Blocks until the human answers. Exits 0 when
-    /// they approve, 4 when they hand over a Round (printed as markdown, or JSON with
-    /// `--format json`: address it, reply to or resolve its Threads, then run `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
-    Review {
-        /// How to print the outcome: markdown, or JSON (`{"outcome":"round",...}`).
-        #[arg(long, value_enum, default_value_t = Format::Markdown)]
-        format: Format,
-    },
+    /// default branch, plus uncommitted changes and untracked files. Blocks until the human
+    /// answers. Exits 0 when they approve, 4 when they hand over a Round (printed as markdown,
+    /// or JSON with `--format json`: address it, reply to or resolve its Threads, then run
+    /// `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
+    Review(ReviewArgs),
     /// Reply to a Thread of this branch's Session, e.g. `akshually reply T3 "Done: …"`. The
     /// human sees it at once; returns immediately.
     Reply {
@@ -65,10 +66,51 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct ReviewArgs {
+    /// Review the changes since HEAD's merge-base with this ref, instead of the default branch.
+    #[arg(long, value_name = "REF", conflicts_with = "range")]
+    base: Option<String>,
+    /// Include untracked, non-ignored files, whatever the human's setting says.
+    #[arg(long, conflicts_with = "no_untracked")]
+    untracked: bool,
+    /// Leave out untracked files, whatever the human's setting says.
+    #[arg(long)]
+    no_untracked: bool,
+    /// Review exactly a commit range instead: `<from>..<to>`, or `<from>...<to>` for the
+    /// changes since their merge-base. Uncommitted work is not part of it.
+    #[arg(value_name = "RANGE", conflicts_with_all = ["untracked", "no_untracked"])]
+    range: Option<String>,
+    /// How to print the outcome: markdown, or JSON (`{"outcome":"round",...}`).
+    #[arg(long, value_enum, default_value_t = Format::Markdown)]
+    format: Format,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Format {
+    Markdown,
+    Json,
+}
+
+impl ReviewArgs {
+    fn local(self) -> LocalOptions {
+        let untracked = match (self.untracked, self.no_untracked) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        };
+        LocalOptions { base: self.base, range: self.range, untracked }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Some(Command::Review { format }) => review(format),
+        Some(Command::Start) => start(),
+        Some(Command::Review(args)) => {
+            let format = args.format;
+            review(args.local(), format)
+        }
         Some(Command::Reply { thread, body }) => {
             agent_call(|conn, cwd| conn.reply(cwd, &ThreadId::new(thread), &body).map_err(Into::into))
         }
@@ -84,15 +126,16 @@ fn main() -> ExitCode {
     })
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum Format {
-    Markdown,
-    Json,
+fn start() -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("can't read the current directory")?;
+    launch::connect_or_launch(&Paths::from_env())?.start(&cwd)?;
+    println!("Session base recorded: `akshually review` will show only the changes made from now on.");
+    Ok(ExitCode::SUCCESS)
 }
 
-fn review(format: Format) -> Result<ExitCode> {
+fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd)?;
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local)?;
     let code = match outcome {
         Outcome::Round(_) => exit::ROUND,
         Outcome::Approved => exit::APPROVED,
@@ -114,6 +157,7 @@ fn agent_call(f: impl FnOnce(Connection, &Path) -> Result<()>) -> Result<ExitCod
 
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     let service = Arc::new(Service::new());
+    service.set_settings(Settings::load(&Settings::file_from_env())?);
     if !headless && akshually_ui::is_headless_run(&rune_args) {
         // A headless render (`--snap`, ...) of the UI alone: no socket, no state.
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
