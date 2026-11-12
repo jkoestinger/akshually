@@ -26,6 +26,9 @@ use akshually_core::{
 const COMPOSER: &str = "composer";
 /// The Inbox tab's id in the tab strip (Session ids are `s1`, `s2`, …).
 const INBOX_TAB: &str = "inbox";
+/// The Changeset view dropdown's list width in points: "Since Session base" whole, with the
+/// list's padding and check. `Select`'s own minimum (160) cuts it off.
+const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 
@@ -1036,7 +1039,7 @@ fn view_dropdown(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
     let labels: Vec<&str> = views.iter().map(|&v| view_label(v)).collect();
     let open = tab.choosing_view;
     let (toggle_id, close_id, choose_id) = (session.id.clone(), session.id.clone(), session.id.clone());
-    Select::new("changeset-view", &labels)
+    let view_select = Select::new("changeset-view", &labels)
         .label("Changeset view")
         .appearance(SelectAppearance::Inline)
         .current(Some(view_label(session.view)))
@@ -1049,8 +1052,13 @@ fn view_dropdown(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
                 s.show(&choose_id, view);
             }
         })
-        .build(k, layer)
-        .into()
+        .build(k, layer);
+    // `Select` gives its list a fixed minimum width, and its labels shrink to fit, so the
+    // longest view would be cut off. The list is the last element `build` puts in the layer.
+    if open && let Some(list) = layer.pop() {
+        layer.push(list.min_w(VIEW_LIST_MIN_WIDTH));
+    }
+    Some(view_select)
 }
 
 fn view_label(view: ChangesetView) -> &'static str {
