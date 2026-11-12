@@ -1,0 +1,13 @@
+[package]
+name = "akshually"
+version = "0.1.0"
+edition = "2024"
+description = "A human-in-the-loop code review app for agents and humans"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jkoestinger/akshually"
+readme = "README.md"
+# Shipped as an app (release binaries, package managers), not via crates.io,
+# where the `akshually` name belongs to another crate.
+publish = false
+
+[dependencies]
