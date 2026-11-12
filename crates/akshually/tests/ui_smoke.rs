@@ -1,11 +1,12 @@
 //! UI: a headless render smoke check (Rune's `--snap`, and `--tree` for the text a scene shows),
-//! and the Session header's Changeset view dropdown, read from the `--tree` accessibility tree
-//! after a `--script` of input. Needs a Vulkan or Metal adapter, but no display; on a GPU-less
+//! and the Session header's Changeset view dropdown and diff layout control, read from the
+//! `--tree` accessibility tree after a `--script` of input. Needs a Vulkan or Metal adapter, but no display; on a GPU-less
 //! Linux CI runner, install lavapipe (`mesa-vulkan-drivers`).
 
 use std::path::Path;
 use std::process::Command;
 
+use akshually_core::DiffLayout;
 use akshually_testkit::TestDirs;
 use serde_json::{Value, json};
 
@@ -88,6 +89,30 @@ fn a_session_where_only_the_full_changeset_applies_shows_no_dropdown() {
 }
 
 #[test]
+fn a_session_shows_its_diff_stacked_by_default() {
+    let tree = session_tree(&[]);
+
+    assert_eq!(tree.diff_layout(), DiffLayout::Stacked);
+}
+
+#[test]
+fn picking_side_by_side_lays_out_every_tab_side_by_side() {
+    let tree = session_tree(&[pick_side_by_side(), json!({ "t": 0.4, "type": "click", "key": "t-unseen" })]);
+
+    let unseen = tree.with_role("tab").into_iter().find(|t| t["key"] == "t-unseen").unwrap();
+    assert!(has_state(unseen, "selected"), "the other Session's tab didn't open");
+    assert_eq!(tree.diff_layout(), DiffLayout::SideBySide);
+}
+
+#[test]
+fn threads_still_show_under_their_lines_side_by_side() {
+    let tree = session_tree(&[pick_side_by_side()]);
+
+    assert_eq!(tree.diff_layout(), DiffLayout::SideBySide);
+    assert!(tree.0.to_string().contains("Take the snapshot before building the Round."), "T1 is gone");
+}
+
+#[test]
 fn the_publish_dialog_names_a_gitlab_pull_request_with_its_sigil() {
     let tree = render_tree("publish-gitlab");
 
@@ -159,6 +184,11 @@ fn open_views() -> Value {
     json!({ "t": 0.2, "type": "click", "key": "changeset-view-trigger" })
 }
 
+/// A press on the diff layout control's side-by-side segment.
+fn pick_side_by_side() -> Value {
+    json!({ "t": 0.2, "type": "click", "key": "segment1" })
+}
+
 fn has_state(node: &Value, state: &str) -> bool {
     node["states"].as_array().is_some_and(|states| states.iter().any(|s| s == state))
 }
@@ -180,6 +210,19 @@ impl Tree {
         let mut found = Vec::new();
         walk(&self.0, role, &mut found);
         found
+    }
+
+    /// How the shown diff is laid out: side by side when a removed line sits level with an
+    /// added one, which stacked never puts on one row.
+    fn diff_layout(&self) -> DiffLayout {
+        let tops = |kind: &str| -> Vec<f64> {
+            let rows = self.with_role("list-item").into_iter();
+            let rows = rows.filter(|r| r["name"].as_str().is_some_and(|n| n.starts_with(kind)));
+            rows.map(|r| r["bounds"][1].as_f64().unwrap()).collect()
+        };
+        let (removed, added) = (tops("removed line"), tops("added line"));
+        assert!(!removed.is_empty() && !added.is_empty(), "the diff shows no changed lines");
+        if removed.iter().any(|top| added.contains(top)) { DiffLayout::SideBySide } else { DiffLayout::Stacked }
     }
 }
 

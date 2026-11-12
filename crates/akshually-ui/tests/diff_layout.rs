@@ -1,6 +1,6 @@
 //! UI: the window-wide diff layout in Rune's headless `Runtime`, against real Sessions in the
-//! core service: the Session header's control switches every tab, and tabs opened later take
-//! the current layout.
+//! core service, for what the render smoke check can't reach: its scenes have fixed sample tabs
+//! over an empty service, so no Session arrives, reloads or opens in a layout already saved.
 
 use std::sync::Arc;
 
@@ -55,54 +55,18 @@ fn open_tab(rt: &mut Runtime<State>, id: &SessionId) {
     assert!(rt.find(&format!("diff-{id}")).is_some(), "the tab of {id} didn't open");
 }
 
-/// How the shown tab lays out its diff, read from where its one changed line sits: the removed
-/// line beside the added one (`"side by side"`), or above it (`"stacked"`).
-fn shown_layout(rt: &Runtime<State>) -> &'static str {
-    fn find<'a>(node: &'a Value, name: &str) -> Option<&'a Value> {
-        if node["role"] == "list-item" && node["name"] == name {
-            return Some(node);
+/// How the shown tab lays out its diff: side by side when its removed line sits level with
+/// its added one, which stacked puts on the next row.
+fn shown_layout(rt: &Runtime<State>) -> DiffLayout {
+    fn top(node: &Value, kind: &str) -> Option<f64> {
+        if node["role"] == "list-item" && node["name"].as_str().is_some_and(|n| n.starts_with(kind)) {
+            return node["bounds"][1].as_f64();
         }
-        node["children"].as_array().into_iter().flatten().find_map(|child| find(child, name))
+        node["children"].as_array().into_iter().flatten().find_map(|child| top(child, kind))
     }
     let tree = rt.accessibility_json();
-    let top = |name: &str| {
-        let row = find(&tree, name).unwrap_or_else(|| panic!("the diff shows no \"{name}\""));
-        row["bounds"][1].as_f64().unwrap()
-    };
-    let (removed, added) = (top("removed line 1: one"), top("added line 1: two"));
-    if removed == added {
-        "side by side"
-    } else {
-        assert!(removed < added, "the removed line shows below the added one");
-        "stacked"
-    }
-}
-
-#[test]
-fn a_tab_opens_stacked_by_default() {
-    let repo = repo_with_one_edit();
-    let service = Arc::new(Service::new());
-    let _pending = service.review(ReviewRequest::new(repo.path())).unwrap();
-
-    let rt = window(&service);
-
-    assert_eq!(shown_layout(&rt), "stacked");
-}
-
-#[test]
-fn switching_to_side_by_side_on_one_tab_switches_every_tab() {
-    let (repo_a, repo_b) = (repo_with_one_edit(), repo_with_one_edit());
-    let service = Arc::new(Service::new());
-    let pending_a = service.review(ReviewRequest::new(repo_a.path())).unwrap();
-    let pending_b = service.review(ReviewRequest::new(repo_b.path())).unwrap();
-    service.display(pending_a.session()).unwrap();
-    let mut rt = window(&service);
-
-    pick_side_by_side(&mut rt);
-    open_tab(&mut rt, pending_b.session());
-
-    assert_eq!(shown_layout(&rt), "side by side");
-    assert_eq!(service.diff_layout(), DiffLayout::SideBySide, "the service keeps the layout");
+    let line = |kind: &str| top(&tree, kind).unwrap_or_else(|| panic!("the diff shows no {kind}"));
+    if line("removed line") == line("added line") { DiffLayout::SideBySide } else { DiffLayout::Stacked }
 }
 
 #[test]
@@ -117,7 +81,23 @@ fn a_session_arriving_after_the_switch_opens_in_the_current_layout() {
     deliver_sessions(&mut rt, &service);
     open_tab(&mut rt, pending_b.session());
 
-    assert_eq!(shown_layout(&rt), "side by side");
+    assert_eq!(shown_layout(&rt), DiffLayout::SideBySide);
+    assert_eq!(service.diff_layout(), DiffLayout::SideBySide, "the service keeps the layout");
+}
+
+#[test]
+fn reloading_a_session_keeps_the_current_layout() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let mut rt = window(&service);
+    pick_side_by_side(&mut rt);
+
+    repo.write("a.txt", "three\n");
+    service.reload(pending.session()).unwrap();
+    deliver_sessions(&mut rt, &service);
+
+    assert_eq!(shown_layout(&rt), DiffLayout::SideBySide);
 }
 
 #[test]
@@ -129,5 +109,5 @@ fn restored_tabs_open_in_the_saved_layout() {
 
     let rt = window(&service);
 
-    assert_eq!(shown_layout(&rt), "side by side");
+    assert_eq!(shown_layout(&rt), DiffLayout::SideBySide);
 }
