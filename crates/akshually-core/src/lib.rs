@@ -21,7 +21,7 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PublishPlan,
-    ReviewRequest, Service, SessionId, SessionView, Turn, Verdict,
+    ReviewRequest, Role, Service, SessionId, SessionView, Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
@@ -66,6 +66,10 @@ pub enum Error {
     VerdictNotOffered(Verdict),
     #[error("only an approval can be published without a summary or a Comment")]
     EmptyReview,
+    #[error("this Session already has an agent, as its {0}")]
+    OtherAgent(Role),
+    #[error("{0} isn't an agent Draft")]
+    NotAnAgentDraft(ThreadId),
     #[error("this Session is being published")]
     Publishing,
 }

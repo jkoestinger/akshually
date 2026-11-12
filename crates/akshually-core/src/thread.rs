@@ -145,6 +145,11 @@ impl Comment {
     pub fn is_draft(&self) -> bool {
         self.round.is_none() && !matches!(self.author, Party::Other(_))
     }
+
+    /// A co-Reviewer agent's Draft the human hasn't kept yet. Keeping it makes it the human's.
+    pub fn is_agent_draft(&self) -> bool {
+        self.round.is_none() && self.author == Party::Agent
+    }
 }
 
 /// What a party writes to open a Thread: a markdown body, optionally with a code suggestion.

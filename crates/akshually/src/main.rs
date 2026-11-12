@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use akshually_core::ipc::{BindError, Connection, Server};
-use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings, ThreadId, forge};
+use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -55,6 +55,8 @@ enum Command {
     /// answers. Exits 0 when they approve, 4 when they hand over a Round (printed as markdown,
     /// or JSON with `--format json`: address it, reply to or resolve its Threads, then run
     /// `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
+    /// With `--pr <url>`, hand your Drafts on that Pull Request to the human instead: exits 5
+    /// when they Publish (printing the Verdict and the review's link), 3 when they abandon it.
     Review(ReviewArgs),
     /// Reply to a Thread of this branch's Session, e.g. `akshually reply T3 "Done: …"`. The
     /// human sees it at once; returns immediately.
@@ -70,6 +72,10 @@ enum Command {
         /// The Thread ID from the Round, e.g. `T3`.
         thread: String,
     },
+    /// As co-Reviewer of a Pull Request, add a Draft for the human to keep, edit or discard,
+    /// e.g. `akshually draft --pr <url> --lines src/lib.rs:2-3 "…"`. Prints its Thread ID.
+    /// Then run `akshually review --pr <url>` to hand your Drafts to the human.
+    Draft(DraftArgs),
     /// Print the guide for agents: the review loop, the commands and the exit codes. It is
     /// also a `SKILL.md` you can install as an agent skill.
     AgentHelp,
@@ -103,6 +109,56 @@ struct ReviewArgs {
     /// How to print the outcome: markdown, or JSON (`{"outcome":"round",...}`).
     #[arg(long, value_enum, default_value_t = Format::Markdown)]
     format: Format,
+    /// Co-review this Pull Request instead of your local work: the human gets your Drafts.
+    #[arg(long, value_name = "URL", conflicts_with_all = ["base", "untracked", "no_untracked", "range"])]
+    pr: Option<String>,
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("anchor").required(true).args(["lines", "file", "review"])))]
+struct DraftArgs {
+    /// The Pull Request you co-review.
+    #[arg(long, value_name = "URL", required = true)]
+    pr: String,
+    /// Anchor to lines of a file, 1-based and inclusive: `src/lib.rs:2-3` or `src/lib.rs:2`.
+    #[arg(long, value_name = "PATH:N[-M]", value_parser = parse_lines)]
+    lines: Option<(String, u32, u32)>,
+    /// With `--lines`: count them in the old version of the file, not the new one.
+    #[arg(long, requires = "lines")]
+    old: bool,
+    /// Anchor to a whole file.
+    #[arg(long, value_name = "PATH")]
+    file: Option<String>,
+    /// Anchor to the Review as a whole.
+    #[arg(long)]
+    review: bool,
+    /// Markdown, `-` to read it from stdin. A ```suggestion fence proposes the exact new code
+    /// for new-side lines.
+    body: String,
+}
+
+impl DraftArgs {
+    fn anchor(&self) -> Anchor {
+        match (&self.lines, &self.file) {
+            (Some((path, start, end)), _) => {
+                Anchor::lines(if self.old { Side::Old } else { Side::New }, path, *start..=*end)
+            }
+            (None, Some(path)) => Anchor::file(path),
+            (None, None) => Anchor::Review,
+        }
+    }
+}
+
+/// `PATH:N` or `PATH:N-M`.
+fn parse_lines(value: &str) -> Result<(String, u32, u32), String> {
+    let bad = || format!("expected PATH:N or PATH:N-M, got `{value}`");
+    let (path, range) = value.rsplit_once(':').ok_or_else(bad)?;
+    let (start, end) = range.split_once('-').unwrap_or((range, range));
+    let (start, end) = (start.parse().map_err(|_| bad())?, end.parse().map_err(|_| bad())?);
+    if path.is_empty() || start == 0 || start > end {
+        return Err(bad());
+    }
+    Ok((path.to_owned(), start, end))
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -128,8 +184,12 @@ fn main() -> ExitCode {
         Some(Command::Start) => start(),
         Some(Command::Review(args)) => {
             let format = args.format;
-            review(args.local(), format)
+            match args.pr.clone() {
+                Some(url) => co_review(&url, format),
+                None => review(args.local(), format),
+            }
         }
+        Some(Command::Draft(args)) => draft(args),
         Some(Command::Reply { thread, body }) => {
             agent_call(|conn, cwd| conn.reply(cwd, &ThreadId::new(thread), &body).map_err(Into::into))
         }
@@ -160,22 +220,46 @@ fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
     // Printed and flushed before the app hears back, so the outcome is acknowledged only once
     // the agent can see it.
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, |outcome| {
-        let text = match format {
-            Format::Markdown => render::outcome_markdown(outcome),
-            Format::Json => format!("{}\n", serde_json::to_string(outcome).map_err(io::Error::other)?),
-        };
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(text.as_bytes())?;
-        stdout.flush()
-    })?;
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, |o| print_outcome(o, format))?;
+    Ok(exit_code(&outcome))
+}
+
+/// `review --pr`: the co-Reviewer hands its Drafts to the human and waits for the outcome.
+fn co_review(url: &str, format: Format) -> Result<ExitCode> {
+    let outcome = launch::connect_or_launch(&Paths::from_env())?.co_review(url, |o| print_outcome(o, format))?;
+    Ok(exit_code(&outcome))
+}
+
+fn draft(args: DraftArgs) -> Result<ExitCode> {
+    let anchor = args.anchor();
+    let body = match args.body.as_str() {
+        "-" => io::read_to_string(io::stdin()).context("can't read the Draft from stdin")?,
+        _ => args.body,
+    };
+    let comment = NewComment::from_markdown(&body);
+    let thread = launch::connect_or_launch(&Paths::from_env())?.draft(&args.pr, anchor, comment)?;
+    println!("{thread}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_outcome(outcome: &Outcome, format: Format) -> io::Result<()> {
+    let text = match format {
+        Format::Markdown => render::outcome_markdown(outcome),
+        Format::Json => format!("{}\n", serde_json::to_string(outcome).map_err(io::Error::other)?),
+    };
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+fn exit_code(outcome: &Outcome) -> ExitCode {
     let code = match outcome {
         Outcome::Round(_) => exit::ROUND,
         Outcome::Approved => exit::APPROVED,
         Outcome::Abandoned => exit::ABANDONED,
         Outcome::Published { .. } => exit::PUBLISHED,
     };
-    Ok(ExitCode::from(code))
+    ExitCode::from(code)
 }
 
 /// A call that acts on this branch's Session and returns at once, exiting 0 when it succeeds.

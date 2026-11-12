@@ -8,7 +8,7 @@ use std::sync::Arc;
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, FileChange, InboxRow, InboxRowState, InboxView, NewComment, Outcome,
-    Party, PublishPlan, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
+    Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
 };
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -42,6 +42,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("threads", scene_threads),
             ("inbox", scene_inbox),
             ("publish", scene_publish),
+            ("co-review", scene_co_review),
         ],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
         // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
@@ -97,6 +98,9 @@ struct State {
     /// The Thread a reply is being written in, at most one in the window.
     reply: Option<(SessionId, ThreadId)>,
     reply_text: TextEdit,
+    /// The co-Reviewer's Draft being edited, at most one in the window.
+    editing: Option<(SessionId, ThreadId)>,
+    edit_text: TextEdit,
     /// The Publish dialog, while it's open.
     publish: Option<Publish>,
     /// The Publish dialog's summary, the review body.
@@ -272,6 +276,8 @@ impl State {
             handle: None,
             reply: None,
             reply_text: TextEdit::new(""),
+            editing: None,
+            edit_text: TextEdit::new(""),
             publish: None,
             summary: TextEdit::new(""),
         };
@@ -530,6 +536,29 @@ impl State {
         }
     }
 
+    /// Opens the editor on the co-Reviewer's Draft `thread`, with what it says now.
+    fn open_edit(&mut self, session: SessionId, thread: ThreadId) {
+        let tab = self.tabs.iter().find(|t| t.session.id == session);
+        let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread)?.comments.first());
+        let Some(draft) = draft else { return };
+        self.edit_text = TextEdit::new(draft_markdown(&draft.body, draft.suggestion.as_deref()));
+        self.editing = Some((session, thread));
+    }
+
+    fn close_edit(&mut self) {
+        self.editing = None;
+        self.edit_text = TextEdit::new("");
+    }
+
+    /// Saves the edited co-Reviewer's Draft, which keeps it as the human's.
+    fn save_edit(&mut self) {
+        let Some((session, thread)) = &self.editing else { return };
+        match self.service.edit_draft(session, thread, NewComment::from_markdown(&self.edit_text.text)) {
+            Ok(()) => self.close_edit(),
+            Err(error) => eprintln!("akshually: {error}"),
+        }
+    }
+
     /// Expands or collapses an Outdated Thread.
     fn toggle_outdated(&mut self, session: &SessionId, thread: &ThreadId) {
         let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == session) else { return };
@@ -616,6 +645,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .pr(8.0)
         .items_center()
         .child(row().key("tabbar").h(40.0).grow(1.0).min_w(0.0).child(tabs));
+    let agent = theme::tokens(cx.system_dark()).color("state-agent");
     let body = match s.active_tab() {
         Some(tab) => col()
             .w_full()
@@ -626,9 +656,9 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
-            .child(general_threads(k, s, tab))
+            .child(general_threads(k, s, tab, agent))
             .child(outdated_threads(k, tab))
-            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab))),
+            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab, agent))),
         None => {
             let draft = theme::tokens(cx.system_dark()).color("state-draft");
             col().w_full().h_full().min_h(0.0).child(tab_bar).child(inbox_view(k, s, draft))
@@ -1139,7 +1169,7 @@ fn push_banner(k: &Kit, tab: &SessionTab) -> El {
     )
 }
 
-fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
+fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
     let id_header = id.clone();
@@ -1178,7 +1208,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     })
     .annotation({
         let k = k.clone();
-        move |s: &State, a: &Annotation| annotation(&k, s, a)
+        move |s: &State, a: &Annotation| annotation(&k, s, a, agent)
     })
     .on_comment(|s: &mut State, range: LineRange, _: &mut Tx| s.compose(range))
     .build(s, k)
@@ -1186,7 +1216,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
 
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
 /// and the composer when it's writing one.
-fn general_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
+fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     // Outdated File Threads show with the other Outdated Threads instead.
     let general = |t: &Thread| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. });
     let threads: Vec<&Thread> = tab.session.threads.iter().filter(|t| general(t)).collect();
@@ -1196,7 +1226,7 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
     }
     let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
     for thread in threads {
-        list = list.child(thread_view(k, s, thread, tab.session.id.clone()));
+        list = list.child(thread_view(k, s, thread, tab.session.id.clone(), agent));
     }
     if composing {
         list = list.child(composer(k, s));
@@ -1204,24 +1234,117 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
     col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list)
 }
 
-fn annotation(k: &Kit, s: &State, a: &Annotation) -> El {
+fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
     if a.id == COMPOSER {
         return composer(k, s);
     }
     let tab = s.active_tab();
     match tab.and_then(|t| t.session.threads.iter().find(|t| t.id.as_str() == a.id).map(|th| (t, th))) {
-        Some((tab, thread)) => thread_view(k, s, thread, tab.session.id.clone()),
+        Some((tab, thread)) => thread_view(k, s, thread, tab.session.id.clone(), agent),
         None => col(),
     }
 }
 
-/// A Thread of `session`: its card, or one line while it's Resolved.
-fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId) -> El {
+/// A Thread of `session`: its card, or one line while it's Resolved. A co-Reviewer's Draft the
+/// human hasn't kept shows in the `agent` colour.
+fn thread_view(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
     if thread.resolved.is_some() {
         resolved_row(k, thread, session)
+    } else if let [draft] = thread.comments.as_slice()
+        && draft.is_agent_draft()
+    {
+        agent_draft_card(k, s, thread, session, agent)
     } else {
         thread_card(k, thread, Some((s, session)))
     }
+}
+
+/// A co-Reviewer's Draft, dashed in the `agent` colour until the human keeps it, with Discard,
+/// Edit and Keep. Nothing reaches the Forge until it is kept.
+fn agent_draft_card(k: &Kit, s: &State, thread: &Thread, session: SessionId, agent: Color) -> El {
+    let draft = &thread.comments[0];
+    let mut card = card(k).border(1.0, agent).border_dash(4.0, 3.0).key(format!("agent-draft-{}", thread.id));
+    card = card.child(
+        row().gap(8.0).items_center().child(text("Agent Draft").font(k.ty.ui_medium).color(agent)).child(
+            text(format!("{} · not kept yet · nothing reaches the Forge until you keep it", thread.id))
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        ),
+    );
+    if let Some(label) = general_label(&thread.anchor) {
+        card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
+    }
+    if s.editing.as_ref().is_some_and(|(at, id)| at == &session && id == &thread.id) {
+        return card.child(edit_composer(k, s));
+    }
+    card = card.child(Markdown::new(draft.body.clone()).selectable(true).build(k));
+    if let Some(suggestion) = &draft.suggestion {
+        card = card.child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
+    }
+    let on = |action: fn(&Service, &SessionId, &ThreadId) -> Result<(), akshually_core::Error>| {
+        let (session, id) = (session.clone(), thread.id.clone());
+        move |s: &mut State| s.act_on_thread(&session, &id, action)
+    };
+    let (edit_session, edit_id) = (session.clone(), thread.id.clone());
+    card.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .child(row().grow(1.0))
+            .child(Button::new("Discard").variant(ButtonVariant::Ghost).on_press(on(Service::discard_draft)).build(k))
+            .child(
+                Button::new("Edit")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| s.open_edit(edit_session.clone(), edit_id.clone()))
+                    .build(k),
+            )
+            .child(Button::new("Keep").variant(ButtonVariant::Submit).on_press(on(Service::keep_draft)).build(k)),
+    )
+}
+
+/// The editor of a co-Reviewer's Draft; saving keeps it as the human's.
+fn edit_composer(k: &Kit, s: &State) -> El {
+    col()
+        .key("edit-composer")
+        .w_full()
+        .gap(8.0)
+        .child(
+            TextArea::new(&s.edit_text)
+                .width(None)
+                .auto_grow(2, 12)
+                .on_edit(|s: &mut State| &mut s.edit_text)
+                .on_submit(|s: &mut State, _| s.save_edit())
+                .build(k),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(text("Markdown · saving keeps it as your Draft").font(k.ty.small).color(k.c.text_faint))
+                .child(row().grow(1.0))
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|s: &mut State| s.close_edit())
+                        .build(k),
+                )
+                .child(
+                    Button::new("Save and keep")
+                        .variant(ButtonVariant::Submit)
+                        .on_press(|s: &mut State| s.save_edit())
+                        .build(k),
+                ),
+        )
+}
+
+/// A Draft as the markdown its author would have written: the body, then any suggestion fence.
+fn draft_markdown(body: &str, suggestion: Option<&str>) -> String {
+    let Some(code) = suggestion else { return body.to_owned() };
+    let code = if code.ends_with('\n') || code.is_empty() { code.to_owned() } else { format!("{code}\n") };
+    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{}\n\n{fence}suggestion\n{code}{fence}\n", body.trim_end())
 }
 
 /// Reopen for a Resolved Thread, Resolve for one that has reached the agent; nothing for a
@@ -1507,6 +1630,7 @@ fn scene_session(s: &mut State) {
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
         pull_request: None,
+        agent: Some(Role::Author),
         since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
         last_round: None,
@@ -1571,6 +1695,7 @@ fn scene_threads(s: &mut State) {
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
         pull_request: None,
+        agent: Some(Role::Author),
         changeset: sample_changeset(),
         since_session_base: None,
         last_round: None,
@@ -1703,6 +1828,26 @@ fn scene_publish(s: &mut State) {
         busy: false,
         error: None,
     });
+}
+
+/// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
+/// with a suggestion, one on the Review) next to a Draft of the human's.
+fn scene_co_review(s: &mut State) {
+    scene_publish(s);
+    s.publish = None;
+    let Some(tab) = s.tabs.first() else { return };
+    let mut session = tab.session.clone();
+    session.agent = Some(Role::CoReviewer);
+    for thread in &mut session.threads {
+        thread.comments[0].author = Party::Agent;
+    }
+    let mut review = sample_thread("T4", 1..=1, "Small and focused; the snapshot is the only risk.", None);
+    review.anchor = Anchor::Review;
+    review.comments[0].author = Party::Agent;
+    session.threads.push(review);
+    session.threads.push(sample_thread("T5", 4..=4, "Is `Round::new` fallible now?", None));
+    s.apply(vec![session]);
+    open_first_tab(s);
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
