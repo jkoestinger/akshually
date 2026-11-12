@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
-use crate::{Error, Settings, git};
+use crate::{Error, Settings, git, reanchor};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -126,6 +126,16 @@ impl SessionView {
             (ChangesetView::SinceSessionBase, Some(since), _) => since,
             (ChangesetView::SinceLastRound, _, Some(since)) => since,
             _ => &self.changeset,
+        }
+    }
+
+    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
+    /// where the old side is that Round's code rather than a base and files the agent left
+    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    pub fn anchored_in(&self) -> &Changeset {
+        match self.view {
+            ChangesetView::SinceLastRound => &self.changeset,
+            _ => self.shown(),
         }
     }
 }
@@ -294,7 +304,17 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            let before = session.anchored_in().clone();
+            session.view = view;
+            // Threads follow the Changeset they are anchored in.
+            if session.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut session.threads);
+                reanchor(&mut threads, session.anchored_in());
+                session.threads = threads;
+            }
+        }
         inner.notify();
         Ok(())
     }
@@ -318,6 +338,7 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                let before = session.view.anchored_in().clone();
                 for file in changeset.since(&session.view.changeset).files {
                     session.view.viewed.remove(&file.path);
                 }
@@ -327,6 +348,12 @@ impl Service {
                     session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
                 if session.view.since_last_round.is_some() {
                     session.view.view = ChangesetView::SinceLastRound;
+                }
+                // Threads follow the Changeset they are anchored in.
+                if session.view.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.view.threads);
+                    reanchor(&mut threads, session.view.anchored_in());
+                    session.view.threads = threads;
                 }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
@@ -383,17 +410,17 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        // Since the last Round, the old side is that Round's code rather than a base, and
-        // files the agent left alone are hidden: Threads still anchor to the full Changeset.
-        let anchored_to = match session.view.view {
-            ChangesetView::SinceLastRound => &session.view.changeset,
-            _ => session.view.shown(),
-        };
-        let excerpt = anchor.excerpt(anchored_to).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None, suggestion };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            outdated: false,
+        });
         inner.notify();
         Ok(thread)
     }
