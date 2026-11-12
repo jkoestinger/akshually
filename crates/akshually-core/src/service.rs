@@ -1,6 +1,6 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -108,15 +108,23 @@ pub struct SessionView {
     pub attention: bool,
     /// The agent's changes since the Session base, when it ran `start` first.
     pub since_session_base: Option<Changeset>,
+    /// The full Changeset as it was when the last Round was handed over; `None` before the
+    /// first handover.
+    pub last_round: Option<Changeset>,
+    /// What changed since `last_round`, with the last Round's code as the old side.
+    pub since_last_round: Option<Changeset>,
     /// Which Changeset the human is looking at.
     pub view: ChangesetView,
+    /// Paths the human ticked as viewed. A tick clears when its file changes in a new Changeset.
+    pub viewed: BTreeSet<String>,
 }
 
 impl SessionView {
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
-        match (self.view, &self.since_session_base) {
-            (ChangesetView::SinceSessionBase, Some(since)) => since,
+        match (self.view, &self.since_session_base, &self.since_last_round) {
+            (ChangesetView::SinceSessionBase, Some(since), _) => since,
+            (ChangesetView::SinceLastRound, _, Some(since)) => since,
             _ => &self.changeset,
         }
     }
@@ -128,6 +136,8 @@ impl SessionView {
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
     SinceSessionBase,
+    /// Only the changes since the last Round (the default from Round 2 on).
+    SinceLastRound,
     /// The whole Changeset.
     Full,
 }
@@ -308,8 +318,16 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                for file in changeset.since(&session.view.changeset).files {
+                    session.view.viewed.remove(&file.path);
+                }
                 session.view.changeset = changeset;
                 session.view.since_session_base = since_session_base;
+                session.view.since_last_round =
+                    session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
+                if session.view.since_last_round.is_some() {
+                    session.view.view = ChangesetView::SinceLastRound;
+                }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
                     if session.view.turn != Turn::Human {
@@ -333,11 +351,14 @@ impl Service {
                     branch,
                     changeset,
                     since_session_base,
+                    last_round: None,
+                    since_last_round: None,
                     view,
                     round: 1,
                     threads: Vec::new(),
                     turn: Turn::Human,
                     attention: false,
+                    viewed: BTreeSet::new(),
                 };
                 inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
                 let at = inner.sessions.len() - 1;
@@ -359,7 +380,13 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        let excerpt = anchor.excerpt(session.view.shown()).map_err(Error::InvalidAnchor)?;
+        // Since the last Round, the old side is that Round's code rather than a base, and
+        // files the agent left alone are hidden: Threads still anchor to the full Changeset.
+        let anchored_to = match session.view.view {
+            ChangesetView::SinceLastRound => &session.view.changeset,
+            _ => session.view.shown(),
+        };
+        let excerpt = anchor.excerpt(anchored_to).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None };
@@ -401,6 +428,9 @@ impl Service {
         }
         session.view.round += 1;
         session.view.turn = Turn::Agent;
+        session.view.since_last_round =
+            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
+        session.view.last_round = Some(session.view.changeset.clone());
         let round = Round { number, threads };
         match session.waiter.take() {
             // A waiter that went away gives the Round back, for the next call.
@@ -465,6 +495,23 @@ impl Service {
         let found =
             session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| !c.is_draft()));
         f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        inner.notify();
+        Ok(())
+    }
+
+    /// Human: ticks `path` as viewed, or unticks it.
+    pub fn mark_viewed(&self, id: &SessionId, path: &str, viewed: bool) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let view = &mut inner.sessions[at].view;
+        if !view.changeset.files.iter().any(|f| f.path == path) {
+            return Err(Error::NotInChangeset(path.to_owned()));
+        }
+        if viewed {
+            view.viewed.insert(path.to_owned());
+        } else {
+            view.viewed.remove(path);
+        }
         inner.notify();
         Ok(())
     }

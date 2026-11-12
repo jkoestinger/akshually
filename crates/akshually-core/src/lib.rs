@@ -37,4 +37,6 @@ pub enum Error {
     NoSessionHere { repo: std::path::PathBuf, branch: String },
     #[error("no Thread {0} in this Session")]
     UnknownThread(ThreadId),
+    #[error("{0} isn't in the Changeset")]
+    NotInChangeset(String),
 }
