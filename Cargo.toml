@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 
 # Cargo ignores a dependency's [patch], so Rune's are repeated here, all at the pinned rev.
 # Re-check `[patch.crates-io]` in Rune's root Cargo.toml whenever the rev is bumped.
