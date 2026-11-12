@@ -12,6 +12,7 @@ pub fn outcome_markdown(outcome: &Outcome) -> String {
         Outcome::Abandoned => {
             "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n".to_owned()
         }
+        Outcome::Published { verdict, url } => format!("Published with the Verdict {verdict}: {url}\n"),
     }
 }
 

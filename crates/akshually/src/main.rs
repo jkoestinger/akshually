@@ -26,6 +26,7 @@ mod exit {
     pub const ERROR: u8 = 1;
     pub const ABANDONED: u8 = 3;
     pub const ROUND: u8 = 4;
+    pub const PUBLISHED: u8 = 5;
 }
 
 #[derive(Parser)]
@@ -165,6 +166,7 @@ fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
         Outcome::Round(_) => exit::ROUND,
         Outcome::Approved => exit::APPROVED,
         Outcome::Abandoned => exit::ABANDONED,
+        Outcome::Published { .. } => exit::PUBLISHED,
     };
     Ok(ExitCode::from(code))
 }

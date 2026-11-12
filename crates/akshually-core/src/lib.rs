@@ -20,7 +20,8 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn,
+    CancelReview, ChangesetView, Outcome, PendingReview, PublishPlan, ReviewRequest, Service, SessionId, SessionView,
+    Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
@@ -61,4 +62,10 @@ pub enum Error {
     NotAPullRequest(String),
     #[error(transparent)]
     Forge(#[from] forge::ForgeError),
+    #[error("the Forge doesn't accept the Verdict {0} here")]
+    VerdictNotOffered(Verdict),
+    #[error("only an approval can be published without a summary or a Comment")]
+    EmptyReview,
+    #[error("this Session is being published")]
+    Publishing,
 }

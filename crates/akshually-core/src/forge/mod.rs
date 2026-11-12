@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BinarySizes, Changeset, FileChange, Side};
+use crate::{BinarySizes, Changeset, FileChange, Side, Verdict};
 
 mod config;
 mod credentials;
@@ -30,6 +30,36 @@ pub trait ForgeAdapter: Send + Sync {
 
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
+
+    /// The Verdicts the Forge accepts from the human on `pr`: on GitHub, only feedback on
+    /// their own Pull Request.
+    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError>;
+
+    /// Sends `review` to `pr` as one review under the human's name, against `pr.head_sha`, and
+    /// returns its web page. On failure nothing is left half-published.
+    fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError>;
+}
+
+/// A finished Review as the Forge receives it at Publish, in Forge-neutral terms; each adapter
+/// maps it to its Forge's own (GitHub's pending review, GitLab's draft notes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Review {
+    pub verdict: Verdict,
+    /// Markdown: the human's summary, then any Drafts on the Review as a whole. May be empty.
+    pub body: String,
+    /// One per new Thread, in the order they were opened.
+    pub comments: Vec<ReviewComment>,
+}
+
+/// A new Thread's opening Comment in a [`Review`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub anchor: RemoteAnchor,
+    /// Markdown.
+    pub body: String,
+    /// Code to replace the anchored lines with, whole; only on new-side lines. The adapter
+    /// writes it as the Forge's native suggestion.
+    pub suggestion: Option<String>,
 }
 
 /// Names one Pull Request: a Pull Request Session's identity.

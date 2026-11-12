@@ -3,9 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
+    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn};
+use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn, Verdict};
 use akshually_testkit::{TestDirs, TestRepo};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -77,6 +77,14 @@ impl ForgeAdapter for FakeForge {
                 comments: vec![RemoteComment { author: "sam".into(), body: "Split this file?".into() }],
             },
         ])
+    }
+
+    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        unreachable!("not published here")
+    }
+
+    fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
+        unreachable!("not published here")
     }
 }
 
@@ -214,6 +222,12 @@ fn a_forge_failure_opens_no_session() {
             unreachable!()
         }
         fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
+            unreachable!()
+        }
+        fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+            unreachable!()
+        }
+        fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
             unreachable!()
         }
     }

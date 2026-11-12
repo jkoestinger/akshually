@@ -6,13 +6,15 @@
 use std::sync::Arc;
 
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, Service, SessionId,
-    SessionView, Side, Thread, ThreadId, Turn,
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, NewComment, Outcome, Party, PublishPlan, Service,
+    SessionId, SessionView, Side, Thread, ThreadId, Turn, Verdict,
 };
 use rune::{AppHandle, AppSpec, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
-use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Kit, Markdown, TextArea, TextInput};
+use rune_kit::{
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, TextArea, TextInput,
+};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
 const COMPOSER: &str = "composer";
@@ -32,7 +34,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let spec = AppSpec {
-        scenes: &[("session", scene_session), ("threads", scene_threads)],
+        scenes: &[("session", scene_session), ("threads", scene_threads), ("publish", scene_publish)],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
         // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
         // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
@@ -78,6 +80,22 @@ struct State {
     /// The Thread a reply is being written in, at most one in the window.
     reply: Option<(SessionId, ThreadId)>,
     reply_text: TextEdit,
+    /// The Publish dialog, while it's open.
+    publish: Option<Publish>,
+    /// The Publish dialog's summary, the review body.
+    summary: TextEdit,
+}
+
+/// The Publish dialog of one Pull Request Session.
+struct Publish {
+    session: SessionId,
+    /// What Publish would send, once the Forge said which Verdicts it takes.
+    plan: Option<PublishPlan>,
+    verdict: Option<Verdict>,
+    /// Asking the Forge, or Publishing.
+    busy: bool,
+    /// Why the last attempt failed.
+    error: Option<String>,
 }
 
 /// A Comment being written, before it becomes a Draft.
@@ -235,6 +253,8 @@ impl State {
             handle: None,
             reply: None,
             reply_text: TextEdit::new(""),
+            publish: None,
+            summary: TextEdit::new(""),
         };
         let sessions = state.service.sessions();
         state.apply(sessions);
@@ -268,6 +288,9 @@ impl State {
         }
         if self.reply.as_ref().is_some_and(|(session, _)| !self.tabs.iter().any(|t| &t.session.id == session)) {
             self.close_reply();
+        }
+        if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
+            self.publish = None;
         }
         self.annotate();
         if self.active_tab().is_none() {
@@ -306,6 +329,73 @@ impl State {
             }
             None => opened(self, service.open_pull_request(&url)),
         }
+    }
+
+    /// Runs `work` off the UI thread (the Forge may be slow), then `done` with its result on
+    /// the UI thread. Headless renders have no handle and run it in place.
+    fn off_ui<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&Service) -> T + Send + 'static,
+        done: impl FnOnce(&mut State, T) + Send + 'static,
+    ) {
+        let service = self.service.clone();
+        match self.handle.clone() {
+            Some(handle) => {
+                std::thread::spawn(move || {
+                    let result = work(&service);
+                    handle.update(move |s: &mut State, _| done(s, result));
+                });
+            }
+            None => done(self, work(&service)),
+        }
+    }
+
+    /// Opens the Publish dialog of `id`, asking the Forge which Verdicts it takes.
+    fn open_publish(&mut self, id: SessionId) {
+        self.publish = Some(Publish { session: id.clone(), plan: None, verdict: None, busy: true, error: None });
+        self.summary = TextEdit::new("");
+        self.off_ui(
+            move |service| service.publish_plan(&id),
+            |s, plan| {
+                let Some(publish) = &mut s.publish else { return };
+                publish.busy = false;
+                match plan {
+                    Ok(plan) => {
+                        // A single choice is made already.
+                        publish.verdict = (plan.verdicts.len() == 1).then(|| plan.verdicts[0]);
+                        publish.plan = Some(plan);
+                    }
+                    Err(error) => publish.error = Some(error.to_string()),
+                }
+            },
+        );
+    }
+
+    fn close_publish(&mut self) {
+        if self.publish.as_ref().is_some_and(|p| !p.busy || p.plan.is_none()) {
+            self.publish = None;
+        }
+    }
+
+    /// Publishes the dialog's Session with its Verdict and summary.
+    fn publish(&mut self) {
+        let Some(publish) = &mut self.publish else { return };
+        let Some(verdict) = publish.verdict.filter(|_| !publish.busy) else { return };
+        publish.busy = true;
+        publish.error = None;
+        let (id, summary) = (publish.session.clone(), self.summary.text.clone());
+        self.off_ui(
+            move |service| service.publish(&id, verdict, &summary),
+            |s, published| match published {
+                Ok(_) => s.publish = None,
+                Err(error) => {
+                    if let Some(publish) = &mut s.publish {
+                        publish.busy = false;
+                        publish.error = Some(error.to_string());
+                    }
+                }
+            },
+        );
     }
 
     /// Shows the Session's tab and tells the service, which clears its attention.
@@ -493,6 +583,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             )
             .child(pull_request_opener(k, s)),
     };
+    publish_dialog(k, s, &mut layer);
     rune_kit::root(body.fill(k.c.bg_base), layer)
 }
 
@@ -511,7 +602,8 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
 fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
     let session = &tab.session;
     let base = &session.changeset.base[..session.changeset.base.len().min(8)];
-    let close_id = session.id.clone();
+    let (close_id, publish_id) = (session.id.clone(), session.id.clone());
+    let published = session.ended.is_some();
     row()
         .key("session-header")
         .w_full()
@@ -533,9 +625,138 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(
             Button::new("Close")
                 .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| s.act(&close_id, Service::abandon))
+                .on_press(move |s: &mut State| s.act(&close_id, Service::close))
                 .build(k),
         )
+        .child(
+            Button::new("Publish…")
+                .variant(ButtonVariant::Submit)
+                .disabled(published)
+                .on_press(move |s: &mut State| s.open_publish(publish_id.clone()))
+                .build(k),
+        )
+}
+
+/// The Publish dialog: what will be sent and what won't, the Verdict and the summary.
+fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
+    let Some(publish) = &s.publish else { return };
+    let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
+    let Some(pr) = &tab.session.pull_request else { return };
+    let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0);
+    if let Some(plan) = &publish.plan {
+        let mut list = col().key("publish-drafts").w_full().gap(8.0);
+        for (thread, kept) in plan.kept.iter().map(|t| (t, true)).chain(plan.discarded.iter().map(|t| (t, false))) {
+            list = list.child(publish_row(k, thread, kept));
+        }
+        if plan.kept.is_empty() && plan.discarded.is_empty() {
+            list =
+                list.child(text("No Drafts: only the Verdict and summary go out.").font(k.ty.ui).color(k.c.text_muted));
+        }
+        let verdicts = Verdict::ALL.iter().filter(|v| plan.verdicts.contains(v)).fold(row().gap(8.0), |row, &v| {
+            row.child(
+                RadioItem::new(verdict_label(v), publish.verdict == Some(v))
+                    .on_select(move |s: &mut State| {
+                        if let Some(p) = &mut s.publish {
+                            p.verdict = Some(v);
+                        }
+                    })
+                    .build(k)
+                    .key(format!("verdict-{v}"))
+                    .grow(1.0),
+            )
+        });
+        let own = plan.verdicts == [Verdict::Feedback];
+        body = body
+            .child(list)
+            .child(text("VERDICT").font(k.ty.small).color(k.c.text_faint))
+            .child(verdicts)
+            .children(own.then(|| {
+                text("Your own Pull Request: the Forge takes feedback only.").font(k.ty.small).color(k.c.text_muted)
+            }))
+            .child(
+                TextArea::new(&s.summary)
+                    .placeholder("Summary (optional, markdown): the review body")
+                    .width(None)
+                    .auto_grow(2, 8)
+                    .on_edit(|s: &mut State| &mut s.summary)
+                    .build(k),
+            )
+            .child(text("Feedback is published as the Forge's \"Comment\".").font(k.ty.small).color(k.c.text_faint));
+    } else if publish.busy {
+        body = body.child(text("Asking the Forge…").font(k.ty.ui).color(k.c.text_muted));
+    }
+    if let Some(error) = &publish.error {
+        body = body.child(text(error.clone()).font(k.ty.small).color(k.c.danger.fg).wrap());
+    }
+    let sent = publish.plan.as_ref().map_or(0, |p| p.kept.len());
+    let label = match publish.verdict {
+        _ if publish.busy && publish.plan.is_some() => "Publishing…".to_owned(),
+        Some(v) if sent > 0 => {
+            format!("Publish {sent} comment{} · {}", if sent == 1 { "" } else { "s" }, verdict_label(v))
+        }
+        Some(v) => format!("Publish · {}", verdict_label(v)),
+        None => "Publish".to_owned(),
+    };
+    body = body.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .items_center()
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.close_publish())
+                    .build(k),
+            )
+            .child(
+                Button::new(label)
+                    .variant(ButtonVariant::Submit)
+                    .disabled(publish.verdict.is_none() || publish.busy)
+                    .on_press(|s: &mut State| s.publish())
+                    .build(k),
+            ),
+    );
+    Dialog::new("publish", "Publish review")
+        .description(format!(
+            "Sent to {} as one review on {} #{}, under your name.",
+            pr.id.host, pr.id.repo, pr.id.number
+        ))
+        .open(true)
+        .width(620.0)
+        .fit()
+        .click_outside(false)
+        .on_close(|s: &mut State| s.close_publish())
+        .child(body)
+        .build(k, layer);
+}
+
+/// One Thread's Drafts in the Publish dialog, ticked when they're sent.
+fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
+    let on = match &thread.anchor {
+        Anchor::Lines { path, side: Side::New, start, end } if start == end => format!("{path}:{end}"),
+        Anchor::Lines { path, side: Side::New, start, end } => format!("{path}:{start}-{end}"),
+        Anchor::Lines { path, side: Side::Old, start, end } => format!("{path}, old {start}-{end}"),
+        anchor => general_label(anchor).unwrap_or_default(),
+    };
+    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
+    let suggestion = thread.comments.iter().any(|c| c.suggestion.is_some());
+    row()
+        .w_full()
+        .gap(8.0)
+        .items_center()
+        .child(Checkbox::new(kept).disabled(true).build(k))
+        .child(text(what).font(k.ty.ui).color(if kept { k.c.text_base } else { k.c.text_faint }).grow(1.0).min_w(0.0))
+        .children(suggestion.then(|| text("suggestion").font(k.ty.small).color(k.c.text_faint)))
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Approve => "Approve",
+        Verdict::RequestChanges => "Request changes",
+        Verdict::Feedback => "Feedback",
+    }
 }
 
 /// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
@@ -647,7 +868,10 @@ fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
         Some(Outcome::Approved) => {
             "Approved. The agent's next `akshually review` receives the Verdict and ends this Session.".to_owned()
         }
-        Some(_) => {
+        Some(Outcome::Published { verdict, url }) => {
+            format!("Published with the Verdict {verdict}: {url}. Close this Session when you're done.")
+        }
+        Some(Outcome::Abandoned | Outcome::Round(_)) => {
             "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session.".to_owned()
         }
         None if session.turn == Turn::Agent => format!(
@@ -1175,6 +1399,46 @@ fn scene_threads(s: &mut State) {
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
     s.apply(vec![session]);
+}
+
+/// `--scene publish`: a Pull Request Session with its Publish dialog open.
+fn scene_publish(s: &mut State) {
+    use akshually_core::forge::{PullRequest, PullRequestRef};
+    let pr = PullRequest {
+        id: PullRequestRef { host: "github.com".into(), repo: "acme/web".into(), number: 482 },
+        url: "https://github.com/acme/web/pull/482".into(),
+        title: "Add SSO login".into(),
+        author: "maria".into(),
+        head_branch: "sso".into(),
+        head_sha: "head1".into(),
+        base_sha: "base1".into(),
+    };
+    let mut suggested = sample_thread("T1", 3..=3, "Name it for what it holds.", None);
+    suggested.comments[0].suggestion = Some("    let before = self.changeset.snapshot()?;\n".into());
+    let mut reply = sample_thread("T2", 1..=1, "Agreed, the env var name is enough.", None);
+    reply.anchor = Anchor::file("README.md");
+    let session = SessionView {
+        id: SessionId::new("pr"),
+        branch: "sso".into(),
+        pull_request: Some(pr),
+        changeset: sample_changeset(),
+        round: 1,
+        threads: vec![suggested.clone(), sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
+        ..SessionView::default()
+    };
+    s.apply(vec![session]);
+    let plan = PublishPlan {
+        verdicts: Verdict::ALL.to_vec(),
+        kept: vec![suggested, sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
+        discarded: vec![reply],
+    };
+    s.publish = Some(Publish {
+        session: SessionId::new("pr"),
+        plan: Some(plan),
+        verdict: Some(Verdict::RequestChanges),
+        busy: false,
+        error: None,
+    });
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
