@@ -11,3 +11,9 @@ publish.workspace = true
 akshually-core.workspace = true
 rune.workspace = true
 rune-kit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust.workspace = true
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rune-notify.workspace = true

@@ -10,11 +10,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, Settings, git};
+use crate::store::Store;
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
-/// Identifies a Session for as long as the app runs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Identifies a Session, across restarts too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -47,10 +48,11 @@ pub enum Outcome {
 }
 
 /// Whose move a Session is waiting on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Turn {
     /// The agent waits on the human: a `review` call is blocked.
+    #[default]
     Human,
     /// The human handed over a Round; the agent is working on it.
     Agent,
@@ -89,8 +91,10 @@ impl ReviewRequest {
     }
 }
 
-/// What the UI (and tests) can observe of one Session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// What the UI (and tests) can observe of one Session. It's persisted: a field missing from
+/// an older saved Session takes its `Default`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionView {
     pub id: SessionId,
     /// The working tree root: each worktree is its own Session.
@@ -128,10 +132,20 @@ impl SessionView {
             _ => &self.changeset,
         }
     }
+
+    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
+    /// where the old side is that Round's code rather than a base and files the agent left
+    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    pub fn anchored_in(&self) -> &Changeset {
+        match self.view {
+            ChangesetView::SinceLastRound => &self.changeset,
+            _ => self.shown(),
+        }
+    }
 }
 
 /// Which of a Session's Changesets the human is looking at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangesetView {
     /// Only the agent's changes since the Session base (the default after `start`).
@@ -139,6 +153,7 @@ pub enum ChangesetView {
     /// Only the changes since the last Round (the default from Round 2 on).
     SinceLastRound,
     /// The whole Changeset.
+    #[default]
     Full,
 }
 
@@ -167,14 +182,28 @@ impl PendingReview {
 
 type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 
+/// A Session as the service keeps it, and as the store saves it: every field but the waiter
+/// survives a restart, and a field missing from an older saved Session takes its `Default`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Session {
     view: SessionView,
-    /// The agent's blocked `review` call, if any.
+    /// The agent's blocked `review` call, if any. A restart drops it; the agent's next
+    /// `review` attaches to the restored Session.
+    #[serde(skip)]
     waiter: Option<Sender<Outcome>>,
     /// Threads opened so far, for numbering the next one.
     threads_opened: u32,
     /// Rounds handed over while no `review` call waited, oldest first.
     queued: Vec<Round>,
+}
+
+/// A Session base as saved: `session_bases` keys by a tuple, which JSON can't.
+#[derive(Serialize, Deserialize)]
+struct SessionBase {
+    repo: PathBuf,
+    branch: String,
+    tree: String,
 }
 
 #[derive(Default)]
@@ -187,6 +216,11 @@ struct Inner {
     subscribers: Vec<Subscriber>,
     /// The Session whose tab the human has open.
     displayed: Option<SessionId>,
+    /// Whether the human is looking at akshually's window.
+    window_focused: bool,
+    notifier: Option<Box<dyn Notifier>>,
+    /// Where Sessions are saved; `None` keeps them in memory only.
+    store: Option<Store>,
 }
 
 impl Inner {
@@ -200,6 +234,14 @@ impl Inner {
             None => self.displayed = Some(view.id.clone()),
             Some(displayed) => view.attention = displayed != &view.id,
         }
+        if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
+            let repo = view.repo.file_name().unwrap_or(view.repo.as_os_str()).to_string_lossy();
+            notifier.notify(Notification {
+                session: view.id.clone(),
+                title: "Your Turn to review".into(),
+                body: format!("{repo} ({})", view.branch),
+            });
+        }
     }
 
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
@@ -210,7 +252,29 @@ impl Inner {
         self.sessions.iter().map(|s| s.view.clone()).collect()
     }
 
-    fn notify(&self) {
+    /// Saves the Sessions and Session bases, if the service has a store.
+    fn save(&mut self) {
+        let Some(store) = &mut self.store else { return };
+        let mut bases: Vec<SessionBase> = self
+            .session_bases
+            .iter()
+            .map(|((repo, branch), tree)| SessionBase {
+                repo: repo.clone(),
+                branch: branch.clone(),
+                tree: tree.clone(),
+            })
+            .collect();
+        bases.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        let saved = store.sync(self.sessions.iter().map(|s| (&s.view.id, s))).and_then(|()| store.sync_bases(&bases));
+        // The change already happened in memory; a failed save shouldn't undo it.
+        if let Err(error) = saved {
+            eprintln!("akshually: couldn't save Sessions: {error}");
+        }
+    }
+
+    /// Publishes a change: saves it, then tells subscribers.
+    fn notify(&mut self) {
+        self.save();
         if self.subscribers.is_empty() {
             return;
         }
@@ -228,8 +292,34 @@ pub struct Service {
 }
 
 impl Service {
+    /// A service that keeps its Sessions in memory only.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A service that saves its Sessions under `state_dir` (never inside a repository) and
+    /// restores the ones saved there by an earlier run.
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let (store, mut sessions, bases) = Store::open(state_dir.as_ref(), |s: &Session| &s.view.id)?;
+        sessions.sort_by_key(|s| id_number(&s.view.id));
+        let next_id = sessions.iter().filter_map(|s| id_number(&s.view.id)).max().unwrap_or(0);
+        let bases: Vec<SessionBase> = bases;
+        let session_bases = bases.into_iter().map(|b| ((b.repo, b.branch), b.tree)).collect();
+        let inner = Inner { next_id, sessions, session_bases, store: Some(store), ..Inner::default() };
+        Ok(Service { inner: Mutex::new(inner) })
+    }
+
+    /// Shows a desktop notification through `notifier` whenever a Session becomes the human's
+    /// Turn while the window is unfocused. Without one, the service notifies no one.
+    pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
+        self.lock().notifier = Some(Box::new(notifier));
+        self
+    }
+
+    /// The UI: tells the service whether the human is looking at the window (unfocused until
+    /// told otherwise).
+    pub fn set_window_focused(&self, focused: bool) {
+        self.lock().window_focused = focused;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -285,7 +375,9 @@ impl Service {
         let repo = git::toplevel(cwd)?;
         let branch = git::branch(&repo)?;
         let base = changeset::snapshot(&repo)?;
-        self.lock().session_bases.insert((repo, branch), base);
+        let mut inner = self.lock();
+        inner.session_bases.insert((repo, branch), base);
+        inner.save();
         Ok(())
     }
 
@@ -294,7 +386,17 @@ impl Service {
     pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        inner.sessions[at].view.view = view;
+        let session = &mut inner.sessions[at].view;
+        if session.view != view {
+            let before = session.anchored_in().clone();
+            session.view = view;
+            // Threads follow the Changeset they are anchored in.
+            if session.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut session.threads);
+                reanchor(&mut threads, session.anchored_in());
+                session.threads = threads;
+            }
+        }
         inner.notify();
         Ok(())
     }
@@ -318,6 +420,7 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
+                let before = session.view.anchored_in().clone();
                 for file in changeset.since(&session.view.changeset).files {
                     session.view.viewed.remove(&file.path);
                 }
@@ -327,6 +430,12 @@ impl Service {
                     session.view.last_round.as_ref().map(|s| session.view.changeset.since(s));
                 if session.view.since_last_round.is_some() {
                     session.view.view = ChangesetView::SinceLastRound;
+                }
+                // Threads follow the Changeset they are anchored in.
+                if session.view.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.view.threads);
+                    reanchor(&mut threads, session.view.anchored_in());
+                    session.view.threads = threads;
                 }
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
@@ -360,7 +469,7 @@ impl Service {
                     attention: false,
                     viewed: BTreeSet::new(),
                 };
-                inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
+                inner.sessions.push(Session { view, waiter: Some(tx), ..Session::default() });
                 let at = inner.sessions.len() - 1;
                 inner.became_humans_turn(at);
                 id
@@ -370,27 +479,30 @@ impl Service {
         Ok(PendingReview { session: id, outcome: rx })
     }
 
-    /// Human: opens a Thread at `anchor` with `body` (markdown) as a Draft, which goes out
-    /// with the next Round.
-    pub fn comment(&self, id: &SessionId, anchor: Anchor, body: impl Into<String>) -> Result<ThreadId, Error> {
-        let body = body.into();
+    /// Human: opens a Thread at `anchor` with `comment` (markdown, plus any suggestion) as a
+    /// Draft, which goes out with the next Round.
+    pub fn comment(&self, id: &SessionId, anchor: Anchor, comment: impl Into<NewComment>) -> Result<ThreadId, Error> {
+        let NewComment { body, suggestion } = comment.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
+        }
+        if suggestion.is_some() && !matches!(anchor, Anchor::Lines { side: Side::New, .. }) {
+            return Err(Error::InvalidSuggestion);
         }
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        // Since the last Round, the old side is that Round's code rather than a base, and
-        // files the agent left alone are hidden: Threads still anchor to the full Changeset.
-        let anchored_to = match session.view.view {
-            ChangesetView::SinceLastRound => &session.view.changeset,
-            _ => session.view.shown(),
-        };
-        let excerpt = anchor.excerpt(anchored_to).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
-        let comment = Comment { author: Party::Human, body, round: None };
-        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        let comment = Comment { author: Party::Human, body, round: None, suggestion };
+        session.view.threads.push(Thread {
+            id: thread.clone(),
+            anchor,
+            excerpt,
+            comments: vec![comment],
+            outdated: false,
+        });
         inner.notify();
         Ok(thread)
     }
@@ -481,4 +593,9 @@ impl Service {
         inner.notify();
         Ok(())
     }
+}
+
+/// The `n` of a Session id `sn`.
+fn id_number(id: &SessionId) -> Option<u64> {
+    id.as_str().strip_prefix('s')?.parse().ok()
 }
