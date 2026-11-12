@@ -632,16 +632,16 @@ impl Inner {
         }
     }
 
-    /// Publishes a change: saves it, then tells subscribers.
+    /// Publishes a change: saves it, then tells subscribers, the Inbox's too.
     fn notify(&mut self) {
         self.save();
-        if self.subscribers.is_empty() {
-            return;
+        if !self.subscribers.is_empty() {
+            let views = self.views();
+            for subscriber in &self.subscribers {
+                subscriber(&views);
+            }
         }
-        let views = self.views();
-        for subscriber in &self.subscribers {
-            subscriber(&views);
-        }
+        self.tell_inbox_subscribers();
     }
 }
 

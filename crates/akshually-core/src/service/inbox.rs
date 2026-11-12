@@ -120,6 +120,11 @@ impl Inner {
         {
             eprintln!("akshually: couldn't save the Inbox: {error}");
         }
+        self.tell_inbox_subscribers();
+    }
+
+    /// Gives the Inbox subscribers the Inbox as it is now: its rows' states follow the Sessions.
+    pub(super) fn tell_inbox_subscribers(&self) {
         if self.inbox.subscribers.is_empty() {
             return;
         }
@@ -137,8 +142,10 @@ impl Service {
         inner.inbox.saved.view(&inner.sessions)
     }
 
-    /// Calls `f` with the Inbox after each refresh, and whenever its attention changes. Like
-    /// `subscribe`, `f` runs while the service is locked: hand the Inbox off, don't call back.
+    /// Calls `f` with the Inbox after each refresh, whenever its attention changes, and after
+    /// each change to the Sessions, which the rows' states follow (a Session opened, Drafts
+    /// written, Published). Like `subscribe`, `f` runs while the service is locked: hand the
+    /// Inbox off, don't call back.
     pub fn subscribe_inbox(&self, f: impl Fn(&InboxView) + Send + 'static) {
         self.lock().inbox.subscribers.push(Box::new(f));
     }
