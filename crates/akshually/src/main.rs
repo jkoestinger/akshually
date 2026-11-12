@@ -1,6 +1,7 @@
 //! The single `akshually` binary: the CLI agents call, and (`akshually app`) the app itself.
 
 mod launch;
+mod render;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ mod exit {
     pub const APPROVED: u8 = 0;
     pub const ERROR: u8 = 1;
     pub const ABANDONED: u8 = 3;
+    pub const ROUND: u8 = 4;
 }
 
 #[derive(Parser)]
@@ -29,7 +31,8 @@ struct Cli {
 enum Command {
     /// Ask the human to review your local work: this branch against its merge-base with the
     /// default branch, plus uncommitted changes. Blocks until the human answers. Exits 0 when
-    /// they approve, 3 when they abandon the Session (stop working on it), 1 on error.
+    /// they approve, 4 when they hand over a Round (printed as markdown: address it, then run
+    /// `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
     Review,
     /// Run the app (launched by the first CLI call). Arguments after the options go to Rune,
     /// e.g. `--snap out.png --scene session` for a headless render.
@@ -60,6 +63,10 @@ fn review() -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
     let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd)?;
     let code = match outcome {
+        Outcome::Round(round) => {
+            print!("{}", render::round_markdown(&round));
+            exit::ROUND
+        }
         Outcome::Approved => {
             println!("Approved.");
             exit::APPROVED

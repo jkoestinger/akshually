@@ -4,12 +4,14 @@
 mod support;
 
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
+use akshually_core::{Anchor, Side};
 use akshually_testkit::{TestDirs, TestRepo};
 use support::{HostedApp, LaunchedApp, finish, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_ABANDONED: i32 = 3;
+const EXIT_ROUND: i32 = 4;
 
 fn repo_with_work() -> TestRepo {
     let repo = TestRepo::new();
@@ -49,6 +51,71 @@ fn review_exits_with_the_abandoned_code_when_the_human_abandons() {
         String::from_utf8_lossy(&out.stdout),
         "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n"
     );
+}
+
+#[test]
+fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?\n\n- one is enough").unwrap();
+    app.service.comment(&session.id, Anchor::lines(Side::Old, "lib.rs", 1..=1), "Keep `a`.").unwrap();
+
+    assert!(still_running(&mut child), "a Draft reached the agent before the handover");
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "# Round 1\n\
+         \n\
+         The human handed over 2 Threads. Address each one, then run `akshually review` again.\n\
+         \n\
+         ## T1 · lib.rs, new lines 2-3\n\
+         \n\
+         ```\n\
+         fn b() {}\n\
+         fn c() {}\n\
+         ```\n\
+         \n\
+         Why two?\n\
+         \n\
+         - one is enough\n\
+         \n\
+         ## T2 · lib.rs, old line 1\n\
+         \n\
+         ```\n\
+         fn a() {}\n\
+         ```\n\
+         \n\
+         Keep `a`.\n"
+    );
+}
+
+#[test]
+fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+
+    repo.write("lib.rs", "fn a() {}\nfn b() {}\n");
+    let mut second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+
+    assert!(still_running(&mut second), "the second call didn't wait for the human");
+    let sessions = app.service.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, session.id);
+    assert_eq!(sessions[0].round, 2);
+    assert_eq!(sessions[0].threads.len(), 1);
+    assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(second).status.code(), Some(EXIT_APPROVED));
 }
 
 #[test]

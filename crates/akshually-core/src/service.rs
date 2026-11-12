@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset};
+use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
 use crate::{Error, git};
 
 /// Identifies a Session for as long as the app runs.
@@ -33,9 +34,11 @@ impl fmt::Display for SessionId {
 }
 
 /// What the agent's blocking `review` call receives when the human acts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
+    /// The human handed over a Round of feedback; the Session goes on.
+    Round(Round),
     /// The Verdict: the human approved the agent's local work.
     Approved,
     /// The human closed the Session without a Verdict; the agent should stop.
@@ -63,6 +66,10 @@ pub struct SessionView {
     pub repo: PathBuf,
     pub branch: String,
     pub changeset: Changeset,
+    /// The Round being drafted: 1 until the first handover, then one more after each.
+    pub round: u32,
+    /// In the order they were opened.
+    pub threads: Vec<Thread>,
 }
 
 /// A `review` call waiting for the human. Dropping it stops waiting.
@@ -94,6 +101,10 @@ struct Session {
     view: SessionView,
     /// The agent's blocked `review` call, if any.
     waiter: Option<Sender<Outcome>>,
+    /// Threads opened so far, for numbering the next one.
+    threads_opened: u32,
+    /// Rounds handed over while no `review` call waited, oldest first.
+    queued: Vec<Round>,
 }
 
 #[derive(Default)]
@@ -169,19 +180,82 @@ impl Service {
             Some(at) => {
                 let session = &mut inner.sessions[at];
                 session.view.changeset = changeset;
-                session.waiter = Some(tx);
+                if session.queued.is_empty() {
+                    session.waiter = Some(tx);
+                } else {
+                    let _ = tx.send(Outcome::Round(session.queued.remove(0)));
+                }
                 session.view.id.clone()
             }
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = SessionView { id: id.clone(), repo, branch, changeset };
-                inner.sessions.push(Session { view, waiter: Some(tx) });
+                let view = SessionView { id: id.clone(), repo, branch, changeset, round: 1, threads: Vec::new() };
+                inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
                 id
             }
         };
         inner.notify();
         Ok(PendingReview { session: id, outcome: rx })
+    }
+
+    /// Human: opens a Thread at `anchor` with `body` (markdown) as a Draft, which goes out
+    /// with the next Round.
+    pub fn comment(&self, id: &SessionId, anchor: Anchor, body: impl Into<String>) -> Result<ThreadId, Error> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(Error::EmptyComment);
+        }
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        let excerpt = anchor.excerpt(&session.view.changeset).map_err(Error::InvalidAnchor)?;
+        session.threads_opened += 1;
+        let thread = ThreadId::new(format!("T{}", session.threads_opened));
+        let comment = Comment { author: Party::Human, body, round: None };
+        session.view.threads.push(Thread { id: thread.clone(), anchor, excerpt, comments: vec![comment] });
+        inner.notify();
+        Ok(thread)
+    }
+
+    /// Human: hands every Draft over to the agent at once, as the Session's next Round, and
+    /// returns its number. The waiting `review` call receives it, or the next one if none waits.
+    pub fn hand_over_round(&self, id: &SessionId) -> Result<u32, Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        let number = session.view.round;
+        let mut threads = Vec::new();
+        for thread in &mut session.view.threads {
+            let drafts: Vec<Comment> = thread
+                .comments
+                .iter_mut()
+                .filter(|c| c.is_draft())
+                .map(|c| {
+                    c.round = Some(number);
+                    c.clone()
+                })
+                .collect();
+            if !drafts.is_empty() {
+                threads.push(Thread { comments: drafts, ..thread.clone() });
+            }
+        }
+        if threads.is_empty() {
+            return Err(Error::NoDrafts);
+        }
+        session.view.round += 1;
+        let round = Round { number, threads };
+        match session.waiter.take() {
+            // A waiter that went away gives the Round back, for the next call.
+            Some(waiter) => {
+                if let Err(mpsc::SendError(Outcome::Round(round))) = waiter.send(Outcome::Round(round)) {
+                    session.queued.push(round);
+                }
+            }
+            None => session.queued.push(round),
+        }
+        inner.notify();
+        Ok(number)
     }
 
     /// Human: approves the Session, which ends it and returns the Verdict to the agent.
