@@ -106,6 +106,9 @@ struct State {
     publish: Option<Publish>,
     /// The Publish dialog's summary, the review body.
     summary: TextEdit,
+    /// The Session the human asked to abandon (or close, for a Pull Request), until they
+    /// confirm or cancel.
+    confirming_end: Option<SessionId>,
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -245,6 +248,7 @@ impl State {
             edit_text: TextEdit::new(""),
             publish: None,
             summary: TextEdit::new(""),
+            confirming_end: None,
         };
         let sessions = state.service.sessions();
         state.apply(sessions);
@@ -286,6 +290,9 @@ impl State {
         }
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
+        }
+        if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
+            self.confirming_end = None;
         }
         self.annotate();
         if self.active.is_some() && self.active_tab().is_none() {
@@ -555,7 +562,7 @@ impl State {
     }
 
     /// Runs a human action on the service; the service's update then refreshes the view.
-    fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
+    fn act(&self, id: &SessionId, action: SessionAction) {
         report(action(&self.service, id));
     }
 
@@ -575,6 +582,9 @@ impl State {
         report(action(&self.service, thread));
     }
 }
+
+/// A human action on one Session.
+type SessionAction = fn(&Service, &SessionId) -> Result<(), akshually_core::Error>;
 
 /// Reports a human action the service refused. The UI offers only what's allowed, so this is
 /// for races (the Session changed meanwhile); there's nowhere better to show it yet.
@@ -629,6 +639,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .min_h(0.0)
             .child(tab_bar.child(pull_request_opener(k, s)))
             .child(session_header(k, tab))
+            .children(end_confirm(k, s, &tab.session))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
@@ -812,7 +823,11 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(
             Button::new("Close")
                 .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| s.act(&close_id, Service::close))
+                .on_press(move |s: &mut State| match published {
+                    true => s.act(&close_id, Service::close),
+                    // Unpublished Drafts go with it: ask first.
+                    false => s.confirming_end = Some(close_id.clone()),
+                })
                 .build(k),
         )
         .children(session.agent.is_some().then(|| hand_over_button(k, tab)))
@@ -1083,7 +1098,7 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
                     Button::new("Close").on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
                 }
                 (false, false) => {
-                    Button::new("Abandon").on_press(move |s: &mut State| s.act(&abandon_id, Service::abandon))
+                    Button::new("Abandon").on_press(move |s: &mut State| s.confirming_end = Some(abandon_id.clone()))
                 }
             }
             .variant(ButtonVariant::Ghost)
@@ -1091,6 +1106,49 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         )
         .children(decide)
         .child(hand_over_button(k, tab))
+}
+
+/// Asks the human to confirm abandoning a Session (or closing a Pull Request Session before
+/// Publish), which can't be undone. Cancel keeps everything.
+fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
+    if s.confirming_end.as_ref() != Some(&session.id) {
+        return None;
+    }
+    let (question, label, end): (String, _, SessionAction) = match session.pull_request() {
+        Some(_) => {
+            let agent = if session.agent.is_some() { " The co-Reviewer is told to stop." } else { "" };
+            (format!("Close this Pull Request? Your Drafts are discarded.{agent}"), "Close", Service::close)
+        }
+        None => ("Abandon this Session? The agent is told to stop.".to_owned(), "Abandon", Service::abandon),
+    };
+    let id = session.id.clone();
+    Some(
+        row()
+            .key("end-confirm")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .gap(12.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(question).font(k.ty.ui).color(k.c.text_base))
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.confirming_end = None)
+                    .build(k),
+            )
+            .child(
+                Button::new(label)
+                    .variant(ButtonVariant::Danger)
+                    .on_press(move |s: &mut State| {
+                        s.confirming_end = None;
+                        s.act(&id, end);
+                    })
+                    .build(k),
+            ),
+    )
 }
 
 /// During the agent's Turn: what the human can still do. Once ended: that the agent hasn't
