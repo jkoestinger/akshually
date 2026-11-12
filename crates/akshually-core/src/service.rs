@@ -49,6 +49,19 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Names one Thread across Sessions: the Session it's in, and its id there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadRef {
+    pub session: SessionId,
+    pub thread: ThreadId,
+}
+
+impl ThreadRef {
+    pub fn new(session: &SessionId, thread: &ThreadId) -> Self {
+        ThreadRef { session: session.clone(), thread: thread.clone() }
+    }
+}
+
 /// What the agent's blocking `review` call receives when the human acts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]

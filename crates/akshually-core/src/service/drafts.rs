@@ -1,7 +1,7 @@
 //! Draft rules: the human's Drafts, what the next Round carries, handing it over or taking it
 //! back, and the co-Reviewer's Drafts the human keeps, edits or discards.
 
-use super::{ChangesetView, Outcome, Service, SessionId, SessionView, Turn};
+use super::{ChangesetView, Outcome, Service, SessionId, SessionView, ThreadRef, Turn};
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Changeset, Error};
 
@@ -120,15 +120,15 @@ impl Service {
     }
 
     /// Human: keeps the co-Reviewer's Draft `thread`, which becomes the human's own Draft.
-    pub fn keep_draft(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_draft(id, thread, |threads, at| threads[at].comments[0].author = Party::Human)
+    pub fn keep_draft(&self, thread: &ThreadRef) -> Result<(), Error> {
+        self.agent_draft(thread, |threads, at| threads[at].comments[0].author = Party::Human)
     }
 
     /// Human: rewrites the co-Reviewer's Draft `thread` as `comment`, which keeps it: the human
     /// wrote what it says now.
-    pub fn edit_draft(&self, id: &SessionId, thread: &ThreadId, comment: impl Into<NewComment>) -> Result<(), Error> {
+    pub fn edit_draft(&self, thread: &ThreadRef, comment: impl Into<NewComment>) -> Result<(), Error> {
         let comment = comment.into();
-        self.agent_draft(id, thread, |threads, at| {
+        self.agent_draft(thread, |threads, at| {
             check_comment(&threads[at].anchor, &comment)?;
             let NewComment { body, suggestion } = comment;
             threads[at].comments[0] = Comment { author: Party::Human, body, round: None, suggestion };
@@ -137,8 +137,8 @@ impl Service {
     }
 
     /// Human: discards the co-Reviewer's Draft `thread`, and with it the Thread.
-    pub fn discard_draft(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.agent_draft(id, thread, |threads, at| {
+    pub fn discard_draft(&self, thread: &ThreadRef) -> Result<(), Error> {
+        self.agent_draft(thread, |threads, at| {
             threads.remove(at);
         })
     }
@@ -147,8 +147,7 @@ impl Service {
     /// co-Reviewer opened whose Draft the human hasn't kept, questioned or not.
     fn agent_draft<T>(
         &self,
-        id: &SessionId,
-        thread: &ThreadId,
+        ThreadRef { session: id, thread }: &ThreadRef,
         f: impl FnOnce(&mut Vec<Thread>, usize) -> T,
     ) -> Result<T, Error> {
         let mut inner = self.lock();

@@ -6,7 +6,7 @@ mod support;
 use std::io::Write;
 use std::process::{Output, Stdio};
 
-use akshually_core::{Anchor, Outcome, Party, Side, ThreadId, Verdict};
+use akshually_core::{Anchor, Outcome, Party, Side, ThreadId, ThreadRef, Verdict};
 use akshually_testkit::{TestRepo, wait_until};
 use support::{HostedApp, PR_URL, TIMEOUT, finish, still_running};
 
@@ -81,7 +81,7 @@ fn review_pr_blocks_until_the_human_publishes_then_exits_5_with_the_verdict_and_
     let session = app.wait_for_co_reviewer();
 
     assert!(still_running(&mut child), "blocks until the human is done");
-    app.service.keep_draft(&session.id, &session.threads[0].id).unwrap();
+    app.service.keep_draft(&ThreadRef::new(&session.id, &session.threads[0].id)).unwrap();
     app.service.publish(&session.id, Verdict::RequestChanges, "").unwrap();
     let out = finish(child);
 
@@ -141,7 +141,7 @@ fn review_pr_exits_4_with_the_humans_questions_and_reply_pr_answers_them() {
     let session = app.wait_for_co_reviewer();
     let thread = session.threads[0].id.clone();
 
-    app.service.reply_in_thread(&session.id, &thread, "Which docs?").unwrap();
+    app.service.reply_in_thread(&ThreadRef::new(&session.id, &thread), "Which docs?").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
     let out = finish(child);
 
@@ -184,7 +184,7 @@ fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_
     let session = wait_until(TIMEOUT, "the co-Reviewer to wait", || {
         app.service.sessions().into_iter().find(|s| s.repo() == Some(repo.path()) && s.agent_waiting)
     });
-    app.service.reply_in_thread(&session.id, &ThreadId::new("T1"), "Name it what?").unwrap();
+    app.service.reply_in_thread(&ThreadRef::new(&session.id, &ThreadId::new("T1")), "Name it what?").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
     let round = finish(child);
     assert_eq!(round.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&round.stderr));

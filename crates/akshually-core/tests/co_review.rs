@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{
-    Anchor, Changeset, Error, FileChange, NewComment, Outcome, Party, ReviewRequest, Role, Service, Side, Turn, Verdict,
+    Anchor, Changeset, Error, FileChange, NewComment, Outcome, Party, ReviewRequest, Role, Service, Side, ThreadRef,
+    Turn, Verdict,
 };
 use akshually_testkit::TestRepo;
 
@@ -148,9 +149,9 @@ fn a_kept_agent_draft_becomes_the_humans_and_only_kept_drafts_are_published() {
     let unvetted = svc.draft(URL, Anchor::file("login.rs"), "Needs a test.").unwrap();
     let id = svc.sessions()[0].id.clone();
 
-    svc.keep_draft(&id, &kept).unwrap();
-    svc.edit_draft(&id, &edited, "Link the SSO docs here.").unwrap();
-    svc.discard_draft(&id, &discarded).unwrap();
+    svc.keep_draft(&ThreadRef::new(&id, &kept)).unwrap();
+    svc.edit_draft(&ThreadRef::new(&id, &edited), "Link the SSO docs here.").unwrap();
+    svc.discard_draft(&ThreadRef::new(&id, &discarded)).unwrap();
 
     let session = svc.session(&id).unwrap();
     let thread = |t| session.threads.iter().find(|thread| &thread.id == t);
@@ -183,7 +184,7 @@ fn the_co_reviewers_review_call_hands_its_drafts_to_the_human_and_returns_what_w
     let session = svc.session(&id).unwrap();
     assert_eq!((session.turn, session.agent_waiting), (Turn::Human, true));
     assert!(pending.wait_timeout(Duration::from_millis(50)).is_none(), "blocks until the human is done");
-    svc.keep_draft(&id, &thread).unwrap();
+    svc.keep_draft(&ThreadRef::new(&id, &thread)).unwrap();
     let url = svc.publish(&id, Verdict::Approve, "").unwrap();
     assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url }));
     assert!(svc.sessions().is_empty(), "the Session ends once the co-Reviewer has its outcome");
@@ -238,7 +239,11 @@ fn only_an_agent_draft_can_be_kept_or_discarded() {
     let id = svc.sessions()[0].id.clone();
     let mine = svc.comment(&id, Anchor::file("README.md"), "Docs?").unwrap();
 
-    for result in [svc.keep_draft(&id, &mine), svc.discard_draft(&id, &mine), svc.edit_draft(&id, &mine, "x")] {
+    for result in [
+        svc.keep_draft(&ThreadRef::new(&id, &mine)),
+        svc.discard_draft(&ThreadRef::new(&id, &mine)),
+        svc.edit_draft(&ThreadRef::new(&id, &mine), "x"),
+    ] {
         assert!(matches!(result, Err(Error::NotAnAgentDraft(_))), "{result:?}");
     }
 }
@@ -252,7 +257,7 @@ fn questions_on_agent_drafts_reach_the_co_reviewer_as_a_round_and_the_drafts_sta
     let id = pending.session().clone();
     let mine = svc.comment(&id, Anchor::file("README.md"), "Docs?").unwrap();
 
-    svc.reply_in_thread(&id, &questioned, "Which state? There are two.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &questioned), "Which state? There are two.").unwrap();
     let number = svc.hand_over_round(&id).unwrap();
 
     let Some(Outcome::Round(round)) = pending.wait() else { panic!("expected a Round") };
@@ -275,7 +280,7 @@ fn the_co_reviewer_answers_questions_in_their_threads_and_its_next_review_call_i
     let unasked = svc.draft(URL, Anchor::Review, "Small and clear.").unwrap();
     let pending = svc.review(ReviewRequest::pull_request(URL)).unwrap();
     let id = pending.session().clone();
-    svc.reply_in_thread(&id, &questioned, "Which state?").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &questioned), "Which state?").unwrap();
     svc.hand_over_round(&id).unwrap();
     pending.wait().unwrap();
 
@@ -296,7 +301,7 @@ fn the_co_reviewer_answers_questions_in_their_threads_and_its_next_review_call_i
             (Party::Agent, "The OAuth `state` parameter."),
         ]
     );
-    svc.keep_draft(&id, &questioned).unwrap();
+    svc.keep_draft(&ThreadRef::new(&id, &questioned)).unwrap();
     let url = svc.publish(&id, Verdict::RequestChanges, "").unwrap();
     assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::RequestChanges, url }));
     let bodies: Vec<_> = published.lock().unwrap()[0].comments.iter().map(|c| c.body.clone()).collect();
@@ -339,7 +344,7 @@ fn a_local_co_review_goes_through_question_rounds_and_closing_it_returns_closed(
     let id = pending.session().clone();
     assert_eq!(svc.session(&id).unwrap().turn, Turn::Human);
 
-    svc.reply_in_thread(&id, &thread, "Name it what?").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &thread), "Name it what?").unwrap();
     svc.hand_over_round(&id).unwrap();
     let Some(Outcome::Round(round)) = pending.wait() else { panic!("expected a Round") };
     assert_eq!(round.threads[0].comments[0].body, "Name it what?");

@@ -21,7 +21,7 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PublishPlan,
-    ReviewRequest, Role, Service, SessionId, SessionView, Source, SourceRef, Turn, Verdict,
+    ReviewRequest, Role, Service, SessionId, SessionView, Source, SourceRef, ThreadRef, Turn, Verdict,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId};

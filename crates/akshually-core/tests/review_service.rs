@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use akshually_core::{
     Anchor, BinarySizes, ChangesetView, Collapsed, Error, FileChange, Outcome, Party, ReviewRequest, Round, Service,
-    SessionId, Settings, Side, Source, Thread, ThreadId, Turn,
+    SessionId, Settings, Side, Source, Thread, ThreadId, ThreadRef, Turn,
 };
 use akshually_testkit::{TestDirs, TestRepo};
 
@@ -1030,14 +1030,14 @@ fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_any_thread() {
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "A Draft").unwrap();
     svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
 
-    svc.reopen_thread(&id, &ThreadId::new("T1")).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
     assert_eq!(svc.session(&id).unwrap().threads[0].resolved, None);
 
-    svc.resolve_thread(&id, &ThreadId::new("T1")).unwrap();
-    svc.resolve_thread(&id, &ThreadId::new("T2")).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T2"))).unwrap();
     let resolved: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.resolved.clone()).collect();
     assert_eq!(resolved, vec![Some(Party::Human), Some(Party::Human)]);
-    assert!(svc.resolve_thread(&id, &ThreadId::new("T9")).is_err());
+    assert!(svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T9"))).is_err());
 }
 
 #[test]
@@ -1049,7 +1049,7 @@ fn a_human_reply_in_a_thread_is_a_draft_that_goes_out_with_the_next_round() {
     svc.reply(repo.path(), &t1, "Renamed for clarity.").unwrap();
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    svc.reply_in_thread(&id, &t1, "Clearer how?").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &t1), "Clearer how?").unwrap();
 
     let thread = svc.session(&id).unwrap().threads.remove(0);
     let last = thread.comments.last().unwrap();
@@ -1072,9 +1072,9 @@ fn a_human_reply_needs_text_and_a_known_thread() {
     let svc = Service::new();
     let id = after_round_1(&repo, &svc);
 
-    assert!(svc.reply_in_thread(&id, &ThreadId::new("T1"), " \n").is_err());
+    assert!(svc.reply_in_thread(&ThreadRef::new(&id, &ThreadId::new("T1")), " \n").is_err());
     assert_eq!(
-        svc.reply_in_thread(&id, &ThreadId::new("T9"), "?").unwrap_err().to_string(),
+        svc.reply_in_thread(&ThreadRef::new(&id, &ThreadId::new("T9")), "?").unwrap_err().to_string(),
         "no Thread T9 in this Session"
     );
     assert_eq!(svc.session(&id).unwrap().threads[0].comments.len(), 1);
@@ -1089,7 +1089,7 @@ fn a_thread_the_human_reopened_goes_out_with_the_next_round_marked_reopened() {
     svc.resolve(repo.path(), &t1).unwrap();
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    svc.reopen_thread(&id, &t1).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
     assert!(svc.session(&id).unwrap().threads[0].reopened);
     svc.hand_over_round(&id).unwrap();
 
@@ -1109,8 +1109,8 @@ fn a_thread_reopened_then_resolved_again_before_handover_does_not_go_out() {
     let t1 = ThreadId::new("T1");
     svc.resolve(repo.path(), &t1).unwrap();
 
-    svc.reopen_thread(&id, &t1).unwrap();
-    svc.resolve_thread(&id, &t1).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &t1)).unwrap();
 
     assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
 }
@@ -1121,7 +1121,7 @@ fn reopening_an_open_thread_changes_nothing() {
     let svc = Service::new();
     let id = after_round_1(&repo, &svc);
 
-    svc.reopen_thread(&id, &ThreadId::new("T1")).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
 
     assert!(!svc.session(&id).unwrap().threads[0].reopened);
     assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
@@ -1143,9 +1143,9 @@ fn an_outdated_thread_can_be_resolved_by_either_party_and_reopened() {
 
     svc.resolve(repo.path(), &t1).unwrap();
     assert_eq!(state(), (true, Some(Party::Agent)));
-    svc.reopen_thread(&id, &t1).unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
     assert_eq!(state(), (true, None));
-    svc.resolve_thread(&id, &t1).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &t1)).unwrap();
     assert_eq!(state(), (true, Some(Party::Human)));
 }
 
@@ -1156,7 +1156,7 @@ fn a_handed_over_round_carries_whether_each_thread_is_resolved() {
     let id = after_round_1(&repo, &svc);
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "Add a test for d").unwrap();
-    svc.resolve_thread(&id, &ThreadId::new("T2")).unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T2"))).unwrap();
 
     svc.hand_over_round(&id).unwrap();
 
@@ -1350,8 +1350,8 @@ fn replies_resolutions_and_reopenings_survive_a_restart_and_still_go_out() {
     let t1 = ThreadId::new("T1");
     svc.reply(repo.path(), &t1, "Renamed for clarity.").unwrap();
     svc.resolve(repo.path(), &t1).unwrap();
-    svc.reopen_thread(&id, &t1).unwrap();
-    svc.reply_in_thread(&id, &t1, "Clearer how?").unwrap();
+    svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &t1), "Clearer how?").unwrap();
     let before = svc.session(&id).unwrap();
     drop(svc);
 

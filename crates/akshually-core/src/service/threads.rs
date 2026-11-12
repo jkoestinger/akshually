@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Service, Session, SessionId, SourceRef};
+use super::{Service, Session, SourceRef, ThreadRef};
 use crate::forge::PullRequestRef;
 use crate::thread::{Comment, Party, Thread, ThreadId};
 use crate::{Error, git};
@@ -51,31 +51,35 @@ impl Service {
 
     /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
     /// next Round under that Thread.
-    pub fn reply_in_thread(&self, id: &SessionId, thread: &ThreadId, body: impl Into<String>) -> Result<(), Error> {
+    pub fn reply_in_thread(&self, thread: &ThreadRef, body: impl Into<String>) -> Result<(), Error> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
         }
-        self.human_thread(id, thread, |t| {
+        self.human_thread(thread, |t| {
             t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
         })
     }
 
     /// Human: marks `thread` Resolved, whoever opened it.
-    pub fn resolve_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| resolve(t, Party::Human))
+    pub fn resolve_thread(&self, thread: &ThreadRef) -> Result<(), Error> {
+        self.human_thread(thread, |t| resolve(t, Party::Human))
     }
 
     /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
-    pub fn reopen_thread(&self, id: &SessionId, thread: &ThreadId) -> Result<(), Error> {
-        self.human_thread(id, thread, |t| {
+    pub fn reopen_thread(&self, thread: &ThreadRef) -> Result<(), Error> {
+        self.human_thread(thread, |t| {
             if t.resolved.take().is_some() {
                 t.reopened = true;
             }
         })
     }
 
-    fn human_thread(&self, id: &SessionId, thread: &ThreadId, f: impl FnOnce(&mut Thread)) -> Result<(), Error> {
+    fn human_thread(
+        &self,
+        ThreadRef { session: id, thread }: &ThreadRef,
+        f: impl FnOnce(&mut Thread),
+    ) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);

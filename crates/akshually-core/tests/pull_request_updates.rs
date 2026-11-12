@@ -8,7 +8,9 @@ use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment,
     RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, Comment, FileChange, ForgeThread, Hunk, Party, Service, Side, Verdict};
+use akshually_core::{
+    Anchor, Changeset, Comment, FileChange, ForgeThread, Hunk, Party, Service, Side, ThreadRef, Verdict,
+};
 use akshually_testkit::{TestDirs, wait_until};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -237,8 +239,8 @@ fn reloading_takes_others_comments_and_resolutions_and_keeps_the_human_s_drafts(
     let svc = Service::new().with_forges(vec![Box::new(forge.clone())]);
     let id = svc.open_pull_request(URL).unwrap();
     let ids: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.id.clone()).collect();
-    svc.reply_in_thread(&id, &ids[0], "Policy.").unwrap();
-    svc.resolve_thread(&id, &ids[1]).unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &ids[0]), "Policy.").unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &ids[1])).unwrap();
     let new = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 2..=2), "Which provider?").unwrap();
     {
         let mut remote = forge.0.lock().unwrap();
@@ -276,7 +278,7 @@ fn a_thread_deleted_on_the_forge_goes_unless_it_holds_drafts() {
     let svc = Service::new().with_forges(vec![Box::new(forge.clone())]);
     let id = svc.open_pull_request(URL).unwrap();
     let ids: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.id.clone()).collect();
-    svc.reply_in_thread(&id, &ids[1], "Yes.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &ids[1]), "Yes.").unwrap();
     forge.0.lock().unwrap().threads.clear();
 
     svc.reload(&id).unwrap();
