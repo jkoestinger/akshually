@@ -168,6 +168,20 @@ impl GitHub {
             .map_err(|e| self.http(e))
     }
 
+    /// Appends the rest of `thread`'s Comments when they didn't fit on the Threads' page, one
+    /// request per further page of Comments. Blocks on the network.
+    fn fetch_remaining_comments(&self, thread: &mut GqlThread) -> Result<(), ForgeError> {
+        while let Some(cursor) = thread.comments.page_info.next_cursor() {
+            let variables = serde_json::json!({ "id": thread.id, "after": cursor });
+            let data: ThreadCommentsData = self.graphql(THREAD_COMMENTS_QUERY, &variables)?;
+            let page =
+                data.node.ok_or_else(|| self.unexpected("a Thread vanished while its Comments were fetched"))?.comments;
+            thread.comments.nodes.extend(page.nodes);
+            thread.comments.page_info = page.page_info;
+        }
+        Ok(())
+    }
+
     fn lock_polls(&self) -> std::sync::MutexGuard<'_, HashMap<PullRequestRef, Polled>> {
         self.polls.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -409,10 +423,13 @@ impl ForgeAdapter for GitHub {
                 .and_then(|r| r.pull_request)
                 .ok_or_else(|| ForgeError::NotFound(pr.id.to_string()))?
                 .review_threads;
-            threads.extend(page.nodes.into_iter().map(GqlThread::into_remote));
-            match page.page_info {
-                PageInfo { has_next_page: true, end_cursor: Some(cursor) } => after = Some(cursor),
-                _ => return Ok(threads),
+            for mut thread in page.nodes {
+                self.fetch_remaining_comments(&mut thread)?;
+                threads.push(thread.into_remote());
+            }
+            match page.page_info.next_cursor() {
+                Some(cursor) => after = Some(cursor.to_owned()),
+                None => return Ok(threads),
             }
         }
     }
@@ -660,7 +677,16 @@ const DELETE_REVIEW: &str = "mutation($input: DeletePullRequestReviewInput!) {
   deletePullRequestReview(input: $input) { pullRequestReview { id } }
 }";
 
-const THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+/// The selection of one page of a Thread's Comments, shared by [`THREADS_QUERY`] and
+/// [`THREAD_COMMENTS_QUERY`]. A macro so `concat!` can splice it into both.
+macro_rules! comments_page {
+    () => {
+        "pageInfo { hasNextPage endCursor } nodes { body author { login } diffHunk }"
+    };
+}
+
+const THREADS_QUERY: &str = concat!(
+    "query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
@@ -668,16 +694,42 @@ const THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int
         nodes {
           id isResolved resolvedBy { login } isOutdated path subjectType
           line originalLine startLine originalStartLine diffSide
-          comments(first: 100) { nodes { body author { login } diffHunk } }
+          comments(first: 100) { ",
+    comments_page!(),
+    " }
         }
       }
     }
   }
-}";
+}"
+);
+
+/// The rest of a Thread's Comments, for a Thread with more Comments than [`THREADS_QUERY`] loads.
+const THREAD_COMMENTS_QUERY: &str = concat!(
+    "query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) { ",
+    comments_page!(),
+    " }
+    }
+  }
+}"
+);
 
 #[derive(Deserialize)]
 struct ThreadsData {
     repository: Option<GqlRepository>,
+}
+
+#[derive(Deserialize)]
+struct ThreadCommentsData {
+    node: Option<GqlThreadComments>,
+}
+
+#[derive(Deserialize)]
+struct GqlThreadComments {
+    comments: Page<GqlComment>,
 }
 
 #[derive(Deserialize)]
@@ -706,6 +758,13 @@ struct PageInfo {
     end_cursor: Option<String>,
 }
 
+impl PageInfo {
+    /// The cursor to ask for the next page after, `None` on the last page.
+    fn next_cursor(&self) -> Option<&str> {
+        self.end_cursor.as_deref().filter(|_| self.has_next_page)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GqlThread {
@@ -720,12 +779,7 @@ struct GqlThread {
     start_line: Option<u32>,
     original_start_line: Option<u32>,
     diff_side: Option<String>,
-    comments: Nodes<GqlComment>,
-}
-
-#[derive(Deserialize)]
-struct Nodes<T> {
-    nodes: Vec<T>,
+    comments: Page<GqlComment>,
 }
 
 #[derive(Deserialize)]

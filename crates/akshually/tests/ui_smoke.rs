@@ -1,7 +1,7 @@
-//! UI: a headless render smoke check (Rune's `--snap`), and the Session header's Changeset view
-//! dropdown, read from the accessibility tree of a headless render (`--tree`) driven by a
-//! `--script`. Needs a Vulkan or Metal adapter, but no display; on a GPU-less Linux CI runner,
-//! install lavapipe (`mesa-vulkan-drivers`).
+//! UI: a headless render smoke check (Rune's `--snap`, and `--tree` for the text a scene shows),
+//! and the Session header's Changeset view dropdown, read from the `--tree` accessibility tree
+//! after a `--script` of input. Needs a Vulkan or Metal adapter, but no display; on a GPU-less
+//! Linux CI runner, install lavapipe (`mesa-vulkan-drivers`).
 
 use std::path::Path;
 use std::process::Command;
@@ -87,41 +87,71 @@ fn a_session_where_only_the_full_changeset_applies_shows_no_dropdown() {
     assert!(tree.with_role("combo-box").is_empty(), "a dropdown with a single view");
 }
 
+#[test]
+fn the_publish_dialog_names_a_gitlab_pull_request_with_its_sigil() {
+    let tree = render_tree("publish-gitlab");
+
+    assert!(
+        tree.contains("Sent to gitlab.example.com as one review on platform/infra !97, under your name."),
+        "the Publish dialog doesn't name the GitLab Pull Request as `platform/infra !97`"
+    );
+    assert!(!tree.contains("#97"), "the Publish dialog names a GitLab Pull Request with `#`");
+}
+
+#[test]
+fn the_publish_dialog_names_a_github_pull_request_with_its_sigil() {
+    let tree = render_tree("publish");
+
+    assert!(
+        tree.contains("Sent to github.com as one review on acme/web #482, under your name."),
+        "the Publish dialog doesn't name the GitHub Pull Request as `acme/web #482`"
+    );
+}
+
 fn render_session(theme: &str) -> Snapshot {
+    let args = ["--scene", "session", "--theme", theme, "--size", "1280x800"];
+    render("session.png", "--snap", &args, Snapshot::read)
+}
+
+/// The `--tree` dump (Rune's element and accessibility tree, as JSON) of `scene`.
+fn render_tree(scene: &str) -> String {
+    render("tree.json", "--tree", &["--scene", scene], |path| std::fs::read_to_string(path).unwrap())
+}
+
+/// Runs the app headless, writing its `output` flag's file to `name` in a scratch directory, and
+/// reads that file with `read` before the directory goes.
+fn render<T>(name: &str, output: &str, args: &[&str], read: impl FnOnce(&Path) -> T) -> T {
     let dirs = TestDirs::new();
-    let snap = dirs.path().join("session.png");
+    let path = dirs.path().join(name);
 
-    let out = app(&dirs).arg("--snap").arg(&snap).args(["--theme", theme]).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_akshually"))
+        .args(["app", output])
+        .arg(&path)
+        .args(args)
+        // A headless render must not bind the socket or write state.
+        .env("AKSHUALLY_STATE_DIR", dirs.state())
+        .env("AKSHUALLY_RUNTIME_DIR", dirs.runtime())
+        // Nor read the user's config.
+        .env("AKSHUALLY_CONFIG", dirs.config())
+        .output()
+        .unwrap();
 
-    assert!(out.status.success(), "snap failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "render failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!dirs.runtime().exists() && !dirs.state().exists(), "a headless render touched akshually's dirs");
-    Snapshot::read(&snap)
+    read(&path)
 }
 
 /// The accessibility tree of the `session` scene once `script`, a list of Rune `--script`
 /// events, has played.
 fn session_tree(script: &[Value]) -> Tree {
     let dirs = TestDirs::new();
-    let (tree, script_path) = (dirs.path().join("tree.json"), dirs.path().join("script.json"));
+    let script_path = dirs.path().join("script.json");
     std::fs::write(&script_path, json!(script).to_string()).unwrap();
 
-    let out =
-        app(&dirs).arg("--tree").arg(&tree).arg("--script").arg(&script_path).args(["--at", "2"]).output().unwrap();
+    let args = ["--scene", "session", "--size", "1280x800", "--script", script_path.to_str().unwrap(), "--at", "2"];
+    let tree = render("tree.json", "--tree", &args, |path| std::fs::read_to_string(path).unwrap());
 
-    assert!(out.status.success(), "tree failed: {}", String::from_utf8_lossy(&out.stderr));
-    Tree(serde_json::from_str::<Value>(&std::fs::read_to_string(&tree).unwrap()).unwrap()["accessibility"].clone())
-}
-
-/// A headless run of the app on the `session` scene, kept away from akshually's dirs.
-fn app(dirs: &TestDirs) -> Command {
-    let mut app = Command::new(env!("CARGO_BIN_EXE_akshually"));
-    app.args(["app", "--scene", "session", "--size", "1280x800"])
-        // A headless render must not bind the socket or write state.
-        .env("AKSHUALLY_STATE_DIR", dirs.state())
-        .env("AKSHUALLY_RUNTIME_DIR", dirs.runtime())
-        // Nor read the user's config.
-        .env("AKSHUALLY_CONFIG", dirs.config());
-    app
+    Tree(serde_json::from_str::<Value>(&tree).unwrap()["accessibility"].clone())
 }
 
 /// A press on the Changeset view dropdown.

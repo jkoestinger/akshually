@@ -52,6 +52,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("threads", scene_threads),
             ("inbox", scene_inbox),
             ("publish", scene_publish),
+            ("publish-gitlab", scene_publish_gitlab),
             ("co-review", scene_co_review),
         ],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
@@ -92,8 +93,8 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
     app.try_run()
 }
 
-/// The window's view model.
-struct State {
+/// The window's view model. Public so tests can drive [`view`] in Rune's headless `Runtime`.
+pub struct State {
     service: Arc<Service>,
     tabs: Vec<SessionTab>,
     /// The Session whose tab is open; `None` for the Inbox.
@@ -122,6 +123,11 @@ struct State {
     /// The Session the human asked to abandon (or close, for a Pull Request), until they
     /// confirm or cancel.
     confirming_end: Option<SessionId>,
+    /// What a Session's diff view reads and writes once its tab is gone. Rune runs pointer,
+    /// wheel and visible-row handlers against the last built view, so they can reach a diff
+    /// view after `apply` dropped its tab and before the next rebuild drops the view (#37).
+    /// It is never shown, and nothing but those stale handlers reads what they write to it.
+    spare_diff: DiffState,
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -247,7 +253,9 @@ fn bytes(n: u64) -> String {
 }
 
 impl State {
-    fn new(service: Arc<Service>) -> Self {
+    /// The view model of `service`'s Sessions, showing the Session the service displays, else
+    /// the first one, else the Inbox.
+    pub fn new(service: Arc<Service>) -> Self {
         let mut state = State {
             service,
             tabs: Vec::new(),
@@ -266,6 +274,7 @@ impl State {
             publish: None,
             summary: TextEdit::new(""),
             confirming_end: None,
+            spare_diff: DiffState::new(Vec::new()),
         };
         let sessions = state.service.sessions();
         state.apply(sessions);
@@ -279,7 +288,7 @@ impl State {
 
     /// Mirrors the service's Sessions, keeping each Session's view state (scroll, folds) and
     /// rebuilding its diff only when its Changeset changed.
-    fn apply(&mut self, sessions: Vec<SessionView>) {
+    pub fn apply(&mut self, sessions: Vec<SessionView>) {
         let mut old = std::mem::take(&mut self.tabs);
         self.tabs = sessions
             .into_iter()
@@ -547,7 +556,7 @@ impl State {
 
     /// Opens the editor on the co-Reviewer's Draft `thread`, with what it says now.
     fn open_edit(&mut self, thread: ThreadRef) {
-        let tab = self.tabs.iter().find(|t| t.session.id == thread.session);
+        let tab = self.tab(&thread.session);
         let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread.thread)?.comments.first());
         let Some(draft) = draft else { return };
         self.edit_text = TextEdit::new(draft_markdown(&draft.body, draft.suggestion.as_deref()));
@@ -570,13 +579,21 @@ impl State {
 
     /// Expands or collapses an Outdated Thread.
     fn toggle_outdated(&mut self, thread: &ThreadRef) {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.session.id == thread.session) else { return };
+        let Some(tab) = self.tab_mut(&thread.session) else { return };
         match tab.expanded.iter().position(|t| t == &thread.thread) {
             Some(at) => {
                 tab.expanded.remove(at);
             }
             None => tab.expanded.push(thread.thread.clone()),
         }
+    }
+
+    fn tab(&self, id: &SessionId) -> Option<&SessionTab> {
+        self.tabs.iter().find(|t| &t.session.id == id)
+    }
+
+    fn tab_mut(&mut self, id: &SessionId) -> Option<&mut SessionTab> {
+        self.tabs.iter_mut().find(|t| &t.session.id == id)
     }
 
     fn active_tab(&self) -> Option<&SessionTab> {
@@ -626,7 +643,7 @@ fn first_line(thread: &Thread) -> &str {
 }
 
 /// The window: the tab strip, then the open Session or the Inbox, and any dialog above them.
-fn view(s: &State, cx: &mut Cx<State>) -> El {
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Rune keeps `system_dark` current with the OS setting and redraws when it changes.
     let k = theme::kit(cx.system_dark());
     let mut layer = Vec::new();
@@ -970,10 +987,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
             ),
     );
     Dialog::new("publish", "Publish review")
-        .description(format!(
-            "Sent to {} as one review on {} #{}, under your name.",
-            pr.id.host, pr.id.repo, pr.id.number
-        ))
+        .description(format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference()))
         .open(true)
         .width(620.0)
         .fit()
@@ -1324,25 +1338,31 @@ fn push_banner(k: &Kit, tab: &SessionTab) -> El {
 }
 
 /// The Session's diff, with each file's Comment and Viewed controls and its Threads under their
-/// lines. The diff view finds its state by Session id, as it outlives this call.
+/// lines. The diff view finds its state by Session id, as it outlives this call. Its handlers
+/// can run after the Session's tab is gone (see `State::spare_diff`); they then do nothing.
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
     let id_header = id.clone();
+    let id_comment = id.clone();
     let kc = k.clone();
     DiffView::new(
-        move |s: &State| &s.tabs.iter().find(|t| t.session.id == id).expect("the diff view's Session has a tab").diff,
-        move |s: &mut State| {
-            &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the diff view's Session has a tab").diff
+        move |s: &State| s.tab(&id).map_or(&s.spare_diff, |t| &t.diff),
+        // Not `tab_mut`: borrowing all of `s` for the found tab would keep `spare_diff` borrowed
+        // in the `None` arm too; borrowing the `tabs` field alone leaves `spare_diff` free.
+        move |s: &mut State| match s.tabs.iter_mut().find(|t| t.session.id == id_mut) {
+            Some(tab) => &mut tab.diff,
+            None => &mut s.spare_diff,
         },
     )
     .key(format!("diff-{}", tab.session.id))
     .header_actions(move |s: &State, file: usize| {
-        let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the diff view's Session has a tab");
+        let Some(tab) = s.tab(&id_header) else { return row() };
         let Some(change) = tab.session.shown().files.get(file) else { return row() };
         let note = file_note(change).unwrap_or_default();
         let viewed = tab.session.viewed.contains(&change.path);
         let (id, path) = (tab.session.id.clone(), change.path.clone());
+        let id_file = id.clone();
         row()
             .gap(12.0)
             .items_center()
@@ -1350,7 +1370,12 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .child(
                 Button::new("Comment on file")
                     .variant(ButtonVariant::GhostMuted)
-                    .on_press(move |s: &mut State| s.compose_general(Some(file)))
+                    .on_press(move |s: &mut State| {
+                        // Composing goes to the active Session; a stale press must not reach another.
+                        if s.active.as_ref() == Some(&id_file) {
+                            s.compose_general(Some(file));
+                        }
+                    })
                     .build(&kc),
             )
             .child(
@@ -1364,7 +1389,13 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         let k = k.clone();
         move |s: &State, a: &Annotation| annotation(&k, s, a, agent)
     })
-    .on_comment(|s: &mut State, range: LineRange, _: &mut Tx| s.compose(range))
+    .on_comment(move |s: &mut State, range: LineRange, _: &mut Tx| {
+        // `compose` goes to the active Session; a stale "+" must not open a composer on another
+        // Session at this one's lines.
+        if s.active.as_ref() == Some(&id_comment) {
+            s.compose(range);
+        }
+    })
     .build(s, k)
 }
 
@@ -2027,6 +2058,18 @@ fn scene_publish(s: &mut State) {
         busy: false,
         error: None,
     });
+}
+
+/// `--scene publish-gitlab`: the Publish dialog of `--scene publish`, on a GitLab Pull Request.
+fn scene_publish_gitlab(s: &mut State) {
+    scene_publish(s);
+    let Some(tab) = s.tabs.first() else { return };
+    let mut session = tab.session.clone();
+    let Source::PullRequest(pr) = &mut session.source else { return };
+    pr.id = PullRequestRef { host: "gitlab.example.com".into(), repo: "platform/infra".into(), number: 97 };
+    // `kind()` tells GitLab by its merge request URL.
+    pr.url = "https://gitlab.example.com/platform/infra/-/merge_requests/97".into();
+    s.apply(vec![session]);
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one

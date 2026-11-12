@@ -150,6 +150,7 @@ name = "akshually-ui"
 version = "0.1.0"
 dependencies = [
  "akshually-core",
+ "akshually-testkit",
  "notify-rust",
  "rune",
  "rune-kit",
