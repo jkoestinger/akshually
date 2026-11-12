@@ -269,6 +269,27 @@ fn a_second_app_exits_and_leaves_the_running_one_serving() {
 }
 
 #[test]
+fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear_error() {
+    let app = LaunchedApp::new();
+    let repo = repo_with_work();
+    let call = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let running = app.wait_for("the Session", |s| s.sessions.len() == 1);
+    // As when one CLI runs without XDG_RUNTIME_DIR and another with it.
+    let elsewhere = TestDirs::new();
+
+    let other = app.akshually(repo.path(), &["review"]).env("AKSHUALLY_RUNTIME_DIR", elsewhere.runtime()).spawn();
+    let out = finish(other.unwrap());
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(EXIT_ERROR), "stderr: {stderr}");
+    assert!(stderr.contains("already running"), "stderr: {stderr}");
+    assert!(!elsewhere.runtime().join("akshually.sock").exists(), "a second app serves the same Sessions");
+    assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
+    app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
+    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+}
+
+#[test]
 fn test_control_is_refused_by_an_app_not_started_for_tests() {
     let app = HostedApp::start();
 

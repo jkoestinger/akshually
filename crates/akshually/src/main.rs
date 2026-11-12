@@ -284,6 +284,26 @@ fn agent_call(f: impl FnOnce(Connection, &Path) -> Result<()>) -> Result<ExitCod
     Ok(ExitCode::SUCCESS)
 }
 
+/// The app already running on this state dir. It may have only just taken the lock (two
+/// launches racing), so give it a moment to listen. One that never answers here listens
+/// elsewhere: it was started with another runtime dir.
+fn connect_to_running(paths: &Paths) -> Result<Connection> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match ipc::connect(paths) {
+            Ok(connection) => return Ok(connection),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => anyhow::bail!(
+                "another akshually app is already running on {}, but it doesn't listen at {} ({error}): it was \
+                 started with another XDG_RUNTIME_DIR or AKSHUALLY_RUNTIME_DIR. Run akshually with the same \
+                 environment as that app, or quit it",
+                paths.state.display(),
+                paths.socket().display()
+            ),
+        }
+    }
+}
+
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     let settings = Settings::load(&Settings::file_from_env())?;
     if !headless && akshually_ui::is_headless_run(&rune_args) {
@@ -306,12 +326,10 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         // Another instance serves the CLI already; leave it to that one, and bring its window
         // up, which may have been closed: this is the human opening akshually again.
         Err(BindError::AlreadyRunning) => {
+            let running = connect_to_running(&paths)?;
             if !headless {
                 let token = std::env::var("XDG_ACTIVATION_TOKEN").ok().filter(|t| !t.is_empty());
-                ipc::connect(&paths)
-                    .context("can't reach the running akshually app")?
-                    .show(token)
-                    .context("can't show the running akshually app")?;
+                running.show(token).context("can't show the running akshually app")?;
             }
             return Ok(ExitCode::SUCCESS);
         }

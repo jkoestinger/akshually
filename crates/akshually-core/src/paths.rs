@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub struct Paths {
     /// Persistent state (Sessions, the app log). Overridden by `AKSHUALLY_STATE_DIR`.
     pub state: PathBuf,
-    /// The socket and lock of the running app, private to the user. Overridden by
+    /// The socket of the running app, private to the user. Overridden by
     /// `AKSHUALLY_RUNTIME_DIR`, and defaults to `state` when only that is overridden.
     pub runtime: PathBuf,
 }
@@ -36,9 +36,11 @@ impl Paths {
         self.runtime.join("akshually.sock")
     }
 
-    /// Held by the running app, so only one instance serves the socket.
+    /// Held by the running app, so only one instance serves the Sessions saved in `state`.
+    /// It lives beside them, not in `runtime`: two launches that disagree on the runtime dir
+    /// (one without `XDG_RUNTIME_DIR`) still find each other.
     pub fn lock(&self) -> PathBuf {
-        self.runtime.join("app.lock")
+        self.state.join("app.lock")
     }
 
     /// Where a launched app's stdout and stderr go.
