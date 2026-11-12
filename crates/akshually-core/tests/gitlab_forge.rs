@@ -639,31 +639,41 @@ impl Harness {
 #[test]
 fn gitlab_offers_the_verdicts_its_version_and_approval_rules_allow() {
     use Verdict::*;
-    // (GitLab's version, the human, can approve, has approved) and what's offered.
+    // (GitLab's version, the human's own, can approve, has approved) and what's offered.
     let cases = [
-        ("19.2.0-ee", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
-        ("19.10.1", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
-        ("20.0.0", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
+        ("19.2.0-ee", false, true, false, vec![Approve, RequestChanges, Feedback]),
+        ("19.10.1", false, true, false, vec![Approve, RequestChanges, Feedback]),
+        ("20.0.0", false, true, false, vec![Approve, RequestChanges, Feedback]),
         // Requesting changes through the API came with GitLab 19.2.
-        ("19.1.3-ee", "lee", true, false, vec![Approve, Feedback]),
-        ("18.11.0", "lee", true, false, vec![Approve, Feedback]),
+        ("19.1.3-ee", false, true, false, vec![Approve, Feedback]),
+        ("18.11.0", false, true, false, vec![Approve, Feedback]),
         // Approval rules (or the author approving their own) decide approving.
-        ("19.2.0", "lee", false, false, vec![RequestChanges, Feedback]),
+        ("19.2.0", false, false, false, vec![RequestChanges, Feedback]),
         // Approving again keeps the approval.
-        ("19.2.0", "lee", false, true, vec![Approve, RequestChanges, Feedback]),
+        ("19.2.0", false, false, true, vec![Approve, RequestChanges, Feedback]),
         // Authors can't request changes on their own merge request.
-        ("19.2.0", "tom", false, false, vec![Feedback]),
+        ("19.2.0", true, false, false, vec![Feedback]),
     ];
-    for (version, me, can, has, offered) in cases {
+    for (version, own, can, has, offered) in cases {
         let mut h = Harness::new();
         h.version(version);
-        h.user(me);
         h.approvals(can, has);
 
-        let verdicts = h.gitlab().verdicts(&rotate_creds()).unwrap();
+        let verdicts = h.gitlab().verdicts(&rotate_creds(), own).unwrap();
 
-        assert_eq!(verdicts, offered, "GitLab {version} as {me}, can approve {can}, has approved {has}");
+        assert_eq!(verdicts, offered, "GitLab {version}, own {own}, can approve {can}, has approved {has}");
     }
+}
+
+#[test]
+fn the_gitlab_viewer_is_the_username_of_the_token_s_user() {
+    let mut h = Harness::new();
+    let user = h.user("lee");
+
+    let username = h.gitlab().viewer().unwrap();
+
+    user.assert();
+    assert_eq!(username, "lee");
 }
 
 // --- Publish: draft notes, then the Verdict ---

@@ -51,7 +51,7 @@ impl GitHub {
     /// The adapter for `host`, whose API is at `host.api_base` or else derived: github.com's
     /// is `https://api.github.com`, an Enterprise host's `https://HOST/api/v3`.
     pub fn new(host: HostConfig, credentials: CredentialSources) -> Self {
-        let github_com = host.host.eq_ignore_ascii_case("github.com");
+        let github_com = host.is_default();
         let api = match &host.api_base {
             Some(base) => base.trim_end_matches('/').to_owned(),
             None if github_com => "https://api.github.com".to_owned(),
@@ -446,14 +446,18 @@ impl ForgeAdapter for GitHub {
         Ok(items)
     }
 
-    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
         #[derive(Deserialize)]
         struct User {
             login: String,
         }
         let viewer: User = self.get_json(self.endpoint(&["user"]).as_str())?;
+        Ok(viewer.login)
+    }
+
+    fn verdicts(&self, _: &PullRequest, own: bool) -> Result<Vec<Verdict>, ForgeError> {
         // Authors can't approve their own Pull Request, nor request changes on it.
-        Ok(if viewer.login.eq_ignore_ascii_case(&pr.author) { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
+        Ok(if own { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
     }
 
     /// A pending review with each new Thread and reply in it, then the Resolved changes, then

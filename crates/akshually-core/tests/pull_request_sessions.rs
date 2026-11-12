@@ -79,7 +79,11 @@ impl ForgeAdapter for FakeForge {
         ])
     }
 
-    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        unreachable!("not published here")
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
         unreachable!("not published here")
     }
 
@@ -228,7 +232,10 @@ fn a_forge_failure_opens_no_session() {
         fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
             unreachable!()
         }
-        fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+        fn viewer(&self) -> Result<String, ForgeError> {
+            unreachable!()
+        }
+        fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
             unreachable!()
         }
         fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {

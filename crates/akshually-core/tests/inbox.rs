@@ -1,10 +1,12 @@
-//! Seam A: the Inbox in the core review service, with fake Forge adapters.
+//! Seam A: the Inbox in the core review service, with fake Forge adapters, and how its rows name
+//! each Forge and host.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, ForgeKind, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread, Review,
+    ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread,
+    Review,
 };
 use akshually_core::{Anchor, Changeset, FileChange, InboxRowState, ReviewRequest, Service, Side, Verdict};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
@@ -80,7 +82,11 @@ impl ForgeAdapter for FakeForge {
         self.inbox.lock().unwrap().clone().map_err(|message| ForgeError::Http { host: self.host.into(), message })
     }
 
-    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
         Ok(Verdict::ALL.to_vec())
     }
 
@@ -379,4 +385,28 @@ fn inbox_subscribers_hear_when_a_session_changes_a_rows_state() {
 
     let last = heard.lock().unwrap().last().cloned();
     assert_eq!(last, Some(InboxRowState::SessionOpen { session: id, drafts: 1 }));
+}
+
+// --- Naming Forges and hosts ---
+
+#[test]
+fn each_forge_has_its_display_name() {
+    let names = [ForgeKind::GitHub.name(), ForgeKind::GitLab.name()];
+
+    assert_eq!(names, ["GitHub", "GitLab"]);
+}
+
+#[test]
+fn github_com_and_gitlab_com_are_their_forges_default_hosts_whatever_their_case() {
+    let cases = [
+        (ForgeKind::GitHub, "github.com", true),
+        (ForgeKind::GitHub, "GitHub.com", true),
+        (ForgeKind::GitLab, "gitlab.com", true),
+        (ForgeKind::GitHub, "github.example.com", false),
+        (ForgeKind::GitLab, "gitlab.example.com", false),
+        (ForgeKind::GitHub, "gitlab.com", false),
+    ];
+    for (kind, host, default) in cases {
+        assert_eq!(HostConfig::new(kind, host).is_default(), default, "{host} on {}", kind.name());
+    }
 }

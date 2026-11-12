@@ -210,6 +210,15 @@ impl NewComment {
         NewComment::new(text)
     }
 
+    /// The markdown its author would have written, which `from_markdown` reads back: the body,
+    /// then any suggestion in a ```` ```suggestion ```` fence long enough to hold it.
+    pub fn to_markdown(&self) -> String {
+        let Some(code) = &self.suggestion else { return self.body.clone() };
+        let code = if code.ends_with('\n') || code.is_empty() { code.clone() } else { format!("{code}\n") };
+        let fence = fence_for(&code);
+        format!("{}\n\n{fence}suggestion\n{code}{fence}\n", self.body.trim_end())
+    }
+
     /// Proposes `code` as the whole replacement for the anchored lines, which must be on the
     /// new side.
     pub fn suggest(mut self, code: impl Into<String>) -> Self {

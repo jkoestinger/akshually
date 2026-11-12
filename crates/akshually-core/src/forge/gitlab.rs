@@ -448,17 +448,21 @@ impl ForgeAdapter for GitLab {
         Ok(discussions.into_iter().filter_map(|d| d.into_remote(&pr.head_sha)).collect())
     }
 
+    fn viewer(&self) -> Result<String, ForgeError> {
+        let me: User = self.get_json(&self.endpoint(&["user"]))?;
+        Ok(me.username)
+    }
+
     /// Approving as GitLab's approval rules allow (approving again keeps an approval); requesting
     /// changes from GitLab 19.2, on someone else's merge request; feedback always.
-    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn verdicts(&self, pr: &PullRequest, own: bool) -> Result<Vec<Verdict>, ForgeError> {
         let version = self.version()?;
-        let me: User = self.get_json(&self.endpoint(&["user"]))?;
         let approvals = self.approvals(&pr.id)?;
         let mut verdicts = Vec::new();
         if approvals.user_can_approve || approvals.user_has_approved {
             verdicts.push(Verdict::Approve);
         }
-        if version >= REQUEST_CHANGES_SINCE && !me.username.eq_ignore_ascii_case(&pr.author) {
+        if version >= REQUEST_CHANGES_SINCE && !own {
             verdicts.push(Verdict::RequestChanges);
         }
         verdicts.push(Verdict::Feedback);
@@ -528,9 +532,9 @@ impl ForgeAdapter for GitLab {
     }
 
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
-        let me: User = self.get_json(&self.endpoint(&["user"]))?;
-        let mut items = self.merge_requests("reviewer_username", &me.username, InboxRole::Reviewer)?;
-        for item in self.merge_requests("assignee_username", &me.username, InboxRole::Assignee)? {
+        let me = self.viewer()?;
+        let mut items = self.merge_requests("reviewer_username", &me, InboxRole::Reviewer)?;
+        for item in self.merge_requests("assignee_username", &me, InboxRole::Assignee)? {
             if !items.iter().any(|i| i.id == item.id) {
                 items.push(item);
             }

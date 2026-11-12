@@ -38,11 +38,8 @@ impl CredentialSources {
     /// Enterprise, `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`, as `gh` does, so a
     /// github.com token never goes to another host), then the pasted one.
     pub(crate) fn github_token(&self, host: &HostConfig) -> Option<String> {
-        let vars: &[&str] = if host.host.eq_ignore_ascii_case("github.com") {
-            &["GITHUB_TOKEN"]
-        } else {
-            &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
-        };
+        let vars: &[&str] =
+            if host.is_default() { &["GITHUB_TOKEN"] } else { &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] };
         cli_token(Command::new(&self.gh).args(["auth", "token", "--hostname", &host.host]))
             .or_else(|| vars.iter().find_map(|v| non_empty(self.env.get(*v).cloned())))
             .or_else(|| non_empty(host.token.clone()))

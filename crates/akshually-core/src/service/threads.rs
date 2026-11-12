@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Service, Session, SourceRef, ThreadRef};
+use super::{Service, Session, SourceRef, ThreadActions, ThreadRef};
 use crate::forge::PullRequestRef;
 use crate::thread::{Comment, Party, Thread, ThreadId};
 use crate::{Error, git};
@@ -50,40 +50,63 @@ impl Service {
     }
 
     /// Human: replies in `thread` with `body` (markdown) as a Draft, which goes out with the
-    /// next Round under that Thread.
+    /// next Round under that Thread. Refused while the Thread is still all Drafts, unless a
+    /// co-Reviewer's Draft opens it (the reply questions that Draft).
     pub fn reply_in_thread(&self, thread: &ThreadRef, body: impl Into<String>) -> Result<(), Error> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(Error::EmptyComment);
         }
-        self.human_thread(thread, |t| {
+        let offered = |offered: &ThreadActions| if offered.reply { Ok(()) } else { Err(Error::NotSent) };
+        self.human_thread(thread, offered, |t| {
             t.comments.push(Comment { author: Party::Human, body, round: None, suggestion: None });
         })
     }
 
-    /// Human: marks `thread` Resolved, whoever opened it.
+    /// Human: marks `thread` Resolved, whoever opened it. Refused while it's still all Drafts,
+    /// and while it's Resolved already.
     pub fn resolve_thread(&self, thread: &ThreadRef) -> Result<(), Error> {
-        self.human_thread(thread, |t| resolve(t, Party::Human))
+        let offered = |offered: &ThreadActions| match offered {
+            ThreadActions { resolve: true, .. } => Ok(()),
+            ThreadActions { reopen: true, thread, .. } => {
+                Err(Error::InvalidRequest(format!("{thread} is Resolved already")))
+            }
+            _ => Err(Error::NotSent),
+        };
+        self.human_thread(thread, offered, |t| resolve(t, Party::Human))
     }
 
     /// Human: reopens a Resolved `thread`, whoever resolved it. The next Round tells the agent.
     pub fn reopen_thread(&self, thread: &ThreadRef) -> Result<(), Error> {
-        self.human_thread(thread, |t| {
-            if t.resolved.take().is_some() {
-                t.reopened = true;
-            }
+        let offered = |offered: &ThreadActions| match offered.reopen {
+            true => Ok(()),
+            false => Err(Error::InvalidRequest(format!("{} isn't Resolved", offered.thread))),
+        };
+        self.human_thread(thread, offered, |t| {
+            t.resolved = None;
+            t.reopened = true;
         })
     }
 
+    /// Runs `f` on `thread` if its Session offers the action there: `offered` says whether it
+    /// does, or why not. Once the Session has ended, nothing is offered.
     fn human_thread(
         &self,
         ThreadRef { session: id, thread }: &ThreadRef,
+        offered: impl FnOnce(&ThreadActions) -> Result<(), Error>,
         f: impl FnOnce(&mut Thread),
     ) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let found = inner.sessions[at].view.threads.iter_mut().find(|t| &t.id == thread);
-        f(found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        let view = &mut inner.sessions[at].view;
+        let actions = view.actions();
+        let actions = actions.thread(thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
+        if view.ended.is_some() {
+            return Err(Error::Ended);
+        }
+        offered(actions)?;
+        let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`actions` lists the Session's Threads");
+        f(found);
         inner.notify();
         Ok(())
     }

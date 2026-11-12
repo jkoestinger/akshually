@@ -40,9 +40,12 @@ pub trait ForgeAdapter: Send + Sync {
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
 
-    /// The Verdicts the Forge accepts from the human on `pr`: on GitHub, only feedback on
-    /// their own Pull Request.
-    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError>;
+    /// The human's login on this host, whose credentials the adapter uses.
+    fn viewer(&self) -> Result<String, ForgeError>;
+
+    /// The Verdicts the Forge accepts from the human on `pr`, which is their `own` when they
+    /// wrote it: on GitHub, only feedback on their own Pull Request.
+    fn verdicts(&self, pr: &PullRequest, own: bool) -> Result<Vec<Verdict>, ForgeError>;
 
     /// Sends `review` to `pr` as one review under the human's name, against `pr.head_sha`, and
     /// returns its web page. On failure nothing is left half-published.

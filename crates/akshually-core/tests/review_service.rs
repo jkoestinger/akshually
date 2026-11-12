@@ -1023,20 +1023,17 @@ fn the_agent_can_resolve_a_thread() {
 }
 
 #[test]
-fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_any_thread() {
+fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_it_again() {
     let repo = agent_branch();
     let svc = Service::new();
     let id = after_round_1(&repo, &svc);
-    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "A Draft").unwrap();
     svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
 
     svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
     assert_eq!(svc.session(&id).unwrap().threads[0].resolved, None);
 
     svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
-    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T2"))).unwrap();
-    let resolved: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.resolved.clone()).collect();
-    assert_eq!(resolved, vec![Some(Party::Human), Some(Party::Human)]);
+    assert_eq!(svc.session(&id).unwrap().threads[0].resolved, Some(Party::Human));
     assert!(svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T9"))).is_err());
 }
 
@@ -1138,12 +1135,14 @@ fn a_thread_reopened_then_resolved_again_before_handover_does_not_go_out() {
 }
 
 #[test]
-fn reopening_an_open_thread_changes_nothing() {
+fn reopening_an_open_thread_is_refused_and_changes_nothing() {
     let repo = agent_branch();
     let svc = Service::new();
     let id = after_round_1(&repo, &svc);
 
-    svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
+    let reopened = svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1")));
+
+    assert!(matches!(reopened, Err(Error::InvalidRequest(_))), "{reopened:?}");
 
     assert!(!svc.session(&id).unwrap().threads[0].reopened);
     assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
@@ -1178,14 +1177,15 @@ fn a_handed_over_round_carries_whether_each_thread_is_resolved() {
     let id = after_round_1(&repo, &svc);
     let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 4..=4), "Add a test for d").unwrap();
-    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T2"))).unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &ThreadId::new("T1")), "Fine as it is.").unwrap();
+    svc.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
 
     svc.hand_over_round(&id).unwrap();
 
     let round2 = round(second.wait_timeout(Duration::from_secs(1)));
     assert_eq!(
         round2.threads.iter().map(|t| (t.id.as_str(), t.resolved.clone())).collect::<Vec<_>>(),
-        vec![("T2", Some(Party::Human))]
+        vec![("T1", Some(Party::Human)), ("T2", None)]
     );
 }
 /// A Session in its second Round: the agent changed `lib.rs` and `other.rs` for Round 1, then,

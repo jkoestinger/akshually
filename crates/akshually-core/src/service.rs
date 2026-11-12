@@ -14,6 +14,7 @@ use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
+mod actions;
 mod co_review;
 mod diff_layout;
 mod disk;
@@ -23,6 +24,7 @@ mod inbox;
 mod pull_request;
 mod threads;
 
+pub use actions::{Ending, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use diff_layout::DiffLayout;
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
@@ -358,6 +360,29 @@ impl SessionView {
         }
     }
 
+    /// The Changeset views the Session has, in the order to offer them: the changes since the
+    /// last Round, since the Session base, then the full Changeset, which it always has.
+    pub fn offered_views(&self) -> Vec<ChangesetView> {
+        let since_last_round = self.since_last_round.as_ref().map(|_| ChangesetView::SinceLastRound);
+        let since_session_base = self.since_session_base.as_ref().map(|_| ChangesetView::SinceSessionBase);
+        [since_last_round, since_session_base, Some(ChangesetView::Full)].into_iter().flatten().collect()
+    }
+
+    /// What the Session's tab marks it with, the first that applies: it needs attention, a
+    /// reload is on offer (files changed on disk, or the Pull Request received pushes), or it's
+    /// the agent's Turn. `None` otherwise.
+    pub fn status(&self) -> Option<SessionStatus> {
+        if self.attention {
+            Some(SessionStatus::Attention)
+        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() {
+            Some(SessionStatus::ReloadOffered)
+        } else if self.turn == Turn::Agent {
+            Some(SessionStatus::AgentsTurn)
+        } else {
+            None
+        }
+    }
+
     /// The Changeset Threads are anchored in: the shown one, except since the last Round,
     /// where the old side is that Round's code rather than a base and files the agent left
     /// alone are hidden, so Threads stay anchored in the full Changeset.
@@ -401,6 +426,34 @@ impl SessionView {
         Some(Anchor::lines(side, path, first..=last))
     }
 
+    /// Whether a Thread can be opened at `anchor` now: it must fit the Changeset Threads are
+    /// anchored in (`InvalidAnchor`), and a Forge takes line Comments only within its diff's
+    /// hunks (`OutsideDiff`).
+    pub fn check_anchor(&self, anchor: &Anchor) -> Result<(), Error> {
+        self.excerpt_at(anchor).map(drop)
+    }
+
+    /// Where a Comment can go when the Forge refuses `anchor`'s lines: their whole file. `None`
+    /// when `anchor` isn't refused that way.
+    pub fn fallback_anchor(&self, anchor: &Anchor) -> Option<Anchor> {
+        match self.check_anchor(anchor) {
+            Err(Error::OutsideDiff { path, .. }) => Some(Anchor::file(path)),
+            _ => None,
+        }
+    }
+
+    /// The code a Thread at `anchor` would be written against, once `check_anchor` passes.
+    fn excerpt_at(&self, anchor: &Anchor) -> Result<String, Error> {
+        let excerpt = anchor.excerpt(self.anchored_in()).map_err(Error::InvalidAnchor)?;
+        if !self.changeset.takes_comment_at(anchor) {
+            let Anchor::Lines { path, side, start, end } = anchor.clone() else {
+                unreachable!("only line ranges are refused")
+            };
+            return Err(Error::OutsideDiff { path, side, start, end });
+        }
+        Ok(excerpt)
+    }
+
     /// The Round the agent is working on during its Turn: the last one handed over. `None` in
     /// the human's Turn, and while a co-Reviewer that opened the Session is still drafting,
     /// before any Round.
@@ -434,6 +487,17 @@ pub struct PlacedThread {
     pub side: Side,
     pub line: u32,
     pub thread: ThreadId,
+}
+
+/// What a Session's tab marks it with (`SessionView::status`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// It became the human's Turn while another tab was displayed.
+    Attention,
+    /// Files changed on disk, or the Pull Request received pushes: a reload is on offer.
+    ReloadOffered,
+    /// The agent is working on a Round.
+    AgentsTurn,
 }
 
 /// Which of a Session's Changesets the human is looking at.
@@ -488,11 +552,7 @@ impl Session {
     /// Opens a Thread at `anchor` whose first Comment is `author`'s Draft `comment` (already
     /// checked with `check_comment`).
     fn open_thread(&mut self, anchor: Anchor, comment: NewComment, author: Party) -> Result<ThreadId, Error> {
-        let excerpt = anchor.excerpt(self.view.anchored_in()).map_err(Error::InvalidAnchor)?;
-        if !self.view.changeset.takes_comment_at(&anchor) {
-            let Anchor::Lines { path, side, start, end } = anchor else { unreachable!("only line ranges are refused") };
-            return Err(Error::OutsideDiff { path, side, start, end });
-        }
+        let excerpt = self.view.excerpt_at(&anchor)?;
         self.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", self.threads_opened));
         let NewComment { body, suggestion } = comment;
@@ -917,17 +977,20 @@ impl Service {
     /// A Pull Request Session with no agent has no one to tell, and a co-review of local work
     /// has no Verdict: abandoning either closes it.
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
-        let closes = self.lock().sessions.iter().any(|s| {
-            &s.view.id == id
-                && match s.view.source {
-                    Source::PullRequest(_) => s.view.agent.is_none(),
-                    Source::Local { .. } => s.view.agent == Some(Role::CoReviewer),
-                }
-        });
-        if closes {
-            return self.close(id);
+        let (end, pull_request) = {
+            let inner = self.lock();
+            let view = &inner.sessions[inner.position(id)?].view;
+            if view.ended.is_some() {
+                return Err(Error::Ended);
+            }
+            (view.actions().end, view.pull_request().is_some())
+        };
+        // Closing a Pull Request before Publish tells its co-Reviewer, if any, it was Abandoned.
+        match end {
+            Ending::Close => self.close(id),
+            Ending::Abandon if pull_request => self.close(id),
+            Ending::Abandon => self.end(id, Outcome::Abandoned),
         }
-        self.end(id, Outcome::Abandoned)
     }
 
     /// Human: closes the Session. One that has its outcome already (a Verdict, Published,
@@ -975,14 +1038,13 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        if outcome == Outcome::Approved && session.view.pull_request().is_some() {
-            return Err(Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()));
-        }
-        if outcome == Outcome::Approved && session.view.agent == Some(Role::CoReviewer) {
-            return Err(Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()));
-        }
-        if outcome == Outcome::Approved && session.view.turn != Turn::Human {
-            return Err(Error::NotYourTurn);
+        let view = &session.view;
+        if outcome == Outcome::Approved && view.actions().verdict != Some(VerdictAction::Approve) {
+            return Err(match view.pull_request() {
+                Some(_) => Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()),
+                None if view.turn != Turn::Human => Error::NotYourTurn,
+                None => Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()),
+            });
         }
         session.conclude(outcome);
         inner.reap();

@@ -22,8 +22,9 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, DiffLayout, InboxRow, InboxRowState, InboxView, Outcome, PendingReview, PlacedThread,
-    PublishPlan, ReviewRequest, Role, Service, SessionId, SessionView, Source, SourceRef, ThreadRef, Turn, Verdict,
+    CancelReview, ChangesetView, DiffLayout, Ending, HandOver, InboxRow, InboxRowState, InboxView, Outcome,
+    PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions, SessionId, SessionStatus,
+    SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, Verdict, VerdictAction,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
@@ -73,6 +74,8 @@ pub enum Error {
     EmptyReview,
     #[error("this Session already has an agent, as its {0}")]
     OtherAgent(Role),
+    #[error("this Thread is still all Drafts: there's nothing to reply to or resolve until it goes out")]
+    NotSent,
     #[error("{0} isn't an agent Draft")]
     NotAnAgentDraft(ThreadId),
     #[error("this Session is being published")]

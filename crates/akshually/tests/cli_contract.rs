@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Party, Side, ThreadRef};
+use akshually_core::{Anchor, Party, Side};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
 
@@ -107,7 +107,6 @@ fn review_format_json_prints_the_round_as_json() {
     let child = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
-    app.service.resolve_thread(&ThreadRef::new(&session.id, &akshually_core::ThreadId::new("T1"))).unwrap();
 
     app.service.hand_over_round(&session.id).unwrap();
 
@@ -124,7 +123,7 @@ fn review_format_json_prints_the_round_as_json() {
                 "anchor": {"kind": "lines", "path": "lib.rs", "side": "new", "start": 2, "end": 3},
                 "excerpt": "fn b() {}\nfn c() {}\n",
                 "comments": [{"author": "human", "body": "Why two?", "round": 1}],
-                "resolved": "human",
+                "resolved": null,
                 "outdated": false,
                 "reopened": false,
             }],

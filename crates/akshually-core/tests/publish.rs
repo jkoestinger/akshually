@@ -77,8 +77,13 @@ impl ForgeAdapter for FakeForge {
         Ok(self.remote.clone())
     }
 
-    fn verdicts(&self, pr: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
-        Ok(if pr.author == "me" { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
+    /// The human is `me`.
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, own: bool) -> Result<Vec<Verdict>, ForgeError> {
+        Ok(if own { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
     }
 
     fn publish(&self, _: &PullRequest, review: &Review) -> Result<String, ForgeError> {
@@ -172,6 +177,30 @@ fn on_your_own_pull_request_only_feedback_is_offered() {
     let id = svc.open_pull_request(URL).unwrap();
 
     assert_eq!(svc.publish_plan(&id).unwrap().verdicts, vec![Verdict::Feedback]);
+}
+
+#[test]
+fn the_plan_says_whether_the_human_wrote_the_pull_request_whatever_the_case_of_their_login() {
+    let (yours, _) = service_for("Me");
+    let (theirs, _) = service_for("maria");
+    let (your_id, their_id) = (yours.open_pull_request(URL).unwrap(), theirs.open_pull_request(URL).unwrap());
+
+    let (own, other) = (yours.publish_plan(&your_id).unwrap(), theirs.publish_plan(&their_id).unwrap());
+
+    assert!(own.own, "the human is `me`, who wrote it");
+    assert!(!other.own, "maria wrote it");
+}
+
+#[test]
+fn the_plan_starts_from_the_only_verdict_offered_and_leaves_a_choice_to_the_human() {
+    let (yours, _) = service_for("me");
+    let (theirs, _) = service_for("maria");
+    let (your_id, their_id) = (yours.open_pull_request(URL).unwrap(), theirs.open_pull_request(URL).unwrap());
+
+    let (own, other) = (yours.publish_plan(&your_id).unwrap(), theirs.publish_plan(&their_id).unwrap());
+
+    assert_eq!(own.default_verdict(), Some(Verdict::Feedback), "only feedback is offered");
+    assert_eq!(other.default_verdict(), None, "every Verdict is offered");
 }
 
 #[test]
@@ -420,4 +449,30 @@ fn line_comments_outside_the_forge_s_diff_are_refused_and_the_file_is_offered_in
     svc.comment(&id, Anchor::lines(Side::Old, "config.rs", 14..=19), "In the second.").unwrap();
     svc.comment(&id, Anchor::file("config.rs"), "On the file.").unwrap();
     assert_eq!(svc.session(&id).unwrap().threads.len(), 4, "RT_1 and three Drafts");
+}
+
+#[test]
+fn checking_an_anchor_tells_lines_outside_the_forge_s_diff_before_any_comment() {
+    let (svc, _) = service_for("maria");
+    let id = svc.open_pull_request(URL).unwrap();
+    let session = svc.session(&id).unwrap();
+
+    let outside = session.check_anchor(&Anchor::lines(Side::New, "config.rs", 1..=1));
+    let inside = session.check_anchor(&Anchor::lines(Side::New, "config.rs", 3..=9));
+
+    assert!(matches!(&outside, Err(Error::OutsideDiff { path, .. }) if path == "config.rs"), "{outside:?}");
+    assert!(inside.is_ok(), "{inside:?}");
+}
+
+#[test]
+fn lines_outside_the_forge_s_diff_fall_back_to_their_whole_file() {
+    let (svc, _) = service_for("maria");
+    let id = svc.open_pull_request(URL).unwrap();
+    let session = svc.session(&id).unwrap();
+
+    let outside = session.fallback_anchor(&Anchor::lines(Side::New, "config.rs", 1..=1));
+    let inside = session.fallback_anchor(&Anchor::lines(Side::New, "config.rs", 3..=9));
+
+    assert_eq!(outside, Some(Anchor::file("config.rs")));
+    assert_eq!(inside, None, "the Forge takes those lines");
 }
