@@ -350,3 +350,16 @@ fn inbox_attention_survives_a_restart() {
 
     assert!(restored.inbox().attention);
 }
+
+#[test]
+fn a_pull_request_listed_as_assignee_and_reviewer_is_a_review_request() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Assignee, 100), github.item(1, InboxRole::Reviewer, 100)]);
+    let svc = service(&[&github]);
+
+    svc.refresh_inbox();
+
+    let inbox = svc.inbox();
+    assert_eq!(inbox.rows.iter().map(|r| r.item.role).collect::<Vec<_>>(), vec![InboxRole::Reviewer]);
+    assert!(inbox.attention, "a new review request");
+}

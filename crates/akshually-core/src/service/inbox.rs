@@ -162,6 +162,9 @@ impl Service {
                 }
             }
         }
+        // A Pull Request listed in both roles is a review request: that copy goes first, so it's
+        // the one kept.
+        items.sort_by_key(|i: &InboxItem| i.role != InboxRole::Reviewer);
         let mut listed = Vec::new();
         items.retain(|i: &InboxItem| {
             let first = !listed.contains(&i.id);
