@@ -91,10 +91,7 @@ impl Inbox {
                     // A Published Session stays open until the human closes it.
                     .find(|s| s.view.pull_request().is_some_and(|p| p.id == item.id));
                 let state = match (session, self.seen(&item.id)) {
-                    (Some(s), _) => InboxRowState::SessionOpen {
-                        session: s.view.id.clone(),
-                        drafts: s.view.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count(),
-                    },
+                    (Some(s), _) => InboxRowState::SessionOpen { session: s.view.id.clone(), drafts: s.view.drafts() },
                     (None, None) => InboxRowState::New,
                     (None, Some(seen)) if seen < item.updated_at => InboxRowState::Updated,
                     (None, Some(_)) => InboxRowState::Seen,

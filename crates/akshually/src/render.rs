@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use akshually_core::{Anchor, Outcome, Round, Side, Thread};
+use akshually_core::{Anchor, Outcome, Round, Side, Thread, fence_for};
 
 /// What `review --format markdown` prints for `outcome`; `pr` is the Pull Request the agent
 /// co-reviews, if any, which its commands must name.
@@ -82,10 +82,4 @@ fn code_block(out: &mut String, code: &str) {
         out.push('\n');
     }
     let _ = writeln!(out, "{fence}");
-}
-
-/// A backtick fence longer than any backtick run in `code`, so the code can't close it.
-fn fence_for(code: &str) -> String {
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    "`".repeat(longest.max(2) + 1)
 }

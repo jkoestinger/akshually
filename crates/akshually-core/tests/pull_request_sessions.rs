@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
+    ForgeAdapter, ForgeError, ForgeKind, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
 use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn, Verdict};
 use akshually_testkit::{TestDirs, TestRepo};
@@ -276,4 +276,29 @@ fn a_pull_request_session_survives_a_restart() {
     assert_eq!(restored.session(&id), Some(before));
     assert_eq!(restored.open_pull_request(URL).unwrap(), id);
     assert_eq!(*fetches.lock().unwrap(), 1, "the restored Session is not fetched again");
+}
+
+#[test]
+fn a_pull_request_session_is_titled_by_its_repository_and_number() {
+    let (svc, _) = service();
+
+    let id = svc.open_pull_request(URL).unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().title(), "acme/web #7");
+}
+
+#[test]
+fn a_gitlab_merge_request_takes_gitlabs_sigil() {
+    let mr = PullRequest {
+        id: PullRequestRef { host: "gitlab.example.com".into(), repo: "platform/infra".into(), number: 97 },
+        url: "https://gitlab.example.com/platform/infra/-/merge_requests/97".into(),
+        title: "Rotate database credentials".into(),
+        author: "tom".into(),
+        head_branch: "rotate".into(),
+        head_sha: "h".into(),
+        base_sha: "b".into(),
+    };
+
+    assert_eq!(mr.kind(), ForgeKind::GitLab);
+    assert_eq!(mr.reference(), "platform/infra !97");
 }

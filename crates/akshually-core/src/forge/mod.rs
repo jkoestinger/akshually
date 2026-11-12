@@ -197,6 +197,19 @@ pub struct PullRequest {
     pub base_sha: String,
 }
 
+impl PullRequest {
+    /// The Forge it's on. Only GitLab's merge request pages have `/-/merge_requests/` in their
+    /// URL.
+    pub fn kind(&self) -> ForgeKind {
+        if self.url.contains("/-/merge_requests/") { ForgeKind::GitLab } else { ForgeKind::GitHub }
+    }
+
+    /// How the Forge names it: `acme/web #482`, `platform/infra !97`.
+    pub fn reference(&self) -> String {
+        format!("{} {}{}", self.id.repo, self.kind().sigil(), self.id.number)
+    }
+}
+
 /// A Thread already on the Forge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteThread {
@@ -275,8 +288,7 @@ pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dy
 /// info string is `info` (`suggestion` on GitHub), in a fence longer than any backtick run in
 /// `code`. Empty `code` suggests deleting the lines.
 pub(crate) fn with_suggestion(body: &str, info: &str, code: &str) -> String {
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat((longest + 1).max(3));
+    let fence = crate::fence_for(code);
     let newline = if code.is_empty() || code.ends_with('\n') { "" } else { "\n" };
     let block = format!("{fence}{info}\n{code}{newline}{fence}");
     if body.is_empty() { block } else { format!("{body}\n\n{block}") }

@@ -9,8 +9,11 @@ impl SessionView {
     /// How many Comments and reopened Threads the next Round would carry.
     pub fn to_hand_over(&self) -> usize {
         let co_review = self.is_co_review();
-        let comments: usize =
-            self.threads.iter().map(|t| (0..t.comments.len()).filter(|&at| goes_out(co_review, t, at)).count()).sum();
+        let comments: usize = self
+            .threads
+            .iter()
+            .map(|t| (0..t.comments.len()).filter(|&i| carried_in_next_round(co_review, t, i)).count())
+            .sum();
         comments + self.threads.iter().filter(|t| t.reopened && !co_review).count()
     }
 }
@@ -44,12 +47,13 @@ impl Service {
         let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
         for thread in &mut session.view.threads {
-            let goes_out: Vec<bool> = (0..thread.comments.len()).map(|at| goes_out(co_review, thread, at)).collect();
+            let carried: Vec<bool> =
+                (0..thread.comments.len()).map(|i| carried_in_next_round(co_review, thread, i)).collect();
             let drafts: Vec<Comment> = thread
                 .comments
                 .iter_mut()
-                .zip(goes_out)
-                .filter(|(_, goes)| *goes)
+                .zip(carried)
+                .filter(|(_, carried)| *carried)
                 .map(|(c, _)| {
                     c.round = Some(number);
                     c.clone()
@@ -174,13 +178,14 @@ pub(super) fn check_comment(anchor: &Anchor, comment: &NewComment) -> Result<(),
     Ok(())
 }
 
-/// Whether the next Round carries `thread`'s Comment at `at`: any Draft for an Author, and for
-/// a co-Reviewer only the human's questions, Draft replies in a Thread one of its Drafts opens.
-/// The human's other Drafts wait for Publish, and the agent's for the human to keep.
-fn goes_out(co_review: bool, thread: &Thread, at: usize) -> bool {
-    let comment = &thread.comments[at];
+/// Whether the next Round carries `thread`'s Comment at `comment_index` to the agent: any Draft
+/// for an Author, and for a co-Reviewer only the human's questions, Draft replies in a Thread
+/// one of its Drafts opens. The human's other Drafts wait for Publish, and the agent's for the
+/// human to keep.
+fn carried_in_next_round(co_review: bool, thread: &Thread, comment_index: usize) -> bool {
+    let comment = &thread.comments[comment_index];
     if !co_review {
         return comment.is_draft();
     }
-    at > 0 && comment.is_draft() && comment.author == Party::Human && thread.comments[0].is_agent_draft()
+    comment_index > 0 && comment.is_draft() && comment.author == Party::Human && thread.comments[0].is_agent_draft()
 }

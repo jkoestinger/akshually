@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use akshually_core::{
-    Anchor, BinarySizes, ChangesetView, Collapsed, Error, FileChange, Outcome, Party, ReviewRequest, Round, Service,
-    SessionId, Settings, Side, Source, Thread, ThreadId, ThreadRef, Turn,
+    Anchor, BinarySizes, ChangesetView, Collapsed, Error, FileChange, Outcome, Party, PlacedThread, ReviewRequest,
+    Round, Service, SessionId, Settings, Side, Source, Thread, ThreadId, ThreadRef, Turn,
 };
 use akshually_testkit::{TestDirs, TestRepo};
 
@@ -1284,6 +1284,77 @@ fn a_file_the_agent_reverted_since_the_last_round_shows_as_changed_back() {
 
     let session = svc.session(third.session()).unwrap();
     assert!(session.shown().files.contains(&change("other.rs", Some("fn o2() {}\n"), Some("fn o() {}\n"))));
+}
+
+#[test]
+fn since_the_last_round_threads_on_the_old_side_are_not_placed_in_the_diff() {
+    let svc = Service::new();
+    let (_repo, second) = second_round(&svc);
+    let id = second.session();
+    // On the base's code, which the old side since the last Round doesn't show.
+    svc.show(id, ChangesetView::Full).unwrap();
+    svc.comment(id, Anchor::lines(Side::Old, "lib.rs", 1..=1), "Why keep a?").unwrap();
+    svc.show(id, ChangesetView::SinceLastRound).unwrap();
+
+    let placed = svc.session(id).unwrap().placed_threads();
+
+    assert_eq!(placed, vec![PlacedThread { file: 1, side: Side::New, line: 2, thread: ThreadId::new("T1") }]);
+    svc.show(id, ChangesetView::Full).unwrap();
+    let placed = svc.session(id).unwrap().placed_threads();
+    assert_eq!(placed.iter().map(|p| (p.side, p.line)).collect::<Vec<_>>(), [(Side::New, 2), (Side::Old, 1)]);
+}
+
+#[test]
+fn a_selection_anchors_to_its_lines_or_across_sides_to_its_last_line() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let session = svc.session(pending.session()).unwrap();
+
+    let new_lines = session.anchor_for_selection(0, (Side::New, 3), (Side::New, 2));
+    let across = session.anchor_for_selection(0, (Side::Old, 2), (Side::New, 4));
+
+    assert_eq!(new_lines, Some(Anchor::lines(Side::New, "lib.rs", 2..=3)));
+    assert_eq!(across, Some(Anchor::lines(Side::New, "lib.rs", 4..=4)));
+    assert_eq!(session.anchor_for_selection(5, (Side::New, 1), (Side::New, 1)), None, "no such file");
+}
+
+#[test]
+fn since_the_last_round_old_side_lines_take_no_comment() {
+    let svc = Service::new();
+    let (_repo, second) = second_round(&svc);
+    let session = svc.session(second.session()).unwrap();
+
+    // That old side is the last Round's code, which a Thread can't anchor to.
+    assert_eq!(session.anchor_for_selection(1, (Side::Old, 1), (Side::Old, 1)), None);
+    assert_eq!(
+        session.anchor_for_selection(1, (Side::New, 3), (Side::New, 4)),
+        Some(Anchor::lines(Side::New, "lib.rs", 3..=4))
+    );
+}
+
+#[test]
+fn a_session_counts_its_drafts() {
+    let svc = Service::new();
+    let (_repo, second) = second_round(&svc);
+    let id = second.session();
+    svc.comment(id, Anchor::file("extra.rs"), "Why a new file?").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(id, &ThreadId::new("T1")), "And d_works?").unwrap();
+
+    // T1's opening Comment went out with Round 1.
+    assert_eq!(svc.session(id).unwrap().drafts(), 2);
+}
+
+#[test]
+fn a_local_session_is_titled_by_its_repository_and_branch() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let title = svc.session(pending.session()).unwrap().title();
+
+    let name = repo.path().file_name().unwrap().to_string_lossy();
+    assert_eq!(title, format!("{name} · agent"));
 }
 
 // Persistence: Sessions survive restarts, shown by building a new service on the same state dir.

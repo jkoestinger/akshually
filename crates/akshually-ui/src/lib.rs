@@ -9,7 +9,7 @@ use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, FileChange, InboxRow, InboxRowState, InboxView, NewComment,
     Outcome, Party, PublishPlan, Role, Service, SessionId, SessionView, Side, Source, Thread, ThreadId, ThreadRef,
-    Turn, Verdict,
+    Turn, Verdict, fence_for,
 };
 use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
@@ -151,47 +151,12 @@ impl SessionTab {
     /// Puts each current Thread, and the composer when it's on this Session, under its last
     /// line. Outdated Threads have no line; they show above the diff.
     fn annotate(&mut self, composer: Option<&Composer>) {
-        let changeset = self.session.shown();
-        let mut notes: Vec<Annotation> = self
-            .session
-            .threads
-            .iter()
-            .filter(|t| !t.outdated)
-            .filter_map(|t| {
-                let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
-                if *side == Side::Old && self.session.view == ChangesetView::SinceLastRound {
-                    // That old side is the last Round's code, not the code the Thread is on.
-                    return None;
-                }
-                let file = changeset.files.iter().position(|f| &f.path == path)?;
-                Some(Annotation::new(file, LineRef::new(diff_side(*side), *end), t.id.as_str()))
-            })
+        let placed = self.session.placed_threads().into_iter();
+        let mut notes: Vec<Annotation> = placed
+            .map(|p| Annotation::new(p.file, LineRef::new(diff_side(p.side), p.line), p.thread.as_str()))
             .collect();
         notes.extend(composer.filter(|c| c.session == self.session.id).and_then(|c| c.at.clone()));
         self.diff.set_annotations(notes);
-    }
-
-    /// What the next Round carries: each Draft, and each Thread the human reopened; for a
-    /// co-Reviewer, only the questions on its Drafts.
-    fn to_hand_over(&self) -> usize {
-        self.session.to_hand_over()
-    }
-
-    /// The human's Drafts, which Publish sends once kept.
-    fn drafts(&self) -> usize {
-        self.session.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
-    }
-
-    fn title(&self) -> String {
-        if let Some(pr) = self.session.pull_request() {
-            // GitLab numbers merge requests `!97`, and only its URLs have `/-/merge_requests/`.
-            let sigil = if pr.url.contains("/-/merge_requests/") { '!' } else { '#' };
-            return format!("{} {sigil}{}", pr.id.repo, pr.id.number);
-        }
-        let repo = self.session.repo().map(|repo| {
-            repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into_owned())
-        });
-        format!("{} · {}", repo.unwrap_or_default(), self.session.branch())
     }
 }
 
@@ -202,20 +167,11 @@ fn diff_side(side: Side) -> diff::Side {
     }
 }
 
-/// The Anchor for lines selected in the diff. A selection may run across sides; it then
-/// anchors to its last line alone.
-fn anchor_for(changeset: &Changeset, range: LineRange) -> Option<Anchor> {
-    let path = changeset.files.get(range.file)?.path.clone();
-    let side = match range.end.side {
+fn core_side(side: diff::Side) -> Side {
+    match side {
         diff::Side::Old => Side::Old,
         diff::Side::New => Side::New,
-    };
-    let (start, end) = if range.start.side == range.end.side {
-        (range.start.line.min(range.end.line), range.start.line.max(range.end.line))
-    } else {
-        (range.end.line, range.end.line)
-    };
-    Some(Anchor::lines(side, path, start..=end))
+    }
 }
 
 fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
@@ -465,9 +421,7 @@ impl State {
     }
 
     fn show(&self, id: &SessionId, view: ChangesetView) {
-        if let Err(error) = self.service.show(id, view) {
-            eprintln!("akshually: {error}");
-        }
+        report(self.service.show(id, view));
     }
 
     fn annotate(&mut self) {
@@ -479,11 +433,9 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
-        if tab.session.view == ChangesetView::SinceLastRound && range.end.side == diff::Side::Old {
-            // Those lines are the last Round's code, which a Thread can't anchor to.
-            return;
-        }
-        let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
+        let (start, end) =
+            ((core_side(range.start.side), range.start.line), (core_side(range.end.side), range.end.line));
+        let Some(anchor) = tab.session.anchor_for_selection(range.file, start, end) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.open_composer(anchor, Some(at));
     }
@@ -556,7 +508,7 @@ impl State {
         let Some(thread) = &self.reply else { return };
         match self.service.reply_in_thread(thread, self.reply_text.text.clone()) {
             Ok(()) => self.close_reply(),
-            Err(error) => eprintln!("akshually: {error}"),
+            error => report(error),
         }
     }
 
@@ -579,7 +531,7 @@ impl State {
         let Some(thread) = &self.editing else { return };
         match self.service.edit_draft(thread, NewComment::from_markdown(&self.edit_text.text)) {
             Ok(()) => self.close_edit(),
-            Err(error) => eprintln!("akshually: {error}"),
+            error => report(error),
         }
     }
 
@@ -604,20 +556,14 @@ impl State {
 
     /// Runs a human action on the service; the service's update then refreshes the view.
     fn act(&self, id: &SessionId, action: fn(&Service, &SessionId) -> Result<(), akshually_core::Error>) {
-        if let Err(error) = action(&self.service, id) {
-            eprintln!("akshually: {error}");
-        }
+        report(action(&self.service, id));
     }
 
     /// Reloads a Pull Request Session from its Forge off the UI thread (the Forge may be slow);
     /// the service's update then refreshes the view.
     fn reload_pull_request(&self, id: &SessionId) {
         let (service, id) = (self.service.clone(), id.clone());
-        let reload = move || {
-            if let Err(error) = service.reload(&id) {
-                eprintln!("akshually: {error}");
-            }
-        };
+        let reload = move || report(service.reload(&id));
         match self.handle {
             Some(_) => drop(std::thread::spawn(reload)),
             None => reload(),
@@ -626,10 +572,21 @@ impl State {
 
     /// `act`, for a human action on one Thread.
     fn act_on_thread(&self, thread: &ThreadRef, action: fn(&Service, &ThreadRef) -> Result<(), akshually_core::Error>) {
-        if let Err(error) = action(&self.service, thread) {
-            eprintln!("akshually: {error}");
-        }
+        report(action(&self.service, thread));
     }
+}
+
+/// Reports a human action the service refused. The UI offers only what's allowed, so this is
+/// for races (the Session changed meanwhile); there's nowhere better to show it yet.
+fn report(result: Result<(), akshually_core::Error>) {
+    if let Err(error) = result {
+        eprintln!("akshually: {error}");
+    }
+}
+
+/// The first line of a Thread's first Comment, which names it in one-line summaries.
+fn first_line(thread: &Thread) -> &str {
+    thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""))
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
@@ -642,7 +599,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .status(s.inbox.attention.then_some(TabItemStatus::Attention));
     let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
         .tabs(std::iter::once(inbox_tab).chain(s.tabs.iter().map(|t| {
-            TabItem::new(t.session.id.as_str(), t.title())
+            TabItem::new(t.session.id.as_str(), t.session.title())
                 .icon(&rune_kit::glyphs::FILE_CODE)
                 .closable(false)
                 .status(tab_status(&t.session))
@@ -789,9 +746,10 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
 /// platform/infra !97 · …`: hosts other than github.com and gitlab.com are named.
 fn inbox_meta(item: &InboxItem, now: i64) -> String {
     let PullRequestRef { host, repo, number } = &item.id;
-    let (forge, sigil) = match item.kind {
-        ForgeKind::GitHub => ("GitHub", '#'),
-        ForgeKind::GitLab => ("GitLab", '!'),
+    let sigil = item.kind.sigil();
+    let forge = match item.kind {
+        ForgeKind::GitHub => "GitHub",
+        ForgeKind::GitLab => "GitLab",
     };
     let place = if host == "github.com" || host == "gitlab.com" {
         format!("{repo} {sigil}{number}")
@@ -844,7 +802,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
-        .child(Badge::new(format!("{} Drafts", tab.drafts())).build(k))
+        .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
         .child(
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -871,7 +829,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
 fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
     let id = session.id.clone();
-    let count = tab.to_hand_over();
+    let count = session.to_hand_over();
     let label = match (session.is_co_review(), count) {
         (true, 0) => "Hand over questions".to_owned(),
         (true, n) => format!("Hand over questions ({n})"),
@@ -881,11 +839,7 @@ fn hand_over_button(k: &Kit, tab: &SessionTab) -> El {
     Button::new(label)
         .variant(ButtonVariant::Submit)
         .disabled(count == 0 || session.turn != Turn::Human || session.ended.is_some())
-        .on_press(move |s: &mut State| {
-            if let Err(error) = s.service.hand_over_round(&id) {
-                eprintln!("akshually: {error}");
-            }
-        })
+        .on_press(move |s: &mut State| report(s.service.hand_over_round(&id).map(drop)))
         .build(k)
 }
 
@@ -990,7 +944,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
 /// One Thread's Drafts in the Publish dialog, ticked when they're sent.
 fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
     let on = publish_place(thread);
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let on = if thread.forge.is_some() { format!("Reply in {} on {on}", thread.id) } else { on };
     let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
     let suggestion = thread.comments.iter().any(|c| c.suggestion.is_some());
@@ -1015,7 +969,7 @@ fn publish_place(thread: &Thread) -> String {
 
 /// A Thread Publish resolves or reopens on the Forge (`what`), in the Publish dialog.
 fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let line = format!("{what} {} on {} — {first}", thread.id, publish_place(thread));
     row()
         .w_full()
@@ -1264,11 +1218,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .child(
                 Checkbox::new(viewed)
                     .label("Viewed")
-                    .on_toggle(move |s: &mut State| {
-                        if let Err(error) = s.service.mark_viewed(&id, &path, !viewed) {
-                            eprintln!("akshually: {error}");
-                        }
-                    })
+                    .on_toggle(move |s: &mut State| report(s.service.mark_viewed(&id, &path, !viewed)))
                     .build(&kc),
             )
     })
@@ -1419,8 +1369,7 @@ fn edit_composer(k: &Kit, s: &State) -> El {
 fn draft_markdown(body: &str, suggestion: Option<&str>) -> String {
     let Some(code) = suggestion else { return body.to_owned() };
     let code = if code.ends_with('\n') || code.is_empty() { code.to_owned() } else { format!("{code}\n") };
-    let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
+    let fence = fence_for(&code);
     format!("{}\n\n{fence}suggestion\n{code}{fence}\n", body.trim_end())
 }
 
@@ -1451,7 +1400,7 @@ fn resolved_by(thread: &Thread) -> String {
 
 /// A Resolved Thread, collapsed to one line with a way to reopen it.
 fn resolved_row(k: &Kit, thread: &Thread, session: SessionId) -> El {
-    let first = thread.comments.first().map_or("", |c| c.body.lines().next().unwrap_or(""));
+    let first = first_line(thread);
     let count = thread.comments.len();
     row()
         .w_full()
@@ -1597,8 +1546,7 @@ fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
     let removed = excerpt.lines().map(|l| format!("-{l}\n"));
     let added = suggestion.lines().map(|l| format!("+{l}\n"));
     let lines: String = removed.chain(added).collect();
-    let longest = lines.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
+    let fence = fence_for(&lines);
     format!("{fence}diff\n{lines}{fence}\n")
 }
 
@@ -1614,7 +1562,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             Anchor::File { path } => path.clone(),
             Anchor::Review => "Whole Review".to_owned(),
         };
-        let first = thread.comments.first().map(|c| c.body.lines().next().unwrap_or_default()).unwrap_or_default();
+        let first = first_line(thread);
         let count = match thread.comments.len() {
             1 => "1 Comment".to_owned(),
             n => format!("{n} Comments"),

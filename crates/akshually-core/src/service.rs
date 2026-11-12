@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::changeset::{self, Changeset, LocalOptions};
 use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
 use crate::store::Store;
-use crate::thread::{Anchor, Comment, NewComment, Party, Round, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 mod co_review;
@@ -365,6 +365,66 @@ impl SessionView {
             _ => self.shown(),
         }
     }
+
+    /// Since the last Round, the old side is that Round's code, not a base: no Thread is on it.
+    fn old_side_shown(&self) -> bool {
+        self.view != ChangesetView::SinceLastRound
+    }
+
+    /// Where each current line Thread sits in the shown Changeset: under its last line. Outdated
+    /// Threads, and Threads on lines not shown, have no place.
+    pub fn placed_threads(&self) -> Vec<PlacedThread> {
+        let shown = self.shown();
+        let placed = self.threads.iter().filter(|t| !t.outdated).filter_map(|t| {
+            let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
+            if *side == Side::Old && !self.old_side_shown() {
+                return None;
+            }
+            let file = shown.files.iter().position(|f| &f.path == path)?;
+            Some(PlacedThread { file, side: *side, line: *end, thread: t.id.clone() })
+        });
+        placed.collect()
+    }
+
+    /// The Anchor for the lines selected from `start` to `end` (each a side and a 1-based line)
+    /// in the shown Changeset's file at `file`. A selection running across sides anchors to its
+    /// last line alone. `None` where no Thread can go.
+    pub fn anchor_for_selection(&self, file: usize, start: (Side, u32), end: (Side, u32)) -> Option<Anchor> {
+        let path = self.shown().files.get(file)?.path.clone();
+        let side = end.0;
+        if side == Side::Old && !self.old_side_shown() {
+            return None;
+        }
+        let (first, last) = if start.0 == side { (start.1.min(end.1), start.1.max(end.1)) } else { (end.1, end.1) };
+        Some(Anchor::lines(side, path, first..=last))
+    }
+
+    /// How many Drafts the Session holds: the human's, and the co-Reviewer's not kept yet.
+    pub fn drafts(&self) -> usize {
+        self.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
+    }
+
+    /// The Session's name, as its tab shows it: `repo · branch` for local work, `acme/web #482`
+    /// for a Pull Request.
+    pub fn title(&self) -> String {
+        match &self.source {
+            Source::Local { repo, branch } => {
+                let name = repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into());
+                format!("{name} · {branch}")
+            }
+            Source::PullRequest(pr) => pr.reference(),
+        }
+    }
+}
+
+/// A line Thread's place in the shown Changeset: `file` is its index there, and the Thread
+/// sits under `line` on `side`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedThread {
+    pub file: usize,
+    pub side: Side,
+    pub line: u32,
+    pub thread: ThreadId,
 }
 
 /// Which of a Session's Changesets the human is looking at.
@@ -584,7 +644,6 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 
 #[derive(Default)]
 pub struct Service {
-    // One lock for Sessions and subscribers, so subscribers see changes in order.
     // One lock for Sessions and subscribers, so subscribers see changes in order. Shared with
     // each PendingReview, which frees its Session when dropped.
     inner: Arc<Mutex<Inner>>,
