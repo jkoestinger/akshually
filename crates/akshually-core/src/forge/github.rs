@@ -11,11 +11,11 @@ use ureq::http::Response;
 use ureq::{Body, RequestBuilder};
 use url::Url;
 
-use super::file_change;
 use super::{
-    CredentialSources, ForgeAdapter, ForgeError, HostConfig, PullRequest, PullRequestRef, PullRequestUpdate,
-    RemoteAnchor, RemoteComment, RemoteThread,
+    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
+    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread,
 };
+use super::{epoch_seconds, file_change};
 use crate::{Changeset, Side};
 
 /// Pages of up to this many items, GitHub's maximum.
@@ -400,6 +400,70 @@ impl ForgeAdapter for GitHub {
                 _ => return Ok(threads),
             }
         }
+    }
+
+    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
+        // `review-requested` includes requests to the human's teams. A review removes the
+        // request, so a reviewed Pull Request leaves the Inbox unless assigned.
+        let mut items = self.search("review-requested:@me", InboxRole::Reviewer)?;
+        for item in self.search("assignee:@me", InboxRole::Assignee)? {
+            if !items.iter().any(|i| i.id == item.id) {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+}
+
+impl GitHub {
+    /// The open Pull Requests matching `filter`, most recently updated first; the first 100,
+    /// which is plenty for an Inbox.
+    fn search(&self, filter: &str, role: InboxRole) -> Result<Vec<InboxItem>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Found {
+            items: Vec<Issue>,
+        }
+        #[derive(Deserialize)]
+        struct Issue {
+            repository_url: String,
+            html_url: String,
+            number: u64,
+            title: String,
+            user: Option<GqlActor>,
+            created_at: String,
+            updated_at: String,
+        }
+        let mut url = self.endpoint(&["search", "issues"]);
+        url.query_pairs_mut()
+            .append_pair("q", &format!("is:pr is:open archived:false {filter}"))
+            .append_pair("sort", "updated")
+            .append_pair("per_page", PAGE);
+        let found: Found = self.get_json(url.as_str())?;
+        found
+            .items
+            .into_iter()
+            .map(|issue| {
+                // `…/repos/OWNER/REPO`
+                let mut path = issue.repository_url.rsplit('/');
+                let (repo, owner) = (path.next().unwrap_or_default(), path.next().unwrap_or_default());
+                let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.unexpected(format!("a time of {t:?}")));
+                Ok(InboxItem {
+                    id: PullRequestRef {
+                        host: self.host.host.clone(),
+                        repo: format!("{owner}/{repo}"),
+                        number: issue.number,
+                    },
+                    kind: ForgeKind::GitHub,
+                    url: issue.html_url,
+                    title: issue.title,
+                    // GitHub shows a deleted account as "ghost".
+                    author: issue.user.map_or_else(|| "ghost".to_owned(), |u| u.login),
+                    created_at: time(&issue.created_at)?,
+                    updated_at: time(&issue.updated_at)?,
+                    role,
+                })
+            })
+            .collect()
     }
 }
 

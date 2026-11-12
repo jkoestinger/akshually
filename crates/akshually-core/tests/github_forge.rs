@@ -6,8 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use akshually_core::forge::{
-    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, PullRequest, PullRequestRef,
-    RemoteAnchor, RemoteComment, RemoteThread, adapters,
+    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, InboxItem, InboxRole, PullRequest,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, adapters,
 };
 use akshually_core::{BinarySizes, FileChange, Settings, Side};
 use akshually_testkit::TestDirs;
@@ -453,6 +453,87 @@ fn gh_is_asked_once_and_again_after_the_token_is_refused() {
     github.pull_request(&pr_ref()).unwrap();
 
     assert_eq!(gh_runs(h.dirs.path()), 2);
+}
+
+// --- The Inbox ---
+
+impl Harness {
+    /// `GET search/issues` for the open Pull Requests matching `filter`, answering `body`.
+    fn search(&mut self, filter: &str, body: &str) -> Mock {
+        self.server
+            .mock("GET", "/search/issues")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("q".into(), format!("is:pr is:open archived:false {filter}")),
+                Matcher::UrlEncoded("per_page".into(), "100".into()),
+            ]))
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .match_header("accept", "application/vnd.github+json")
+            .match_header("x-github-api-version", "2022-11-28")
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create()
+    }
+}
+
+fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRole) -> InboxItem {
+    InboxItem {
+        id: PullRequestRef { host: "github.com".into(), repo: repo.into(), number },
+        kind: ForgeKind::GitHub,
+        url: format!("https://github.com/{repo}/pull/{number}"),
+        title: title.into(),
+        author: author.into(),
+        created_at: 0,
+        updated_at: 0,
+        role,
+    }
+}
+
+#[test]
+fn the_inbox_lists_review_requests_then_assignments_once_each() {
+    let mut h = Harness::new();
+    let github = h.github();
+    let requested = h.search("review-requested:@me", &fixture("search-review-requested.json"));
+    let assigned = h.search("assignee:@me", &fixture("search-assigned.json"));
+
+    let inbox = github.inbox().unwrap();
+
+    requested.assert();
+    assigned.assert();
+    let listed: Vec<_> = inbox.iter().map(|i| InboxItem { created_at: 0, updated_at: 0, ..i.clone() }).collect();
+    assert_eq!(
+        listed,
+        vec![
+            inbox_item("acme/web", 482, "Add SSO login", "maria", InboxRole::Reviewer),
+            inbox_item("acme/api", 311, "Retry 429 responses with backoff", "lee", InboxRole::Reviewer),
+            inbox_item("acme/docs", 45, "Fix broken links in setup guide", "sam", InboxRole::Assignee),
+        ]
+    );
+}
+
+#[test]
+fn inbox_times_are_seconds_since_the_epoch() {
+    let mut h = Harness::new();
+    let github = h.github();
+    h.search("review-requested:@me", &fixture("search-review-requested.json"));
+    h.search("assignee:@me", r#"{"total_count":0,"incomplete_results":false,"items":[]}"#);
+
+    let inbox = github.inbox().unwrap();
+
+    // 2026-11-12T08:00:00Z and 2026-11-12T09:30:00Z.
+    assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_470_400, 1_794_475_800));
+    // 2026-11-11T16:45:10Z.
+    assert_eq!(inbox[1].updated_at, 1_794_415_510);
+}
+
+#[test]
+fn a_refused_token_fails_the_inbox() {
+    let mut h = Harness::new();
+    let github = h.github();
+    h.server.mock("GET", "/search/issues").match_query(Matcher::Any).with_status(401).create();
+
+    let error = github.inbox().unwrap_err();
+
+    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
 }
 
 // --- New pushes ---

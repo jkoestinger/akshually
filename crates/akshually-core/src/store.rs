@@ -24,6 +24,9 @@ pub(crate) struct Store {
     /// The Session bases from `start`, which exist before their Session does.
     bases: PathBuf,
     bases_written: Option<u64>,
+    /// The Inbox as last refreshed, and what the human has seen of it.
+    inbox: PathBuf,
+    inbox_written: Option<u64>,
 }
 
 impl Store {
@@ -37,7 +40,14 @@ impl Store {
         let dir = state_dir.join("sessions");
         fs::create_dir_all(&dir)?;
         let bases_path = state_dir.join("session-bases.json");
-        let mut store = Store { dir, written: HashMap::new(), bases: bases_path, bases_written: None };
+        let mut store = Store {
+            dir,
+            written: HashMap::new(),
+            bases: bases_path,
+            bases_written: None,
+            inbox: state_dir.join("inbox.json"),
+            inbox_written: None,
+        };
         let bases = match fs::read_to_string(&store.bases) {
             Ok(json) => match serde_json::from_str(&json) {
                 Ok(bases) => {
@@ -79,6 +89,40 @@ impl Store {
         if self.bases_written != Some(hash) {
             write_atomically(&self.bases, &json)?;
             self.bases_written = Some(hash);
+        }
+        Ok(())
+    }
+
+    /// Reads the saved Inbox; the default when there is none or it can't be read (it's only a
+    /// cache of the Forges, plus what the human has seen).
+    pub(crate) fn load_inbox<I: DeserializeOwned + Default>(&mut self) -> I {
+        let json = match fs::read_to_string(&self.inbox) {
+            Ok(json) => json,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return I::default(),
+            Err(error) => {
+                eprintln!("akshually: skipping unreadable {}: {error}", self.inbox.display());
+                return I::default();
+            }
+        };
+        match serde_json::from_str(&json) {
+            Ok(inbox) => {
+                self.inbox_written = Some(hash(&json));
+                inbox
+            }
+            Err(error) => {
+                eprintln!("akshually: skipping unreadable {}: {error}", self.inbox.display());
+                I::default()
+            }
+        }
+    }
+
+    /// Saves the Inbox, if it changed since last time.
+    pub(crate) fn sync_inbox<I: Serialize>(&mut self, inbox: &I) -> Result<(), Error> {
+        let json = serde_json::to_string(inbox).map_err(std::io::Error::from)?;
+        let hash = hash(&json);
+        if self.inbox_written != Some(hash) {
+            write_atomically(&self.inbox, &json)?;
+            self.inbox_written = Some(hash);
         }
         Ok(())
     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{ChangesetView, Service, Session, SessionId, SessionView, Turn};
-use crate::forge::{ForgeAdapter, PullRequest, RemoteAnchor, RemoteThread};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread};
 use crate::thread::{Anchor, Comment, Party, Thread, ThreadId};
 use crate::{Changeset, Error};
 
@@ -18,8 +18,17 @@ impl Service {
 
     /// Human: opens the Pull Request at `url` in a Session, with its Changeset and the Threads
     /// already on it, or returns its Session if one is open. Either way the Session is the one
-    /// displayed: the human asked for it. Blocks on the Forge.
+    /// displayed: the human asked for it, and has now seen it as far as the Inbox goes. Blocks
+    /// on the Forge.
     pub fn open_pull_request(&self, url: &str) -> Result<SessionId, Error> {
+        let (id, pr) = self.open_pull_request_session(url)?;
+        let mut inner = self.lock();
+        inner.inbox.saved.looked_at(&pr);
+        inner.notify_inbox();
+        Ok(id)
+    }
+
+    fn open_pull_request_session(&self, url: &str) -> Result<(SessionId, PullRequestRef), Error> {
         let (forge, pr) = self
             .forges
             .iter()
@@ -33,7 +42,7 @@ impl Service {
         let already = open(&self.lock().sessions);
         if let Some(id) = already {
             self.display(&id)?;
-            return Ok(id);
+            return Ok((id, pr));
         }
 
         // Not holding the lock: the Forge may take a while.
@@ -46,7 +55,7 @@ impl Service {
         if let Some(id) = open(&inner.sessions) {
             drop(inner);
             self.display(&id)?;
-            return Ok(id);
+            return Ok((id, pr));
         }
         let threads: Vec<Thread> = remote
             .into_iter()
@@ -72,8 +81,9 @@ impl Service {
         let threads_opened = view.threads.len() as u32;
         inner.sessions.push(Session { view, threads_opened, ..Session::default() });
         inner.displayed = Some(id.clone());
+        inner.inbox.displayed = false;
         inner.notify();
-        Ok(id)
+        Ok((id, pr))
     }
 
     /// Runs `check_pull_requests` every `every` on a background thread, until the service is
