@@ -48,6 +48,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("threads", scene_threads),
             ("inbox", scene_inbox),
             ("publish", scene_publish),
+            ("publish-gitlab", scene_publish_gitlab),
             ("co-review", scene_co_review),
         ],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
@@ -956,10 +957,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
             ),
     );
     Dialog::new("publish", "Publish review")
-        .description(format!(
-            "Sent to {} as one review on {} #{}, under your name.",
-            pr.id.host, pr.id.repo, pr.id.number
-        ))
+        .description(format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference()))
         .open(true)
         .width(620.0)
         .fit()
@@ -1980,6 +1978,18 @@ fn scene_publish(s: &mut State) {
         busy: false,
         error: None,
     });
+}
+
+/// `--scene publish-gitlab`: the Publish dialog of `--scene publish`, on a GitLab Pull Request.
+fn scene_publish_gitlab(s: &mut State) {
+    scene_publish(s);
+    let Some(tab) = s.tabs.first() else { return };
+    let mut session = tab.session.clone();
+    let Source::PullRequest(pr) = &mut session.source else { return };
+    pr.id = PullRequestRef { host: "gitlab.example.com".into(), repo: "platform/infra".into(), number: 97 };
+    // `kind()` tells GitLab by its merge request URL.
+    pr.url = "https://gitlab.example.com/platform/infra/-/merge_requests/97".into();
+    s.apply(vec![session]);
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
