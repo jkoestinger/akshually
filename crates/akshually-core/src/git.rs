@@ -1,8 +1,10 @@
 //! A thin wrapper over the `git` CLI, so akshually gives the same answers as the user's git
 //! (worktrees, ignores, attributes) without linking a git library.
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
@@ -22,8 +24,17 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
 
 /// Runs `git args` in `dir` and returns its raw stdout.
 pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
-    let out =
-        Command::new("git").args(["-c", "core.quotepath=off", "--no-pager"]).args(args).current_dir(dir).output()?;
+    run(Command::new("git").current_dir(dir), args)
+}
+
+/// Runs `git args` in `dir` with its index at `index` instead of the repository's own.
+fn git_with_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String, GitError> {
+    let bytes = run(Command::new("git").current_dir(dir).env("GIT_INDEX_FILE", index), args)?;
+    String::from_utf8(bytes).map_err(|_| GitError::NotUtf8)
+}
+
+fn run(cmd: &mut Command, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let out = cmd.args(["-c", "core.quotepath=off", "--no-pager"]).args(args).output()?;
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -65,7 +76,83 @@ pub fn default_branch(repo: &Path) -> Option<String> {
 
 /// The commit where HEAD forked from `other`.
 pub fn merge_base(repo: &Path, other: &str) -> Result<String, GitError> {
-    Ok(git(repo, &["merge-base", "HEAD", other])?.trim().to_owned())
+    merge_base_of(repo, "HEAD", other)
+}
+
+/// The commit where `a` and `b` forked.
+pub fn merge_base_of(repo: &Path, a: &str, b: &str) -> Result<String, GitError> {
+    Ok(git(repo, &["merge-base", "--end-of-options", a, b])?.trim().to_owned())
+}
+
+/// The value of the gitattribute `attr` for each of `paths` (relative to the root of `repo`):
+/// `Some(true)` when set, `Some(false)` when unset or `false`, `None` when unspecified.
+pub fn bool_attr(repo: &Path, attr: &str, paths: &[&str]) -> Result<HashMap<String, Option<bool>>, GitError> {
+    let mut child = Command::new("git")
+        .args(["check-attr", "-z", "--stdin", attr])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    // Written from another thread, so a full stdout pipe can't deadlock us.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output()?;
+    writer.join().expect("the writer doesn't panic")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(GitError::Failed { args: format!("check-attr {attr}"), stderr });
+    }
+    // Records are `<path>\0<attr>\0<value>\0`.
+    let fields: Vec<&[u8]> = out.stdout.split(|&b| b == 0).collect();
+    let mut values = HashMap::new();
+    for [path, _, value] in fields.as_chunks::<3>().0 {
+        let path = String::from_utf8(path.to_vec()).map_err(|_| GitError::NotUtf8)?;
+        let value = match *value {
+            b"unspecified" => None,
+            b"unset" | b"false" => Some(false),
+            _ => Some(true),
+        };
+        values.insert(path, value);
+    }
+    Ok(values)
+}
+
+/// Untracked, non-ignored files in `repo`, relative to its root.
+pub fn untracked(repo: &Path) -> Result<Vec<String>, GitError> {
+    let listing = git_bytes(repo, &["ls-files", "--others", "--exclude-standard", "--full-name", "-z", ":/"])?;
+    listing
+        .split(|&b| b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8(f.to_vec()).map_err(|_| GitError::NotUtf8))
+        .collect()
+}
+
+/// Resolves `rev` (a commit-ish, or `<rev>^{tree}`) to an object id.
+pub fn rev_parse(repo: &Path, rev: &str) -> Result<String, GitError> {
+    Ok(git(repo, &["rev-parse", "--verify", "--end-of-options", rev])?.trim().to_owned())
+}
+
+/// Writes the working tree to the object database as a tree, without touching the
+/// repository's index: tracked files as they are on disk (staged or not), plus untracked
+/// non-ignored files when `untracked` is set. Returns the tree's id.
+pub fn working_tree(repo: &Path, untracked: bool) -> Result<String, GitError> {
+    let scratch = tempfile::Builder::new().prefix("akshually-index").tempdir()?;
+    let index = scratch.path().join("index");
+    // Start from a copy of the real index, so git reuses its cached stats instead of hashing
+    // every file, and what is staged (new files, removals) carries over.
+    let real = PathBuf::from(git(repo, &["rev-parse", "--path-format=absolute", "--git-path", "index"])?.trim());
+    match std::fs::copy(&real, &index) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    git_with_index(repo, &index, &["add", if untracked { "--all" } else { "--update" }, "--", ":/"])?;
+    Ok(git_with_index(repo, &index, &["write-tree"])?.trim().to_owned())
 }
 
 /// The commit HEAD points at.
