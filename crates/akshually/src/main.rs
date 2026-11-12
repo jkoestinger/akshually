@@ -1,6 +1,7 @@
 //! The single `akshually` binary: the CLI agents call, and (`akshually app`) the app itself.
 
 mod launch;
+mod render;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -15,13 +16,15 @@ mod exit {
     pub const APPROVED: u8 = 0;
     pub const ERROR: u8 = 1;
     pub const ABANDONED: u8 = 3;
+    pub const ROUND: u8 = 4;
 }
 
 #[derive(Parser)]
 #[command(version, about = "Human-in-the-loop code review for agents")]
 struct Cli {
+    /// With no command, opens the app (as the `.desktop` entry and the macOS `.app` do).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -32,7 +35,8 @@ enum Command {
     Start,
     /// Ask the human to review your local work: this branch against its merge-base with the
     /// default branch, plus uncommitted changes and untracked files. Blocks until the human
-    /// answers. Exits 0 when they approve, 3 when they abandon the Session (stop working on
+    /// answers. Exits 0 when they approve, 4 when they hand over a Round (printed as markdown:
+    /// address it, then run `review` again), 3 when they abandon the Session (stop working on
     /// it), 1 on error.
     Review(ReviewArgs),
     /// Run the app (launched by the first CLI call). Arguments after the options go to Rune,
@@ -78,9 +82,10 @@ impl ReviewArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Start => start(),
-        Command::Review(args) => review(args.local()),
-        Command::App { headless, rune_args } => app(headless, rune_args),
+        Some(Command::Start) => start(),
+        Some(Command::Review(args)) => review(args.local()),
+        Some(Command::App { headless, rune_args }) => app(headless, rune_args),
+        None => app(false, Vec::new()),
     };
     result.unwrap_or_else(|error| {
         eprintln!("akshually: {error:#}");
@@ -99,6 +104,10 @@ fn review(local: LocalOptions) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("can't read the current directory")?;
     let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local)?;
     let code = match outcome {
+        Outcome::Round(round) => {
+            print!("{}", render::round_markdown(&round));
+            exit::ROUND
+        }
         Outcome::Approved => {
             println!("Approved.");
             exit::APPROVED

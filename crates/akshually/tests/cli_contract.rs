@@ -5,12 +5,14 @@ mod support;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
+use akshually_core::{Anchor, Side};
 use akshually_testkit::{TestDirs, TestRepo};
 use support::{HostedApp, LaunchedApp, finish, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_ABANDONED: i32 = 3;
+const EXIT_ROUND: i32 = 4;
 
 fn repo_with_work() -> TestRepo {
     let repo = TestRepo::new();
@@ -50,6 +52,71 @@ fn review_exits_with_the_abandoned_code_when_the_human_abandons() {
         String::from_utf8_lossy(&out.stdout),
         "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n"
     );
+}
+
+#[test]
+fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let mut child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?\n\n- one is enough").unwrap();
+    app.service.comment(&session.id, Anchor::lines(Side::Old, "lib.rs", 1..=1), "Keep `a`.").unwrap();
+
+    assert!(still_running(&mut child), "a Draft reached the agent before the handover");
+    app.service.hand_over_round(&session.id).unwrap();
+
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "# Round 1\n\
+         \n\
+         The human handed over 2 Threads. Address each one, then run `akshually review` again.\n\
+         \n\
+         ## T1 · lib.rs, new lines 2-3\n\
+         \n\
+         ```\n\
+         fn b() {}\n\
+         fn c() {}\n\
+         ```\n\
+         \n\
+         Why two?\n\
+         \n\
+         - one is enough\n\
+         \n\
+         ## T2 · lib.rs, old line 1\n\
+         \n\
+         ```\n\
+         fn a() {}\n\
+         ```\n\
+         \n\
+         Keep `a`.\n"
+    );
+}
+
+#[test]
+fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+
+    repo.write("lib.rs", "fn a() {}\nfn b() {}\n");
+    let mut second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+
+    assert!(still_running(&mut second), "the second call didn't wait for the human");
+    let sessions = app.service.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, session.id);
+    assert_eq!(sessions[0].round, 2);
+    assert_eq!(sessions[0].threads.len(), 1);
+    assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
+    app.service.approve(&session.id).unwrap();
+    assert_eq!(finish(second).status.code(), Some(EXIT_APPROVED));
 }
 
 #[test]
@@ -197,4 +264,25 @@ fn the_app_reads_the_untracked_setting_from_its_config_file() {
     assert_eq!(paths, ["agent.txt", "topic.txt"]);
     app.human(HumanCommand::Abandon { session: state.sessions[0].id.clone() });
     assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+}
+
+#[test]
+fn version_prints_the_package_version() {
+    let app = HostedApp::start();
+
+    let out = app.akshually(&std::env::temp_dir(), &["--version"]).output().unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("akshually {}\n", env!("CARGO_PKG_VERSION")));
+}
+
+/// The `.desktop` entry and the macOS `.app` start the binary with no arguments. That opens the
+/// app, which leaves the CLI to the instance already running.
+#[test]
+fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
+    let app = HostedApp::start();
+
+    let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 }

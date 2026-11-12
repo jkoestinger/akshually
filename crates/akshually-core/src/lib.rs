@@ -9,11 +9,13 @@ pub mod ipc;
 mod paths;
 mod service;
 mod settings;
+mod thread;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions};
 pub use paths::Paths;
 pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
 pub use settings::{Settings, SettingsError};
+pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,4 +27,10 @@ pub enum Error {
     InvalidRequest(String),
     #[error("no Session {0}")]
     UnknownSession(SessionId),
+    #[error("can't anchor a Thread there: {0}")]
+    InvalidAnchor(String),
+    #[error("a Comment needs some text")]
+    EmptyComment,
+    #[error("there are no Drafts to hand over")]
+    NoDrafts,
 }

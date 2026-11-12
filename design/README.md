@@ -12,7 +12,7 @@
 
 ## Design tokens
 
-The Rune theme JSON in the repo is the source of truth for colours, radii and type. The `akshually` variable collection here (Dark and Light modes) mirrors it. Until the theme JSON exists (see the spec, #7), these variables are the provisional values to start it from.
+`crates/akshually-ui/assets/theme.json`, a Rune theme JSON, is the source of truth for colours and radii, with a `dark` and a `light` section; the app follows the OS light/dark setting. The `akshually` variable collection here (Dark and Light modes) mirrors it: change the JSON first, then update the variables to match. Token names are the variable names with `/` written as `-` (`diff/add-bg` is `diff-add-bg`, `radius/sm` is `radius-sm`). `crates/akshually-ui/src/theme.rs` maps the tokens onto the kit.
 
 ## Constraints from Rune
 

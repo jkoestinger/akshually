@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=akshually
+GenericName=Code Review
+Comment=Human-in-the-loop code review for agents
+Exec=akshually
+Terminal=false
+Categories=Development;
+Keywords=review;diff;git;agent;
+StartupNotify=false

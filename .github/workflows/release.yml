@@ -1,0 +1,80 @@
+# Builds akshually natively on Linux and macOS and attaches the assets to a GitHub release.
+# A tag with a hyphen (v0.1.0-rc.1) makes a pre-release. Run it by hand (workflow_dispatch)
+# to build and smoke-test the assets without releasing them.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, platform: linux }
+          - { os: macos-15, target: aarch64-apple-darwin, platform: macos }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, platform: macos }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p akshually
+
+      - name: Smoke test
+        run: ./target/release/akshually --version
+
+      - name: Package
+        id: package
+        env:
+          STEM: akshually-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-${{ matrix.target }}
+        run: echo "asset=$(packaging/package.sh ${{ matrix.platform }} target/release/akshually "$STEM" dist)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          if [[ $TAG == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes "${prerelease[@]}"
