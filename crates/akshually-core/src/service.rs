@@ -835,6 +835,10 @@ impl Service {
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
         let excerpt = anchor.excerpt(session.view.anchored_in()).map_err(Error::InvalidAnchor)?;
+        if !session.view.changeset.takes_comment_at(&anchor) {
+            let Anchor::Lines { path, side, start, end } = anchor else { unreachable!("only line ranges are refused") };
+            return Err(Error::OutsideDiff { path, side, start, end });
+        }
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None, suggestion };
@@ -846,6 +850,7 @@ impl Service {
             resolved: None,
             outdated: false,
             reopened: false,
+            forge: None,
         });
         inner.notify();
         Ok(thread)

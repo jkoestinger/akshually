@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{ChangesetView, Outcome, Service, Session, SessionId, SessionView, Turn, Verdict};
-use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment};
-use crate::thread::{Anchor, Comment, Party, Thread, ThreadId};
+use crate::forge::{
+    ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
+};
+use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId};
 use crate::{Changeset, Error};
 
 impl Service {
@@ -90,7 +92,7 @@ impl Service {
     /// `verdict` to the Forge as one review, and returns its web page. The Session then has
     /// its Verdict, and the human closes it. Blocks on the Forge.
     pub fn publish(&self, id: &SessionId, verdict: Verdict, summary: &str) -> Result<String, Error> {
-        let (pr, Drafts { kept, .. }) = {
+        let (pr, drafts) = {
             let mut inner = self.lock();
             let at = inner.position(id)?;
             let drafts = drafts(&inner.sessions[at].view)?;
@@ -101,7 +103,7 @@ impl Service {
             drafts
         };
         // Not holding the lock: the Forge may take a while.
-        let sent = self.send_review(&pr, verdict, summary, &kept);
+        let sent = self.send_review(&pr, verdict, summary, &drafts);
 
         let mut inner = self.lock();
         // Closing waits for Publish to finish, so the Session is still here.
@@ -110,10 +112,18 @@ impl Service {
         let url = sent?;
         let view = &mut inner.sessions[at].view;
         // Only what was sent: the human may have drafted more meanwhile.
-        for sent in &kept {
+        for sent in &drafts.kept {
             let Some(thread) = view.threads.iter_mut().find(|t| t.id == sent.id) else { continue };
             for comment in thread.comments.iter_mut().filter(|c| c.is_draft()).take(sent.comments.len()) {
                 comment.round = Some(view.round);
+            }
+        }
+        // The Forge now has them as they were sent, whatever the human did meanwhile.
+        let changed = drafts.resolve.iter().map(|t| (t, true)).chain(drafts.reopen.iter().map(|t| (t, false)));
+        for (sent, resolved) in changed {
+            let thread = view.threads.iter_mut().find(|t| t.id == sent.id);
+            if let Some(forge) = thread.and_then(|t| t.forge.as_mut()) {
+                forge.resolved = resolved;
             }
         }
         view.ended = Some(Outcome::Published { verdict, url: url.clone() });
@@ -123,14 +133,18 @@ impl Service {
         Ok(url)
     }
 
-    /// Sends the review of `kept` Drafts to `pr`'s Forge, if it takes `verdict`.
-    fn send_review(&self, pr: &PullRequest, verdict: Verdict, summary: &str, kept: &[Thread]) -> Result<String, Error> {
+    /// Sends the review of `drafts` to `pr`'s Forge, if it takes `verdict`.
+    fn send_review(&self, pr: &PullRequest, verdict: Verdict, summary: &str, drafts: &Drafts) -> Result<String, Error> {
         let forge = self.forge_for(pr).ok_or_else(|| Error::NotAPullRequest(pr.url.clone()))?;
         if !forge.verdicts(pr)?.contains(&verdict) {
             return Err(Error::VerdictNotOffered(verdict));
         }
-        let review = review(verdict, summary, kept);
-        if verdict != Verdict::Approve && review.body.is_empty() && review.comments.is_empty() {
+        let review = review(verdict, summary, drafts);
+        if verdict != Verdict::Approve
+            && review.body.is_empty()
+            && review.comments.is_empty()
+            && review.replies.is_empty()
+        {
             return Err(Error::EmptyReview);
         }
         Ok(forge.publish(pr, &review)?)
@@ -195,16 +209,19 @@ impl Service {
         }
     }
 
-    /// Fetches the Pull Request at its current head and takes its Changeset (see `reload`).
+    /// Fetches the Pull Request at its current head and takes its Changeset and the Threads
+    /// on it now (see `reload`).
     pub(super) fn reload_pull_request(&self, id: &SessionId, pr: &PullRequest) -> Result<(), Error> {
         let forge = self.forge_for(pr).ok_or_else(|| Error::NotAPullRequest(pr.url.clone()))?;
         // Not holding the lock: the Forge may take a while.
         let now = forge.pull_request(&pr.id)?;
         let changeset = forge.changeset(&now)?;
+        let remote = forge.threads(&now)?;
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
         session.refresh(changeset, None, false);
+        merge_threads(session, remote);
         session.view.pull_request = Some(now);
         session.view.pull_request_update = None;
         inner.notify();
@@ -214,13 +231,13 @@ impl Service {
     /// Human: what Publish would do now, for the Publish dialog. Blocks on the Forge, which
     /// says which Verdicts it accepts.
     pub fn publish_plan(&self, id: &SessionId) -> Result<PublishPlan, Error> {
-        let (pr, Drafts { kept, discarded }) = {
+        let (pr, Drafts { kept, discarded, resolve, reopen }) = {
             let inner = self.lock();
             drafts(&inner.sessions[inner.position(id)?].view)?
         };
         let forge = self.forge_for(&pr).ok_or_else(|| Error::NotAPullRequest(pr.url.clone()))?;
         let verdicts = forge.verdicts(&pr)?;
-        Ok(PublishPlan { verdicts, kept, discarded })
+        Ok(PublishPlan { verdicts, kept, discarded, resolve, reopen })
     }
 
     /// The adapter serving `pr`.
@@ -245,43 +262,74 @@ fn drafts(view: &SessionView) -> Result<(PullRequest, Drafts), Error> {
 pub struct PublishPlan {
     /// The Verdicts the Forge accepts here, in the order to offer them.
     pub verdicts: Vec<Verdict>,
-    /// The Drafts Publish sends, each Thread with only its Drafts.
+    /// The Drafts Publish sends, each Thread with only its Drafts: new Threads, and replies in
+    /// Threads already on the Forge.
     pub kept: Vec<Thread>,
     /// The Drafts Publish leaves out, each Thread with only its Drafts.
     pub discarded: Vec<Thread>,
+    /// Threads already on the Forge that Publish marks Resolved there.
+    pub resolve: Vec<Thread>,
+    /// Threads Resolved on the Forge that Publish reopens there.
+    pub reopen: Vec<Thread>,
 }
 
-/// A Pull Request Session's Drafts, as Publish sorts them: each Thread with only its Drafts.
+/// A Pull Request Session's Drafts, as Publish sorts them (each Thread with only its Drafts),
+/// and the Threads whose Resolved state it changes on the Forge.
 struct Drafts {
-    /// The human's Drafts in new Threads still in the Changeset, which Publish sends.
+    /// The human's Drafts that Publish sends: new Threads still in the Changeset, and replies
+    /// in Threads already on the Forge.
     kept: Vec<Thread>,
-    /// The rest: replies in Threads already on the Forge, and Threads gone Outdated.
+    /// The rest: new Threads gone Outdated or out of the Forge's diff, and Drafts the human
+    /// didn't write.
     discarded: Vec<Thread>,
+    /// Threads the human resolved here that are open on the Forge.
+    resolve: Vec<Thread>,
+    /// Threads the human reopened here that are Resolved on the Forge.
+    reopen: Vec<Thread>,
 }
 
 impl Drafts {
     fn of(view: &SessionView) -> Self {
-        let (mut kept, mut discarded) = (Vec::new(), Vec::new());
+        let (mut kept, mut discarded, mut resolve, mut reopen) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for thread in &view.threads {
+            match &thread.forge {
+                Some(forge) if !forge.resolved && thread.resolved.is_some() => resolve.push(thread.clone()),
+                Some(forge) if forge.resolved && thread.resolved.is_none() => reopen.push(thread.clone()),
+                _ => {}
+            }
             let drafts: Vec<Comment> = thread.comments.iter().filter(|c| c.is_draft()).cloned().collect();
             if drafts.is_empty() {
                 continue;
             }
-            let new = drafts.len() == thread.comments.len();
-            let sendable = new && !thread.outdated && drafts.iter().all(|c| c.author == Party::Human);
+            let sendable = drafts.iter().all(|c| c.author == Party::Human)
+                && match thread.forge {
+                    // A reply: the Thread is there whatever became of its code.
+                    Some(_) => true,
+                    // The Forge refuses lines out of its diff, which a reload can leave a Draft on.
+                    None => {
+                        drafts.len() == thread.comments.len()
+                            && !thread.outdated
+                            && view.changeset.takes_comment_at(&thread.anchor)
+                    }
+                };
             let list = if sendable { &mut kept } else { &mut discarded };
             list.push(Thread { comments: drafts, ..thread.clone() });
         }
-        Drafts { kept, discarded }
+        Drafts { kept, discarded, resolve, reopen }
     }
 }
 
-/// The review Publish sends: Drafts on the Review as a whole join the summary in its body.
-fn review(verdict: Verdict, summary: &str, kept: &[Thread]) -> Review {
+/// The review Publish sends: Drafts on the Review as a whole join the summary in its body, and
+/// each existing Thread's Drafts make one reply.
+fn review(verdict: Verdict, summary: &str, drafts: &Drafts) -> Review {
     let mut body = vec![summary.trim().to_owned()];
-    let mut comments = Vec::new();
-    for thread in kept {
+    let (mut comments, mut replies) = (Vec::new(), Vec::new());
+    for thread in &drafts.kept {
         let text = thread.comments.iter().map(|c| c.body.trim()).collect::<Vec<_>>().join("\n\n");
+        if let Some(forge) = &thread.forge {
+            replies.push(ReviewReply { thread: forge.id.clone(), body: text });
+            continue;
+        }
         let suggestion = thread.comments.iter().find_map(|c| c.suggestion.clone());
         let anchor = match &thread.anchor {
             Anchor::Lines { path, side, start, end } => {
@@ -296,7 +344,54 @@ fn review(verdict: Verdict, summary: &str, kept: &[Thread]) -> Review {
         comments.push(ReviewComment { anchor, body: text, suggestion });
     }
     body.retain(|b| !b.is_empty());
-    Review { verdict, body: body.join("\n\n"), comments }
+    Review {
+        verdict,
+        body: body.join("\n\n"),
+        comments,
+        replies,
+        resolve: forge_ids(&drafts.resolve),
+        reopen: forge_ids(&drafts.reopen),
+    }
+}
+
+fn forge_ids(threads: &[Thread]) -> Vec<String> {
+    threads.iter().filter_map(|t| Some(t.forge.as_ref()?.id.clone())).collect()
+}
+
+/// Takes the Threads on the Forge now into `session`, matched by Forge id: others' Comments and
+/// resolutions replace what was fetched before, while the human's Drafts stay, and so does a
+/// resolve or reopen of theirs not yet Published. New Threads join with the next numbers. A
+/// Thread gone from the Forge goes too, unless it holds Drafts, which stay without a Thread to
+/// reply to.
+fn merge_threads(session: &mut Session, remote: Vec<RemoteThread>) {
+    let mut threads = std::mem::take(&mut session.view.threads);
+    threads.retain_mut(|thread| {
+        let Some(forge) = &thread.forge else { return true };
+        if remote.iter().any(|r| r.id == forge.id) {
+            return true;
+        }
+        thread.forge = None;
+        thread.comments.iter().any(Comment::is_draft)
+    });
+    for remote in remote {
+        let now = existing_thread(remote, &session.view.changeset);
+        let forge_id = now.forge.as_ref().map(|f| f.id.clone());
+        match threads.iter_mut().find(|t| t.forge.as_ref().map(|f| &f.id) == forge_id.as_ref()) {
+            Some(thread) => {
+                let was_resolved = thread.forge.as_ref().is_some_and(|f| f.resolved);
+                let resolved =
+                    if thread.resolved.is_some() != was_resolved { thread.resolved.take() } else { now.resolved };
+                let mut comments = now.comments;
+                comments.extend(thread.comments.drain(..).filter(Comment::is_draft));
+                *thread = Thread { id: thread.id.clone(), comments, resolved, reopened: thread.reopened, ..now };
+            }
+            None => {
+                session.threads_opened += 1;
+                threads.push(Thread { id: ThreadId::new(format!("T{}", session.threads_opened)), ..now });
+            }
+        }
+    }
+    session.view.threads = threads;
 }
 
 /// A Thread already on the Forge, as a Session Thread (numbered by the caller). The excerpt is
@@ -316,6 +411,7 @@ fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
         // A suggestion stays in the body as the Forge's markdown.
         .map(|c| Comment { author: Party::Other(c.author), body: c.body, round: None, suggestion: None })
         .collect();
+    let forge = Some(ForgeThread { id: remote.id, resolved: remote.resolved_by.is_some() });
     let resolved = remote.resolved_by.map(Party::Other);
-    Thread { id: ThreadId::new(""), anchor, excerpt, comments, resolved, outdated, reopened: false }
+    Thread { id: ThreadId::new(""), anchor, excerpt, comments, resolved, outdated, reopened: false, forge }
 }

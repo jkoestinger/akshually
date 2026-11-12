@@ -516,7 +516,14 @@ fn publishing_to_gitlab_is_refused_without_sending_anything() {
     let sent: Vec<Mock> =
         ["GET", "POST", "PUT"].map(|method| h.server.mock(method, Matcher::Any).expect(0).create()).into();
     let gitlab = h.gitlab();
-    let review = Review { verdict: Verdict::Feedback, body: "Looks good.".into(), comments: Vec::new() };
+    let review = Review {
+        verdict: Verdict::Feedback,
+        body: "Looks good.".into(),
+        comments: Vec::new(),
+        replies: Vec::new(),
+        resolve: Vec::new(),
+        reopen: Vec::new(),
+    };
 
     let verdicts = gitlab.verdicts(&rotate_creds()).unwrap_err();
     let published = gitlab.publish(&rotate_creds(), &review).unwrap_err();

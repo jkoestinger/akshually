@@ -17,7 +17,7 @@ use super::{
     PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
 use super::{epoch_seconds, file_change};
-use crate::{Changeset, Side, Verdict};
+use crate::{Changeset, FileChange, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
@@ -302,6 +302,8 @@ impl ForgeAdapter for GitHub {
             filename: String,
             status: String,
             previous_filename: Option<String>,
+            /// GitHub's diff of the file; none for a binary file or a huge diff.
+            patch: Option<String>,
         }
         let id = &pr.id;
         // `base.sha` is the base branch's tip; GitHub's diff is against the merge-base.
@@ -325,21 +327,32 @@ impl ForgeAdapter for GitHub {
             listed.extend(page);
         }
 
-        // Like the local Source, renames are a deletion plus an addition.
+        // Like the local Source, renames are a deletion plus an addition. Line comments must
+        // fit GitHub's own diff, so each file keeps its hunks.
         let mut files = Vec::new();
         for file in listed {
             let old = |path: &str| self.file(id, path, &base).map(Some);
             let new = |path: &str| self.file(id, path, &pr.head_sha).map(Some);
+            let hunks = file.patch.as_deref().map(Hunk::parse_patch);
+            let with = |change: FileChange, hunks| FileChange { hunks, ..change };
             match file.status.as_str() {
-                "added" | "copied" => files.push(file_change(file.filename.clone(), None, new(&file.filename)?)),
-                "removed" => files.push(file_change(file.filename.clone(), old(&file.filename)?, None)),
+                "added" | "copied" => {
+                    files.push(with(file_change(file.filename.clone(), None, new(&file.filename)?), hunks))
+                }
+                "removed" => files.push(with(file_change(file.filename.clone(), old(&file.filename)?, None), hunks)),
                 "renamed" => {
+                    // GitHub shows the renamed file only: none of the old path's lines, and of
+                    // the new path's only those its patch changes.
                     let previous = file.previous_filename.unwrap_or_else(|| file.filename.clone());
-                    files.push(file_change(previous.clone(), old(&previous)?, None));
-                    files.push(file_change(file.filename.clone(), None, new(&file.filename)?));
+                    files.push(with(file_change(previous.clone(), old(&previous)?, None), Some(Vec::new())));
+                    let renamed = file_change(file.filename.clone(), None, new(&file.filename)?);
+                    files.push(with(renamed, Some(hunks.unwrap_or_default())));
                 }
                 "unchanged" => {}
-                _ => files.push(file_change(file.filename.clone(), old(&file.filename)?, new(&file.filename)?)),
+                _ => {
+                    let change = file_change(file.filename.clone(), old(&file.filename)?, new(&file.filename)?);
+                    files.push(with(change, hunks))
+                }
             }
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -425,8 +438,9 @@ impl ForgeAdapter for GitHub {
         Ok(if viewer.login.eq_ignore_ascii_case(&pr.author) { vec![Verdict::Feedback] } else { Verdict::ALL.to_vec() })
     }
 
-    /// A pending review, then each Thread in it, then the Verdict submits it. A failure on the
-    /// way deletes the pending review, so nothing is half-published.
+    /// A pending review with each new Thread and reply in it, then the Resolved changes, then
+    /// the Verdict submits it. A failure on the way undoes the Resolved changes made and
+    /// deletes the pending review, so nothing is half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
         let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
         let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
@@ -436,9 +450,13 @@ impl ForgeAdapter for GitHub {
         let input = json!({ "pullRequestId": pr_id, "commitOID": pr.head_sha });
         let data: Value = self.graphql(START_REVIEW, json!({ "input": input }))?;
         let review_id = self.string_at(&data, "/addPullRequestReview/pullRequestReview/id")?;
-        let submitted = self.fill_and_submit(&review_id, review);
+        let mut changed = Vec::new();
+        let submitted = self.fill_and_submit(&review_id, review, &mut changed);
         if submitted.is_err() {
             // Best effort: the error that stopped Publish is the one to report.
+            for (thread, resolved) in changed {
+                let _ = self.set_resolved(&thread, !resolved);
+            }
             let input = json!({ "pullRequestReviewId": review_id });
             let _ = self.graphql::<Value>(DELETE_REVIEW, json!({ "input": input }));
         }
@@ -499,9 +517,15 @@ impl GitHub {
 }
 
 impl GitHub {
-    /// Adds `review`'s Threads to the pending review `review_id`, then submits it with the
+    /// Adds `review`'s Threads and replies to the pending review `review_id`, then submits it with the
     /// Verdict and body, returning the review's web page.
-    fn fill_and_submit(&self, review_id: &str, review: &Review) -> Result<String, ForgeError> {
+    /// Records in `changed` each Thread whose Resolved state it changed, and to what.
+    fn fill_and_submit(
+        &self,
+        review_id: &str,
+        review: &Review,
+        changed: &mut Vec<(String, bool)>,
+    ) -> Result<String, ForgeError> {
         for comment in &review.comments {
             let mut input = match &comment.anchor {
                 RemoteAnchor::Lines { path, side, start, end } => {
@@ -526,6 +550,21 @@ impl GitHub {
             let data: Value = self.graphql(ADD_THREAD, json!({ "input": input }))?;
             self.string_at(&data, "/addPullRequestReviewThread/thread/id")?;
         }
+        for reply in &review.replies {
+            let input = json!({
+                "pullRequestReviewId": review_id,
+                "pullRequestReviewThreadId": reply.thread,
+                "body": reply.body,
+            });
+            let data: Value = self.graphql(ADD_REPLY, json!({ "input": input }))?;
+            self.string_at(&data, "/addPullRequestReviewThreadReply/comment/id")?;
+        }
+        // Before the submit, so a refusal still leaves nothing published.
+        let resolutions = review.resolve.iter().map(|t| (t, true)).chain(review.reopen.iter().map(|t| (t, false)));
+        for (thread, resolved) in resolutions {
+            self.set_resolved(thread, resolved)?;
+            changed.push((thread.clone(), resolved));
+        }
         let event = match review.verdict {
             Verdict::Approve => "APPROVE",
             Verdict::RequestChanges => "REQUEST_CHANGES",
@@ -535,6 +574,17 @@ impl GitHub {
         let input = json!({ "pullRequestReviewId": review_id, "event": event, "body": review.body });
         let data: Value = self.graphql(SUBMIT_REVIEW, json!({ "input": input }))?;
         self.string_at(&data, "/submitPullRequestReview/pullRequestReview/url")
+    }
+
+    /// Marks the Thread `thread` Resolved, or reopens it.
+    fn set_resolved(&self, thread: &str, resolved: bool) -> Result<(), ForgeError> {
+        let (mutation, field) = if resolved {
+            (RESOLVE_THREAD, "resolveReviewThread")
+        } else {
+            (UNRESOLVE_THREAD, "unresolveReviewThread")
+        };
+        let data: Value = self.graphql(mutation, json!({ "input": { "threadId": thread } }))?;
+        self.string_at(&data, &format!("/{field}/thread/id")).map(drop)
     }
 
     /// The string at `pointer` in a GraphQL answer.
@@ -566,6 +616,18 @@ const START_REVIEW: &str = "mutation($input: AddPullRequestReviewInput!) {
 
 const ADD_THREAD: &str = "mutation($input: AddPullRequestReviewThreadInput!) {
   addPullRequestReviewThread(input: $input) { thread { id } }
+}";
+
+const ADD_REPLY: &str = "mutation($input: AddPullRequestReviewThreadReplyInput!) {
+  addPullRequestReviewThreadReply(input: $input) { comment { id } }
+}";
+
+const RESOLVE_THREAD: &str = "mutation($input: ResolveReviewThreadInput!) {
+  resolveReviewThread(input: $input) { thread { id } }
+}";
+
+const UNRESOLVE_THREAD: &str = "mutation($input: UnresolveReviewThreadInput!) {
+  unresolveReviewThread(input: $input) { thread { id } }
 }";
 
 const SUBMIT_REVIEW: &str = "mutation($input: SubmitPullRequestReviewInput!) {

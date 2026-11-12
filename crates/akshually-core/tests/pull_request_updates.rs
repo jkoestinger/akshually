@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteThread, Review,
+    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment,
+    RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, FileChange, Service, Side, Verdict};
+use akshually_core::{Anchor, Changeset, Comment, FileChange, ForgeThread, Hunk, Party, Service, Side, Verdict};
 use akshually_testkit::{TestDirs, wait_until};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -24,6 +25,10 @@ struct Remote {
     commits: Option<u32>,
     /// Calls to `update` that fail, as when the Forge is down.
     down: bool,
+    /// The Threads on the Pull Request.
+    threads: Vec<RemoteThread>,
+    /// The hunks of the Forge's diff of `login.rs`, if it says.
+    hunks: Option<Vec<Hunk>>,
 }
 
 #[derive(Clone)]
@@ -36,6 +41,8 @@ impl FakeForge {
             login_rs: "fn login() {\n    sso();\n}\n".into(),
             commits: Some(2),
             down: false,
+            threads: Vec::new(),
+            hunks: None,
         })))
     }
 
@@ -74,12 +81,15 @@ impl ForgeAdapter for FakeForge {
         assert_eq!(pr.head_sha, remote.head_sha, "the Changeset at the head asked for");
         Ok(Changeset {
             base: "basesha".into(),
-            files: vec![FileChange::text("login.rs", Some("fn login() {}\n"), Some(&remote.login_rs))],
+            files: vec![FileChange {
+                hunks: remote.hunks.clone(),
+                ..FileChange::text("login.rs", Some("fn login() {}\n"), Some(&remote.login_rs))
+            }],
         })
     }
 
     fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
-        Ok(Vec::new())
+        Ok(self.0.lock().unwrap().threads.clone())
     }
 
     fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
@@ -94,7 +104,7 @@ impl ForgeAdapter for FakeForge {
         Ok((now.head_sha != pr.head_sha).then_some(PullRequestUpdate { pull_request: now, commits }))
     }
     fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
-        unreachable!("not published here")
+        Ok(Verdict::ALL.to_vec())
     }
 
     fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
@@ -191,4 +201,111 @@ fn pull_requests_are_watched_for_pushes() {
     wait_until(Duration::from_secs(10), "the push to be offered", || {
         svc.session(&id).unwrap().pull_request_update.filter(|u| u.pull_request.head_sha == "head2")
     });
+}
+
+fn remote(id: &str, anchor: RemoteAnchor, comments: &[(&str, &str)]) -> RemoteThread {
+    RemoteThread {
+        id: id.into(),
+        anchor,
+        outdated: false,
+        resolved_by: None,
+        diff_hunk: String::new(),
+        comments: comments.iter().map(|(a, b)| RemoteComment { author: (*a).into(), body: (*b).into() }).collect(),
+    }
+}
+
+fn on_file(id: &str, comments: &[(&str, &str)]) -> RemoteThread {
+    remote(id, RemoteAnchor::File { path: "login.rs".into() }, comments)
+}
+
+fn said(author: &str, body: &str) -> Comment {
+    Comment { author: Party::Other(author.into()), body: body.into(), round: None, suggestion: None }
+}
+
+fn draft(body: &str) -> Comment {
+    Comment { author: Party::Human, body: body.into(), round: None, suggestion: None }
+}
+
+#[test]
+fn reloading_takes_others_comments_and_resolutions_and_keeps_the_human_s_drafts() {
+    let forge = FakeForge::new();
+    forge.0.lock().unwrap().threads = vec![
+        on_file("RT_1", &[("lee", "Why SSO?")]),
+        on_file("RT_2", &[("lee", "Split this file?")]),
+        on_file("RT_3", &[("kim", "Naming.")]),
+    ];
+    let svc = Service::new().with_forges(vec![Box::new(forge.clone())]);
+    let id = svc.open_pull_request(URL).unwrap();
+    let ids: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.id.clone()).collect();
+    svc.reply_in_thread(&id, &ids[0], "Policy.").unwrap();
+    svc.resolve_thread(&id, &ids[1]).unwrap();
+    let new = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 2..=2), "Which provider?").unwrap();
+    {
+        let mut remote = forge.0.lock().unwrap();
+        remote.threads[0].comments.push(RemoteComment { author: "maria".into(), body: "See #12.".into() });
+        remote.threads[0].resolved_by = Some("maria".into());
+        remote.threads[2].resolved_by = Some("kim".into());
+        remote.threads.push(on_file("RT_4", &[("kim", "Tests?")]));
+    }
+
+    svc.reload(&id).unwrap();
+
+    let session = svc.session(&id).unwrap();
+    let thread = |t: &akshually_core::ThreadId| session.threads.iter().find(|th| &th.id == t).unwrap().clone();
+    let replied = thread(&ids[0]);
+    assert_eq!(replied.comments, vec![said("lee", "Why SSO?"), said("maria", "See #12."), draft("Policy.")]);
+    assert_eq!(replied.resolved, Some(Party::Other("maria".into())), "resolved by someone else meanwhile");
+    assert_eq!(replied.forge, Some(ForgeThread { id: "RT_1".into(), resolved: true }));
+    let resolved_here = thread(&ids[1]);
+    assert_eq!(resolved_here.resolved, Some(Party::Human), "the human's resolve still waits for Publish");
+    assert_eq!(resolved_here.forge, Some(ForgeThread { id: "RT_2".into(), resolved: false }));
+    assert_eq!(thread(&ids[2]).resolved, Some(Party::Other("kim".into())));
+    assert_eq!(thread(&new).comments, vec![draft("Which provider?")], "the new Draft stays");
+    let added = session.threads.iter().find(|t| t.forge.as_ref().is_some_and(|f| f.id == "RT_4")).expect("RT_4");
+    assert_eq!(added.comments, vec![said("kim", "Tests?")]);
+    let mut all: Vec<_> = session.threads.iter().map(|t| t.id.clone()).collect();
+    all.sort_by_key(|t| t.to_string());
+    all.dedup();
+    assert_eq!(all.len(), 5, "every Thread keeps its own id");
+}
+
+#[test]
+fn a_thread_deleted_on_the_forge_goes_unless_it_holds_drafts() {
+    let forge = FakeForge::new();
+    forge.0.lock().unwrap().threads = vec![on_file("RT_1", &[("lee", "Hm.")]), on_file("RT_2", &[("lee", "Hm?")])];
+    let svc = Service::new().with_forges(vec![Box::new(forge.clone())]);
+    let id = svc.open_pull_request(URL).unwrap();
+    let ids: Vec<_> = svc.session(&id).unwrap().threads.iter().map(|t| t.id.clone()).collect();
+    svc.reply_in_thread(&id, &ids[1], "Yes.").unwrap();
+    forge.0.lock().unwrap().threads.clear();
+
+    svc.reload(&id).unwrap();
+
+    let session = svc.session(&id).unwrap();
+    assert_eq!(session.threads.len(), 1, "the one without Drafts went");
+    assert_eq!(session.threads[0].id, ids[1]);
+    assert_eq!(session.threads[0].forge, None, "nowhere to reply to any more");
+    assert_eq!(svc.publish_plan(&id).unwrap().discarded.len(), 1, "the reply can't be sent");
+}
+
+#[test]
+fn a_draft_whose_lines_leave_the_forge_s_diff_after_a_reload_is_not_sent() {
+    let forge = FakeForge::new();
+    let whole = Hunk { old_start: 1, old_lines: 1, new_start: 1, new_lines: 3 };
+    forge.0.lock().unwrap().hunks = Some(vec![whole]);
+    let svc = Service::new().with_forges(vec![Box::new(forge.clone())]);
+    let id = svc.open_pull_request(URL).unwrap();
+    let draft = svc.comment(&id, Anchor::lines(Side::New, "login.rs", 2..=2), "Which provider?").unwrap();
+    {
+        // Only the end of the file differs from the base now.
+        let mut remote = forge.0.lock().unwrap();
+        remote.hunks = Some(vec![Hunk { old_start: 1, old_lines: 1, new_start: 4, new_lines: 2 }]);
+    }
+    forge.push("head2", "fn login() {\n    sso();\n}\n// audit\nfn audit() {}\n");
+
+    svc.reload(&id).unwrap();
+
+    let plan = svc.publish_plan(&id).unwrap();
+    assert!(plan.kept.is_empty(), "GitHub would refuse it");
+    assert_eq!(plan.discarded.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), vec![draft]);
 }

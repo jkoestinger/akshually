@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitHub, HostConfig, PullRequest, PullRequestRef,
-    RemoteAnchor, Review, ReviewComment,
+    RemoteAnchor, Review, ReviewComment, ReviewReply,
 };
 use akshually_core::{Side, Verdict};
 use mockito::{Matcher, Mock, Server, ServerGuard};
@@ -124,6 +124,18 @@ impl Harness {
     }
 }
 
+/// A review touching no existing Thread, to fill in.
+fn no_threads() -> Review {
+    Review {
+        verdict: Verdict::Feedback,
+        body: String::new(),
+        comments: Vec::new(),
+        replies: Vec::new(),
+        resolve: Vec::new(),
+        reopen: Vec::new(),
+    }
+}
+
 fn comment(anchor: RemoteAnchor, body: &str) -> ReviewComment {
     ReviewComment { anchor, body: body.into(), suggestion: None }
 }
@@ -157,6 +169,7 @@ fn publishes_one_review_with_its_threads_summary_and_verdict() {
             comment(lines(Side::New, 2, 3), "Extract this."),
             comment(RemoteAnchor::File { path: "README.md".into() }, "Link the docs."),
         ],
+        ..no_threads()
     };
 
     let url = h.github().publish(&pull_request("maria"), &review).unwrap();
@@ -171,7 +184,8 @@ fn feedback_is_published_as_github_s_comment() {
     h.pull_request_id();
     h.start_review();
     let submit = h.submit("COMMENT", "Some thoughts.");
-    let review = Review { verdict: Verdict::Feedback, body: "Some thoughts.".into(), comments: Vec::new() };
+    let review =
+        Review { verdict: Verdict::Feedback, body: "Some thoughts.".into(), comments: Vec::new(), ..no_threads() };
 
     h.github().publish(&pull_request("maria"), &review).unwrap();
 
@@ -208,6 +222,7 @@ fn a_suggestion_is_published_as_a_native_suggestion_block() {
             suggest(4, 5, "Document it.", "/// ```\n/// login();"),
             suggest(7, 7, "Drop this.", ""),
         ],
+        ..no_threads()
     };
 
     h.github().publish(&pull_request("maria"), &review).unwrap();
@@ -241,10 +256,114 @@ fn a_thread_github_refuses_deletes_the_pending_review_and_submits_nothing() {
         verdict: Verdict::Approve,
         body: String::new(),
         comments: vec![comment(lines(Side::New, 40, 40), "Out of the diff.")],
+        ..no_threads()
     };
 
     let error = h.github().publish(&pull_request("maria"), &review).unwrap_err();
 
     [refused, submit, deleted].iter().for_each(Mock::assert);
     assert!(matches!(&error, ForgeError::Api { message, .. } if message == "Line could not be resolved"), "{error:?}");
+}
+
+// --- Existing Threads: replies in the review, resolving and reopening ---
+
+impl Harness {
+    /// Adds a reply in the existing Thread `thread` to the pending review.
+    fn reply(&mut self, thread: &str, body: &str) -> Mock {
+        let input = json!({ "pullRequestReviewId": "PRRV_1", "pullRequestReviewThreadId": thread, "body": body });
+        let data = json!({ "addPullRequestReviewThreadReply": { "comment": { "id": "PRRC_5" } } });
+        self.graphql("addPullRequestReviewThreadReply", json!({ "input": input }), data)
+    }
+}
+
+#[test]
+fn replies_go_into_the_pending_review() {
+    let mut h = Harness::new();
+    let sent = [
+        h.pull_request_id(),
+        h.start_review(),
+        h.reply("PRRT_1", "Agreed."),
+        h.reply("PRRT_2", "Fixed in head1."),
+        h.submit("COMMENT", ""),
+    ];
+    let replies = vec![
+        ReviewReply { thread: "PRRT_1".into(), body: "Agreed.".into() },
+        ReviewReply { thread: "PRRT_2".into(), body: "Fixed in head1.".into() },
+    ];
+    let review = Review { replies, ..no_threads() };
+
+    h.github().publish(&pull_request("maria"), &review).unwrap();
+
+    sent.iter().for_each(Mock::assert);
+}
+
+impl Harness {
+    /// Marks the Thread `thread` Resolved (`resolveReviewThread`) or reopens it
+    /// (`unresolveReviewThread`).
+    fn resolution(&mut self, mutation: &str, thread: &str) -> Mock {
+        let data = json!({ mutation: { "thread": { "id": thread } } });
+        // `\b`: "resolveReviewThread" is also the end of "unresolveReviewThread".
+        self.graphql(&format!(r"\b{mutation}"), json!({ "input": { "threadId": thread } }), data)
+    }
+
+    /// `mutation` on the Thread `thread`, failing with GitHub's error `message`.
+    fn refused(&mut self, mutation: &str, thread: &str, message: &str) -> Mock {
+        self.server
+            .mock("POST", "/graphql")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::Regex(format!(r"\b{mutation}\(")),
+                Matcher::PartialJson(json!({ "variables": { "input": { "threadId": thread } } })),
+            ]))
+            .with_body(json!({ "data": { mutation: null }, "errors": [{ "message": message }] }).to_string())
+            .create()
+    }
+}
+
+#[test]
+fn threads_are_resolved_and_reopened_with_the_review() {
+    let mut h = Harness::new();
+    let sent = [
+        h.pull_request_id(),
+        h.start_review(),
+        h.resolution("resolveReviewThread", "PRRT_1"),
+        h.resolution("unresolveReviewThread", "PRRT_2"),
+        h.submit("APPROVE", ""),
+    ];
+    let review = Review {
+        verdict: Verdict::Approve,
+        resolve: vec!["PRRT_1".into()],
+        reopen: vec!["PRRT_2".into()],
+        ..no_threads()
+    };
+
+    h.github().publish(&pull_request("maria"), &review).unwrap();
+
+    sent.iter().for_each(Mock::assert);
+}
+
+#[test]
+fn a_resolve_github_refuses_undoes_the_others_and_publishes_nothing() {
+    let mut h = Harness::new();
+    h.pull_request_id();
+    h.start_review();
+    let resolved = h.resolution("resolveReviewThread", "PRRT_1");
+    let refused = h.refused("resolveReviewThread", "PRRT_3", "Could not resolve to a node");
+    let undone = h.resolution("unresolveReviewThread", "PRRT_1");
+    let submit = h
+        .server
+        .mock("POST", "/graphql")
+        .match_body(Matcher::Regex(r"submitPullRequestReview\(".into()))
+        .expect(0)
+        .create();
+    let deleted = h.graphql(
+        "deletePullRequestReview",
+        json!({ "input": { "pullRequestReviewId": "PRRV_1" } }),
+        json!({ "deletePullRequestReview": { "pullRequestReview": { "id": "PRRV_1" } } }),
+    );
+    let review = Review { verdict: Verdict::Approve, resolve: vec!["PRRT_1".into(), "PRRT_3".into()], ..no_threads() };
+
+    let error = h.github().publish(&pull_request("maria"), &review).unwrap_err();
+
+    [resolved, refused, undone, submit, deleted].iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::Api { message, .. } if message == "Could not resolve to a node"), "{error:?}");
 }

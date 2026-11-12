@@ -114,6 +114,19 @@ pub struct Thread {
     /// without a new Comment.
     #[serde(default)]
     pub reopened: bool,
+    /// Set for a Thread already on the Forge: how it is known there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeThread>,
+}
+
+/// A Thread as it is on the Forge, as last fetched or Published.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeThread {
+    /// The Forge's id for the Thread, for replying and resolving.
+    pub id: String,
+    /// The Forge has it Resolved. Where the Thread's own `resolved` differs, Publish resolves
+    /// or reopens it there.
+    pub resolved: bool,
 }
 
 /// Who wrote a Comment.
