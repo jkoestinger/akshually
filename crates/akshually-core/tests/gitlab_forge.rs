@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitLab, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, adapters,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
-use akshually_core::{Anchor, BinarySizes, FileChange, Party, Service, Settings, Side, Verdict};
+use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
 use akshually_testkit::TestDirs;
 use mockito::{Matcher, Mock, Server, ServerGuard};
+use serde_json::{Value, json};
 
 const TOKEN: &str = "glpat-test";
 
@@ -225,17 +226,51 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_diffs() {
 
     pages.iter().chain(&reads).for_each(Mock::assert);
     assert_eq!(changeset.base, "mb1");
-    let change = FileChange::text;
+    // GitLab takes line comments only in its diff's hunks; a pure rename has none.
+    let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| FileChange {
+        hunks: Some(
+            hunks
+                .iter()
+                .map(|&(old_start, old_lines, new_start, new_lines)| Hunk {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                })
+                .collect(),
+        ),
+        ..FileChange::text(path, old, new)
+    };
     assert_eq!(
         changeset.files,
         vec![
-            change("docs/new.md", None, Some("# New\n")),
-            change("lib/b.rs", None, Some("fn b() {}\n")),
-            change("old.txt", Some("bye\n"), None),
-            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n")),
-            change("src/b.rs", Some("fn b() {}\n"), None),
+            change("docs/new.md", None, Some("# New\n"), &[(0, 0, 1, 1)]),
+            change("lib/b.rs", None, Some("fn b() {}\n"), &[]),
+            change("old.txt", Some("bye\n"), None, &[(1, 1, 0, 0)]),
+            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n"), &[(1, 1, 1, 1)]),
+            change("src/b.rs", Some("fn b() {}\n"), None, &[]),
         ]
     );
+}
+
+#[test]
+fn a_line_outside_gitlab_s_diff_takes_no_comment() {
+    let mut h = Harness::new();
+    h.diffs(
+        "1",
+        "",
+        r#"[{ "old_path": "src/c.rs", "new_path": "src/c.rs", "new_file": false, "renamed_file": false,
+              "deleted_file": false, "diff": "@@ -2,3 +2,3 @@ fn c() {\n a\n-b\n+B\n c\n" }]"#,
+    );
+    h.raw("src/c.rs", "mb1", b"fn c() {\na\nb\nc\nd\n");
+    h.raw("src/c.rs", "head1", b"fn c() {\na\nB\nc\nd\n");
+
+    let changeset = h.gitlab().changeset(&rotate_creds()).unwrap();
+
+    assert!(changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 2..=4)));
+    assert!(changeset.takes_comment_at(&Anchor::lines(Side::Old, "src/c.rs", 3..=3)));
+    assert!(!changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 5..=5)));
+    assert!(!changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 1..=2)));
 }
 
 #[test]
@@ -511,30 +546,6 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
 }
 
 #[test]
-fn publishing_to_gitlab_is_refused_without_sending_anything() {
-    let mut h = Harness::new();
-    let sent: Vec<Mock> =
-        ["GET", "POST", "PUT"].map(|method| h.server.mock(method, Matcher::Any).expect(0).create()).into();
-    let gitlab = h.gitlab();
-    let review = Review {
-        verdict: Verdict::Feedback,
-        body: "Looks good.".into(),
-        comments: Vec::new(),
-        replies: Vec::new(),
-        resolve: Vec::new(),
-        reopen: Vec::new(),
-    };
-
-    let verdicts = gitlab.verdicts(&rotate_creds()).unwrap_err();
-    let published = gitlab.publish(&rotate_creds(), &review).unwrap_err();
-
-    sent.iter().for_each(Mock::assert);
-    for error in [verdicts, published] {
-        assert!(matches!(&error, ForgeError::Unsupported { host, .. } if host == "gitlab.example.com"), "{error:?}");
-    }
-}
-
-#[test]
 fn a_missing_merge_request_is_not_found() {
     let mut h = Harness::new();
     h.server
@@ -561,6 +572,450 @@ fn an_api_error_carries_gitlab_s_message() {
 
     assert!(
         matches!(&error, ForgeError::Api { status: 500, message, .. } if message == "500 Internal Server Error"),
+        "{error:?}"
+    );
+}
+
+// --- Verdicts ---
+
+impl Harness {
+    /// `GET /version`, answering `version`.
+    fn version(&mut self, version: &str) -> Mock {
+        self.get("/version", TOKEN, &format!(r#"{{"version": "{version}", "revision": "abc"}}"#))
+    }
+
+    /// `GET merge_requests/97/approvals`, saying whether the human can approve and has.
+    fn approvals(&mut self, can: bool, has: bool) -> Mock {
+        let body = format!(r#"{{"approved": false, "user_can_approve": {can}, "user_has_approved": {has}}}"#);
+        self.get("/projects/platform%2Finfra/merge_requests/97/approvals", TOKEN, &body)
+    }
+}
+
+#[test]
+fn gitlab_offers_the_verdicts_its_version_and_approval_rules_allow() {
+    use Verdict::*;
+    // (GitLab's version, the human, can approve, has approved) and what's offered.
+    let cases = [
+        ("19.2.0-ee", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
+        ("19.10.1", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
+        ("20.0.0", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
+        // Requesting changes through the API came with GitLab 19.2.
+        ("19.1.3-ee", "lee", true, false, vec![Approve, Feedback]),
+        ("18.11.0", "lee", true, false, vec![Approve, Feedback]),
+        // Approval rules (or the author approving their own) decide approving.
+        ("19.2.0", "lee", false, false, vec![RequestChanges, Feedback]),
+        // Approving again keeps the approval.
+        ("19.2.0", "lee", false, true, vec![Approve, RequestChanges, Feedback]),
+        // Authors can't request changes on their own merge request.
+        ("19.2.0", "tom", false, false, vec![Feedback]),
+    ];
+    for (version, me, can, has, offered) in cases {
+        let mut h = Harness::new();
+        h.version(version);
+        h.user(me);
+        h.approvals(can, has);
+
+        let verdicts = h.gitlab().verdicts(&rotate_creds()).unwrap();
+
+        assert_eq!(verdicts, offered, "GitLab {version} as {me}, can approve {can}, has approved {has}");
+    }
+}
+
+// --- Publish: draft notes, then the Verdict ---
+
+const MR: &str = "/projects/platform%2Finfra/merge_requests/97";
+const RENAME_THREAD: &str = "6a9c1750b37d513a43987b574953fceb50b03ce7";
+const OLD_TXT_THREAD: &str = "87805b7c09016a7058e91bdbe7b29d1f284a39e6";
+const TYPO_THREAD: &str = "f1e2d3c4b5a6978877665544332211ffeeddccbb";
+const MR_URL: &str = "https://gitlab.example.com/platform/infra/-/merge_requests/97";
+
+impl Harness {
+    /// What every Publish reads first: the merge request at `head1`, GitLab's `version`, and
+    /// no draft notes left in the browser.
+    fn before_publish(&mut self, version: &str) {
+        self.get(MR, TOKEN, &fixture("mr.json"));
+        self.version(version);
+        self.get(&format!("{MR}/draft_notes"), TOKEN, "[]");
+    }
+
+    /// `POST draft_notes` with exactly `body`, answering the new draft note's `id`.
+    fn draft_note(&mut self, body: Value, id: u64) -> Mock {
+        self.server
+            .mock("POST", format!("{MR}/draft_notes").as_str())
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .match_body(Matcher::Json(body))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "id": id, "author_id": 1 }).to_string())
+            .create()
+    }
+
+    /// `POST draft_notes/bulk_publish` with exactly `body`.
+    fn bulk_publish(&mut self, body: Value) -> Mock {
+        self.server
+            .mock("POST", format!("{MR}/draft_notes/bulk_publish").as_str())
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .match_body(Matcher::Json(body))
+            .with_status(204)
+            .create()
+    }
+
+    /// `PUT discussions/thread` marking it `resolved` or not.
+    fn set_resolved(&mut self, thread: &str, resolved: bool) -> Mock {
+        self.server
+            .mock("PUT", format!("{MR}/discussions/{thread}").as_str())
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .match_body(Matcher::Json(json!({ "resolved": resolved })))
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "id": thread }).to_string())
+            .create()
+    }
+
+    /// `POST approve` at `head1`.
+    fn approve(&mut self) -> Mock {
+        self.server
+            .mock("POST", format!("{MR}/approve").as_str())
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .match_body(Matcher::Json(json!({ "sha": "head1" })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create()
+    }
+
+    /// Mocks failing the test if any POST, PUT or DELETE arrives.
+    fn nothing_written(&mut self) -> Vec<Mock> {
+        ["POST", "PUT", "DELETE"].map(|method| self.server.mock(method, Matcher::Any).expect(0).create()).into()
+    }
+}
+
+fn review(verdict: Verdict, body: &str) -> Review {
+    Review {
+        verdict,
+        body: body.into(),
+        comments: Vec::new(),
+        replies: Vec::new(),
+        resolve: Vec::new(),
+        reopen: Vec::new(),
+    }
+}
+
+fn comment(anchor: RemoteAnchor, body: &str, suggestion: Option<&str>) -> ReviewComment {
+    ReviewComment { anchor, body: body.into(), suggestion: suggestion.map(Into::into) }
+}
+
+fn lines(side: Side, path: &str, start: u32, end: u32) -> RemoteAnchor {
+    RemoteAnchor::Lines { path: path.into(), side, start, end }
+}
+
+/// A draft note's position on the merge request's current version.
+fn position(fields: Value) -> Value {
+    let mut position = json!({ "base_sha": "mb1", "start_sha": "target1", "head_sha": "head1" });
+    position.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+    position
+}
+
+#[test]
+fn publishes_new_threads_replies_resolves_and_requested_changes_as_one_review() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0-ee");
+    h.diffs("1", "2", &fixture("diffs-1.json"));
+    h.diffs("2", "", &fixture("diffs-2.json"));
+    let notes = [
+        // The summary goes first, as a general comment.
+        h.draft_note(json!({ "note": "Needs another pass." }), 501),
+        h.draft_note(
+            json!({
+                "note": "Name it rotate().\n\n```suggestion:-0+0\nfn rotate() {}\n```",
+                "position": position(json!({
+                    "position_type": "text", "old_path": "src/a.rs", "new_path": "src/a.rs", "new_line": 1,
+                })),
+            }),
+            502,
+        ),
+        h.draft_note(
+            json!({
+                "note": "Why remove this?",
+                "position": position(json!({
+                    "position_type": "text", "old_path": "old.txt", "new_path": "old.txt", "old_line": 1,
+                })),
+            }),
+            503,
+        ),
+        h.draft_note(
+            json!({
+                "note": "Link this from the README.",
+                "position": position(json!({
+                    "position_type": "file", "old_path": "docs/new.md", "new_path": "docs/new.md",
+                })),
+            }),
+            504,
+        ),
+        // A reply that resolves its Thread resolves it when published.
+        h.draft_note(
+            json!({ "note": "Still unclear.", "in_reply_to_discussion_id": RENAME_THREAD, "resolve_discussion": true }),
+            505,
+        ),
+    ];
+    let resolves = [h.set_resolved(OLD_TXT_THREAD, true), h.set_resolved(TYPO_THREAD, false)];
+    let published = h.bulk_publish(json!({ "reviewer_state": "requested_changes" }));
+    let review = Review {
+        comments: vec![
+            comment(lines(Side::New, "src/a.rs", 1, 1), "Name it rotate().", Some("fn rotate() {}")),
+            comment(lines(Side::Old, "old.txt", 1, 1), "Why remove this?", None),
+            comment(RemoteAnchor::File { path: "docs/new.md".into() }, "Link this from the README.", None),
+        ],
+        replies: vec![ReviewReply { thread: RENAME_THREAD.into(), body: "Still unclear.".into() }],
+        resolve: vec![RENAME_THREAD.into(), OLD_TXT_THREAD.into()],
+        reopen: vec![TYPO_THREAD.into()],
+        ..review(Verdict::RequestChanges, "Needs another pass.")
+    };
+
+    let url = h.gitlab().publish(&rotate_creds(), &review).unwrap();
+
+    notes.iter().chain(&resolves).for_each(Mock::assert);
+    published.assert();
+    assert_eq!(url, MR_URL);
+}
+
+#[test]
+fn comments_carry_both_line_numbers_on_unchanged_lines_and_line_codes_on_ranges() {
+    let mut h = Harness::new();
+    h.before_publish("18.11.0");
+    h.diffs(
+        "1",
+        "",
+        r#"[{ "old_path": "src/c.rs", "new_path": "src/c.rs", "new_file": false, "renamed_file": false,
+              "deleted_file": false, "diff": "@@ -2,3 +2,3 @@ fn c() {\n a\n-b\n+B\n c\n@@ -10,2 +10,3 @@\n x\n+y\n z\n" }]"#,
+    );
+    let code = "75a36e2b0b97ef9c67e63a5429d5a83767bb1d19";
+    let text = |fields: Value| {
+        let mut fields = fields;
+        fields["position_type"] = json!("text");
+        fields["old_path"] = json!("src/c.rs");
+        fields["new_path"] = json!("src/c.rs");
+        position(fields)
+    };
+    let notes = [
+        // From an unchanged line to an added one: the note sits on the last.
+        h.draft_note(
+            json!({
+                "note": "Range.\n\n```suggestion:-1+0\nA\nB2\n```",
+                "position": text(json!({
+                    "new_line": 3,
+                    "line_range": {
+                        "start": { "line_code": format!("{code}_2_2"), "type": null, "old_line": 2, "new_line": 2 },
+                        "end": { "line_code": format!("{code}_4_3"), "type": "new", "old_line": null, "new_line": 3 },
+                    },
+                })),
+            }),
+            501,
+        ),
+        // A removed line in a range.
+        h.draft_note(
+            json!({
+                "note": "Removed.",
+                "position": text(json!({
+                    "old_line": 3,
+                    "line_range": {
+                        "start": { "line_code": format!("{code}_2_2"), "type": null, "old_line": 2, "new_line": 2 },
+                        "end": { "line_code": format!("{code}_3_3"), "type": "old", "old_line": 3, "new_line": null },
+                    },
+                })),
+            }),
+            502,
+        ),
+        // Unchanged lines: between hunks, in one, after the last.
+        h.draft_note(json!({ "note": "Between.", "position": text(json!({ "old_line": 7, "new_line": 7 })) }), 503),
+        h.draft_note(json!({ "note": "In.", "position": text(json!({ "old_line": 11, "new_line": 12 })) }), 504),
+        h.draft_note(json!({ "note": "After.", "position": text(json!({ "old_line": 19, "new_line": 20 })) }), 505),
+        h.draft_note(json!({ "note": "Old side.", "position": text(json!({ "old_line": 19, "new_line": 20 })) }), 506),
+    ];
+    // Before GitLab 19.2, feedback leaves the reviewer state alone.
+    let published = h.bulk_publish(json!({}));
+    let review = Review {
+        comments: vec![
+            comment(lines(Side::New, "src/c.rs", 2, 3), "Range.", Some("A\nB2\n")),
+            comment(lines(Side::Old, "src/c.rs", 2, 3), "Removed.", None),
+            comment(lines(Side::New, "src/c.rs", 7, 7), "Between.", None),
+            comment(lines(Side::New, "src/c.rs", 12, 12), "In.", None),
+            comment(lines(Side::New, "src/c.rs", 20, 20), "After.", None),
+            comment(lines(Side::Old, "src/c.rs", 19, 19), "Old side.", None),
+        ],
+        ..review(Verdict::Feedback, "")
+    };
+
+    h.gitlab().publish(&rotate_creds(), &review).unwrap();
+
+    notes.iter().for_each(Mock::assert);
+    published.assert();
+}
+
+#[test]
+fn each_verdict_maps_to_gitlab_s_reviewer_state_and_approval() {
+    // (verdict, GitLab's version, bulk publish's body, approves)
+    let cases = [
+        (Verdict::Feedback, "19.2.0", json!({ "reviewer_state": "reviewed" }), false),
+        (Verdict::Feedback, "18.11.0", json!({}), false),
+        (Verdict::Approve, "19.2.0", json!({}), true),
+        (Verdict::Approve, "18.11.0", json!({}), true),
+    ];
+    for (verdict, version, state, approves) in cases {
+        let mut h = Harness::new();
+        h.before_publish(version);
+        h.approvals(true, false);
+        let note = h.draft_note(json!({ "note": "Thanks." }), 501);
+        let approved = h.approve().expect(usize::from(approves));
+        let published = h.bulk_publish(state);
+
+        h.gitlab().publish(&rotate_creds(), &review(verdict, "Thanks.")).unwrap();
+
+        note.assert();
+        approved.assert();
+        published.assert();
+    }
+}
+
+#[test]
+fn a_bare_approval_only_approves() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0");
+    h.approvals(true, false);
+    let approved = h.approve();
+    let published = h.server.mock("POST", Matcher::Regex("draft_notes".into())).expect(0).create();
+
+    let url = h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "")).unwrap();
+
+    approved.assert();
+    published.assert();
+    assert_eq!(url, MR_URL);
+}
+
+#[test]
+fn approving_again_keeps_the_approval_without_sending_it_twice() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0");
+    h.approvals(false, true);
+    let note = h.draft_note(json!({ "note": "Still good." }), 501);
+    let published = h.bulk_publish(json!({}));
+    let approved = h.server.mock("POST", format!("{MR}/approve").as_str()).expect(0).create();
+
+    h.gitlab().publish(&rotate_creds(), &review(Verdict::Approve, "Still good.")).unwrap();
+
+    note.assert();
+    published.assert();
+    approved.assert();
+}
+
+#[test]
+fn draft_notes_left_in_the_browser_stop_publish_before_anything_is_sent() {
+    let mut h = Harness::new();
+    h.get(MR, TOKEN, &fixture("mr.json"));
+    h.version("19.2.0");
+    h.get(&format!("{MR}/draft_notes"), TOKEN, r#"[{"id": 9, "note": "half a thought"}, {"id": 10, "note": "x"}]"#);
+    let written = h.nothing_written();
+
+    let error = h.gitlab().publish(&rotate_creds(), &review(Verdict::Feedback, "Looks good.")).unwrap_err();
+
+    written.iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::DraftsInBrowser { count: 2, .. }), "{error:?}");
+    assert!(error.to_string().contains("browser"), "{error}");
+}
+
+#[test]
+fn a_push_since_the_session_opened_stops_publish_before_anything_is_sent() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0");
+    let written = h.nothing_written();
+    let stale = PullRequest { head_sha: "head0".into(), ..rotate_creds() };
+
+    let error = h.gitlab().publish(&stale, &review(Verdict::Feedback, "Looks good.")).unwrap_err();
+
+    written.iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::Moved(pr) if pr.contains("platform/infra")), "{error:?}");
+}
+
+#[test]
+fn what_an_old_gitlab_cannot_take_is_refused_before_anything_is_sent() {
+    let file_comment = Review {
+        comments: vec![comment(RemoteAnchor::File { path: "docs/new.md".into() }, "Link it.", None)],
+        ..review(Verdict::Feedback, "")
+    };
+    // File comments came with GitLab 17.0, requesting changes with 19.2.
+    let cases = [("16.11.0", file_comment), ("19.1.0", review(Verdict::RequestChanges, "Fix it."))];
+    for (version, review) in cases {
+        let mut h = Harness::new();
+        h.before_publish(version);
+        h.diffs("1", "", &fixture("diffs-1.json"));
+        let written = h.nothing_written();
+
+        let error = h.gitlab().publish(&rotate_creds(), &review).unwrap_err();
+
+        written.iter().for_each(Mock::assert);
+        assert!(matches!(&error, ForgeError::Unsupported { .. }), "GitLab {version}: {error:?}");
+    }
+}
+
+#[test]
+fn a_failure_part_way_deletes_the_draft_notes_and_undoes_resolves_and_the_approval() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0");
+    h.approvals(true, false);
+    h.draft_note(json!({ "note": "Ship it." }), 501);
+    h.draft_note(json!({ "note": "Thanks.", "in_reply_to_discussion_id": RENAME_THREAD }), 502);
+    h.set_resolved(OLD_TXT_THREAD, true);
+    h.set_resolved(TYPO_THREAD, false);
+    h.approve();
+    h.server
+        .mock("POST", format!("{MR}/draft_notes/bulk_publish").as_str())
+        .with_status(429)
+        .with_body(r#"{"message":"This endpoint has been requested too many times. Try again later."}"#)
+        .create();
+    let undone = [
+        h.server.mock("DELETE", format!("{MR}/draft_notes/501").as_str()).with_status(204).create(),
+        h.server.mock("DELETE", format!("{MR}/draft_notes/502").as_str()).with_status(204).create(),
+        h.set_resolved(OLD_TXT_THREAD, false),
+        h.set_resolved(TYPO_THREAD, true),
+        h.server.mock("POST", format!("{MR}/unapprove").as_str()).with_status(201).with_body("{}").create(),
+    ];
+    let review = Review {
+        replies: vec![ReviewReply { thread: RENAME_THREAD.into(), body: "Thanks.".into() }],
+        resolve: vec![OLD_TXT_THREAD.into()],
+        reopen: vec![TYPO_THREAD.into()],
+        ..review(Verdict::Approve, "Ship it.")
+    };
+
+    let error = h.gitlab().publish(&rotate_creds(), &review).unwrap_err();
+
+    undone.iter().for_each(Mock::assert);
+    assert!(matches!(&error, ForgeError::Api { status: 429, .. }), "{error:?}");
+}
+
+#[test]
+fn a_refused_draft_note_deletes_the_ones_before_it() {
+    let mut h = Harness::new();
+    h.before_publish("19.2.0");
+    h.diffs("1", "", &fixture("diffs-1.json"));
+    h.draft_note(json!({ "note": "Summary." }), 501);
+    h.server
+        .mock("POST", format!("{MR}/draft_notes").as_str())
+        .match_body(Matcher::PartialJson(json!({ "note": "Here." })))
+        .with_status(400)
+        .with_body(r#"{"message":{"line_code":["can't be blank"]}}"#)
+        .create();
+    let deleted = h.server.mock("DELETE", format!("{MR}/draft_notes/501").as_str()).with_status(204).create();
+    let published = h.server.mock("POST", format!("{MR}/draft_notes/bulk_publish").as_str()).expect(0).create();
+    let review = Review {
+        comments: vec![comment(lines(Side::New, "src/a.rs", 1, 1), "Here.", None)],
+        ..review(Verdict::Feedback, "Summary.")
+    };
+
+    let error = h.gitlab().publish(&rotate_creds(), &review).unwrap_err();
+
+    deleted.assert();
+    published.assert();
+    assert!(
+        matches!(&error, ForgeError::Api { status: 400, message, .. } if message.contains("line_code")),
         "{error:?}"
     );
 }
