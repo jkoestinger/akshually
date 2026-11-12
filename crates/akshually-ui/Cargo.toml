@@ -20,3 +20,6 @@ notify-rust.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rune-notify.workspace = true
+
+[dev-dependencies]
+akshually-testkit.workspace = true
