@@ -440,14 +440,20 @@ impl ForgeAdapter for GitHub {
     }
 
     /// A pending review with each new Thread and reply in it, then the Resolved changes, then
-    /// the Verdict submits it. A failure on the way undoes the Resolved changes made and
-    /// deletes the pending review, so nothing is half-published.
+    /// the Verdict submits it. A Pull Request pushed to since `pr` was fetched is refused first.
+    /// A failure on the way undoes the Resolved changes made and deletes the pending review, so
+    /// nothing is half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
         let (owner, repo) = pr.id.repo.split_once('/').ok_or_else(|| self.unexpected("a repository without owner"))?;
         let variables = json!({ "owner": owner, "repo": repo, "number": pr.id.number });
         let data: Value = self.graphql(PULL_REQUEST_ID_QUERY, variables)?;
         let pr_id =
             data.pointer("/repository/pullRequest/id").ok_or_else(|| ForgeError::NotFound(pr.id.to_string()))?;
+        // GitHub would take the review against the old head, its Threads on lines that moved:
+        // refuse, as GitLab does, so the human reloads first.
+        if self.string_at(&data, "/repository/pullRequest/headRefOid")? != pr.head_sha {
+            return Err(ForgeError::Moved(pr.id.to_string()));
+        }
         let input = json!({ "pullRequestId": pr_id, "commitOID": pr.head_sha });
         let data: Value = self.graphql(START_REVIEW, json!({ "input": input }))?;
         let review_id = self.string_at(&data, "/addPullRequestReview/pullRequestReview/id")?;
@@ -619,7 +625,7 @@ impl GitHub {
 }
 
 const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id } }
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id headRefOid } }
 }";
 
 const START_REVIEW: &str = "mutation($input: AddPullRequestReviewInput!) {

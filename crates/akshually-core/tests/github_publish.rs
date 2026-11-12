@@ -104,10 +104,16 @@ impl Harness {
             .create()
     }
 
-    /// The Pull Request's GraphQL id, `PR_1`.
+    /// The Pull Request's GraphQL id, `PR_1`, at its head `head1`.
     fn pull_request_id(&mut self) -> Mock {
+        self.pull_request_at("head1")
+    }
+
+    /// The Pull Request's GraphQL id, `PR_1`, with its head now at `head`.
+    fn pull_request_at(&mut self, head: &str) -> Mock {
         let variables = json!({ "owner": "acme", "repo": "web", "number": 482 });
-        self.graphql("pullRequest", variables, json!({ "repository": { "pullRequest": { "id": "PR_1" } } }))
+        let data = json!({ "repository": { "pullRequest": { "id": "PR_1", "headRefOid": head } } });
+        self.graphql("pullRequest", variables, data)
     }
 
     /// Starts the pending review `PRRV_1` on `head1`.
@@ -439,4 +445,16 @@ fn a_submit_that_failed_with_the_review_still_pending_is_undone() {
 
     [checked, undone, deleted].iter().for_each(Mock::assert);
     assert!(matches!(error, ForgeError::Api { status: 502, .. }), "{error:?}");
+}
+
+#[test]
+fn a_pull_request_pushed_to_since_it_was_fetched_is_refused_before_anything_is_sent() {
+    let mut h = Harness::new();
+    h.pull_request_at("head2");
+    let started = h.never("addPullRequestReview");
+
+    let error = h.github().publish(&pull_request("maria"), &no_threads()).unwrap_err();
+
+    started.assert();
+    assert!(matches!(&error, ForgeError::Moved(pr) if pr == "github.com/acme/web#482"), "{error:?}");
 }
