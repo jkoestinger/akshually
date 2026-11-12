@@ -1,0 +1,108 @@
+[
+  {
+    "id": "6a9c1750b37d513a43987b574953fceb50b03ce7",
+    "individual_note": false,
+    "notes": [
+      {
+        "id": 1126,
+        "type": "DiffNote",
+        "body": "Why the rename?",
+        "author": { "id": 3, "username": "lee", "name": "Lee" },
+        "created_at": "2026-11-11T10:00:00.000Z",
+        "system": false,
+        "resolvable": true,
+        "resolved": false,
+        "resolved_by": null,
+        "position": {
+          "base_sha": "mb1",
+          "start_sha": "target1",
+          "head_sha": "head1",
+          "old_path": "src/a.rs",
+          "new_path": "src/a.rs",
+          "position_type": "text",
+          "old_line": null,
+          "new_line": 1,
+          "line_range": null
+        }
+      },
+      {
+        "id": 1127,
+        "type": "DiffNote",
+        "body": "added 1 commit",
+        "author": { "id": 7, "username": "tom", "name": "Tom" },
+        "system": true,
+        "resolvable": false
+      },
+      {
+        "id": 1128,
+        "type": "DiffNote",
+        "body": "Clearer.",
+        "author": { "id": 7, "username": "tom", "name": "Tom" },
+        "system": false,
+        "resolvable": true,
+        "resolved": false,
+        "resolved_by": null
+      }
+    ]
+  },
+  {
+    "id": "87805b7c09016a7058e91bdbe7b29d1f284a39e6",
+    "individual_note": false,
+    "notes": [
+      {
+        "id": 1130,
+        "type": "DiffNote",
+        "body": "Still needed?",
+        "author": null,
+        "system": false,
+        "resolvable": true,
+        "resolved": true,
+        "resolved_by": { "id": 7, "username": "tom", "name": "Tom" },
+        "position": {
+          "base_sha": "mb1",
+          "start_sha": "target1",
+          "head_sha": "head1",
+          "old_path": "old.txt",
+          "new_path": "old.txt",
+          "position_type": "text",
+          "old_line": 5,
+          "new_line": null,
+          "line_range": {
+            "start": { "line_code": "a_3_0", "type": "old", "old_line": 3, "new_line": null },
+            "end": { "line_code": "a_5_0", "type": "old", "old_line": 5, "new_line": null }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "f1e2d3c4b5a6978877665544332211ffeeddccbb",
+    "individual_note": false,
+    "notes": [
+      {
+        "id": 1140,
+        "type": "DiffNote",
+        "body": "Typo here.",
+        "author": { "id": 3, "username": "lee", "name": "Lee" },
+        "system": false,
+        "resolvable": true,
+        "resolved": false,
+        "resolved_by": null,
+        "position": {
+          "base_sha": "mb0",
+          "start_sha": "target0",
+          "head_sha": "head0",
+          "old_path": "src/a.rs",
+          "new_path": "src/a.rs",
+          "position_type": "text",
+          "old_line": null,
+          "new_line": 7,
+          "line_range": {
+            "start": { "line_code": "b_0_6", "type": "new", "old_line": null, "new_line": 6 },
+            "end": { "line_code": "b_0_7", "type": "new", "old_line": null, "new_line": 7 }
+          }
+        }
+      }
+    ]
+  }
+]

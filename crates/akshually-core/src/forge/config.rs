@@ -7,9 +7,15 @@
 //! host = "github.example.com"                     # the web host, as in Pull Request URLs
 //! api_base = "https://github.example.com/api/v3"  # optional; derived from `host` by default
 //! token = "ghp_…"                                 # optional pasted token, the last resort
+//!
+//! [[hosts]]
+//! kind = "gitlab"
+//! host = "gitlab.example.com"
+//! api_base = "https://gitlab.example.com/api/v4"  # derived by default; set it for a relative root
 //! ```
 //!
-//! github.com needs no entry; one with `host = "github.com"` overrides the default.
+//! github.com needs no entry; one with `host = "github.com"` overrides the default. GitLab hosts,
+//! gitlab.com included, are served only when configured.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +23,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
     pub kind: ForgeKind,
-    /// The web host (`github.com`, `github.example.com`), optionally with a port.
+    /// The web host (`github.com`, `gitlab.example.com`), optionally with a port.
     pub host: String,
     /// The REST API's base URL, when it can't be derived from `host`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,6 +44,8 @@ impl HostConfig {
 pub enum ForgeKind {
     #[serde(rename = "github")]
     GitHub,
+    #[serde(rename = "gitlab")]
+    GitLab,
 }
 
 /// Every host to serve: `configured`, plus github.com unless configured.
