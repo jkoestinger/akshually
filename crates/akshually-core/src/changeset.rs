@@ -179,6 +179,24 @@ pub(crate) fn local(
     settings: &Settings,
     session_base: Option<&str>,
 ) -> Result<LocalChanges, Error> {
+    if options.range.is_some() {
+        return local_in(repo, options, settings, session_base, "");
+    }
+    // Untracked files are always in the tree, as in the Session base, and left out of the
+    // listing when excluded: otherwise ones that were there at `start` would show as deleted.
+    let tree = git::working_tree(repo, true)?;
+    local_in(repo, options, settings, session_base, &tree)
+}
+
+/// `local`, with the working tree already written as `tree` (by `git::working_tree`, untracked
+/// files included). For a commit range, `tree` plays no part.
+pub(crate) fn local_in(
+    repo: &Path,
+    options: &LocalOptions,
+    settings: &Settings,
+    session_base: Option<&str>,
+    tree: &str,
+) -> Result<LocalChanges, Error> {
     if let Some(range) = &options.range {
         if options.base.is_some() {
             return Err(Error::InvalidRequest("give either a base or a commit range, not both".into()));
@@ -191,17 +209,14 @@ pub(crate) fn local(
         Some(base) => git::merge_base(repo, &base)?,
         None => git::head(repo)?,
     };
-    // Untracked files are always in the tree, as in the Session base, and left out of the
-    // listing when excluded: otherwise ones that were there at `start` would show as deleted.
-    let tree = git::working_tree(repo, true)?;
     let excluded = if options.untracked.unwrap_or(settings.untracked) {
         HashSet::new()
     } else {
         git::untracked(repo)?.into_iter().collect()
     };
-    let full = diff(repo, base, &tree, &excluded)?;
+    let full = diff(repo, base, tree, &excluded)?;
     let since_session_base =
-        session_base.map(|session_base| diff(repo, session_base.to_owned(), &tree, &excluded)).transpose()?;
+        session_base.map(|session_base| diff(repo, session_base.to_owned(), tree, &excluded)).transpose()?;
     Ok(LocalChanges { full, since_session_base })
 }
 

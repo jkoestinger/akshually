@@ -476,6 +476,10 @@ struct Session {
     /// A Publish is under way. A restart drops it: the call making it is gone.
     #[serde(skip)]
     publishing: bool,
+    /// What the last look for changes on disk saw, while the Changeset hasn't changed since:
+    /// the same again means nothing new to offer.
+    #[serde(skip)]
+    disk_checked: Option<disk::DiskCheck>,
 }
 
 impl Session {
@@ -520,6 +524,7 @@ impl Session {
     /// Threads. With `default_view`, from Round 2 the view resets to the changes since the last
     /// Round, as on each re-attach.
     fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
+        self.disk_checked = None;
         let view = &mut self.view;
         let before = view.anchored_in().clone();
         for file in changeset.since(&view.changeset).files {

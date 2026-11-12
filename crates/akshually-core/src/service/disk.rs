@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{Service, SessionId, Source, Turn};
-use crate::{Changeset, Error, changeset};
+use crate::{Changeset, Error, changeset, git};
 
 impl Service {
     /// Human: refreshes the Session's Changeset from disk, or for a Pull Request from its Forge
@@ -65,21 +65,45 @@ impl Service {
             (inner.settings.clone(), checks)
         };
         for (id, local, session_base, repo) in checks {
-            // A repository that went away or broke has nothing to offer.
-            let Ok(now) = changeset::local(&repo, &local, &settings, session_base.as_deref()) else { continue };
-            let mut inner = self.lock();
-            let Ok(at) = inner.position(&id) else { continue };
-            let view = &mut inner.sessions[at].view;
-            if view.turn != Turn::Human {
+            // Writing the working tree and reading HEAD is cheap next to building the Changeset,
+            // which happens only when either moved. A repository that went away or broke has
+            // nothing to offer.
+            let (Ok(tree), Ok(head)) = (git::working_tree(&repo, true), git::head(&repo)) else { continue };
+            let check = DiskCheck { head, tree, untracked: settings.untracked, session_base };
+            let unchanged = {
+                let inner = self.lock();
+                inner.position(&id).is_ok_and(|at| inner.sessions[at].disk_checked.as_ref() == Some(&check))
+            };
+            if unchanged {
                 continue;
             }
-            let changed = changed_files(&view.changeset, &now.full);
-            if view.changed_on_disk != changed {
-                view.changed_on_disk = changed;
+            let base = check.session_base.as_deref();
+            let Ok(now) = changeset::local_in(&repo, &local, &settings, base, &check.tree) else { continue };
+            let mut inner = self.lock();
+            let Ok(at) = inner.position(&id) else { continue };
+            let session = &mut inner.sessions[at];
+            if session.view.turn != Turn::Human {
+                continue;
+            }
+            session.disk_checked = Some(check);
+            let changed = changed_files(&session.view.changeset, &now.full);
+            if session.view.changed_on_disk != changed {
+                session.view.changed_on_disk = changed;
                 inner.notify();
             }
         }
     }
+}
+
+/// What a look for changes on disk saw: everything the local Changeset is built from that can
+/// move on its own.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DiskCheck {
+    head: String,
+    /// The working tree, untracked files included.
+    tree: String,
+    untracked: bool,
+    session_base: Option<String>,
 }
 
 /// The paths whose change differs between two Changesets, including files in only one of them.
