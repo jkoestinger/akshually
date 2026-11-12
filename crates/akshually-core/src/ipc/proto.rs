@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LocalOptions, SessionId, SessionView, ThreadId};
+use crate::{Anchor, LocalOptions, SessionId, SessionView, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -23,11 +23,23 @@ pub const VERSION: u32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Blocks until the human answers; replies with an `Outcome`.
+    /// Blocks until the human answers; replies with an `Outcome`. With `pr`, the agent
+    /// co-reviews that Pull Request instead of asking for review of the local work in `cwd`.
     Review {
         cwd: PathBuf,
         #[serde(flatten)]
         local: LocalOptions,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr: Option<String>,
+    },
+    /// The co-Reviewer adds a Draft on the Pull Request `pr`, at `anchor`. Replies
+    /// `{"thread":"T1"}` once the Draft is in the Session.
+    Draft {
+        pr: String,
+        anchor: Anchor,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggestion: Option<String>,
     },
     /// After a `review` replied: the CLI printed the outcome. Replies `{}`.
     Ack,
