@@ -15,7 +15,7 @@ pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, LocalOptions}
 pub use paths::Paths;
 pub use service::{ChangesetView, Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn};
 pub use settings::{Settings, SettingsError};
-pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
+pub use thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -29,6 +29,8 @@ pub enum Error {
     UnknownSession(SessionId),
     #[error("can't anchor a Thread there: {0}")]
     InvalidAnchor(String),
+    #[error("a suggestion replaces lines on the new side; anchor it to some")]
+    InvalidSuggestion,
     #[error("a Comment needs some text")]
     EmptyComment,
     #[error("there are no Drafts to hand over")]
