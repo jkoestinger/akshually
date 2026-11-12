@@ -595,7 +595,7 @@ impl Inner {
         if let Some(notifier) = self.notifier.as_ref().filter(|_| self.settings.notifications && !self.window_focused) {
             let repo = view.repo().map(|r| r.file_name().unwrap_or(r.as_os_str()).to_string_lossy());
             notifier.notify(Notification {
-                session: view.id.clone(),
+                session: Some(view.id.clone()),
                 title: "Your Turn to review".into(),
                 body: format!("{} ({})", repo.unwrap_or_default(), view.branch()),
             });
@@ -709,6 +709,20 @@ impl Service {
     pub fn with_notifier(self, notifier: impl Notifier + 'static) -> Self {
         self.lock().notifier = Some(Box::new(notifier));
         self
+    }
+
+    /// The app can no longer serve the CLI on the local channel: tells the human, through the
+    /// notifier, that agents can't reach akshually until they restart it. Unlike a Turn, it
+    /// notifies whatever the focus or the `notifications` setting: nothing in the window shows
+    /// it (#36). The notifier runs while the service is locked.
+    pub fn local_channel_lost(&self) {
+        if let Some(notifier) = &self.lock().notifier {
+            notifier.notify(Notification {
+                session: None,
+                title: "Agents can't reach akshually".into(),
+                body: "akshually stopped listening for agents' calls. Quit and restart it to fix this.".into(),
+            });
+        }
     }
 
     /// The UI: `f` brings its window up, given the XDG activation token of the launch that

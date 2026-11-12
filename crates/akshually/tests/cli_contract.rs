@@ -3,6 +3,10 @@
 
 mod support;
 
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Party, Side, ThreadRef};
@@ -288,6 +292,28 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
     assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
     app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
     assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+}
+
+#[test]
+fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
+    let app = LaunchedApp::new();
+    let mut process = app.spawn_app_with_fd_limit(16);
+    let log = BufReader::new(process.0.stderr.take().unwrap());
+    let (lines, logged) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut emfile = log.lines().map_while(Result::ok).filter(|line| line.contains("os error 24"));
+        emfile.try_for_each(|line| lines.send(line))
+    });
+    app.wait_for("the app to listen", |_| true);
+
+    // Each idle connection holds some of the app's file descriptors until it closes.
+    let idle: Vec<_> = (0..32).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
+    let out_of_fds = logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
+    drop(idle);
+    let answered = wait_until(TIMEOUT, "the app to answer again", || app.state());
+
+    assert!(out_of_fds.starts_with("akshually: "), "logged: {out_of_fds}");
+    assert_eq!(answered.pid, process.0.id(), "another app answered");
 }
 
 #[test]
