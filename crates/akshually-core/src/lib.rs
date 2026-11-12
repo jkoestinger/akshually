@@ -12,7 +12,7 @@ mod thread;
 
 pub use changeset::{Changeset, FileChange};
 pub use paths::Paths;
-pub use service::{Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView};
+pub use service::{Outcome, PendingReview, ReviewRequest, Service, SessionId, SessionView, Turn};
 pub use thread::{Anchor, Comment, Party, Round, Side, Thread, ThreadId};
 
 #[derive(Debug, thiserror::Error)]

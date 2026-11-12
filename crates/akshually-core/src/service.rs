@@ -45,6 +45,16 @@ pub enum Outcome {
     Abandoned,
 }
 
+/// Whose move a Session is waiting on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Turn {
+    /// The agent waits on the human: a `review` call is blocked.
+    Human,
+    /// The human handed over a Round; the agent is working on it.
+    Agent,
+}
+
 /// An agent asking for review of its local work.
 #[derive(Clone, Debug)]
 pub struct ReviewRequest {
@@ -70,6 +80,10 @@ pub struct SessionView {
     pub round: u32,
     /// In the order they were opened.
     pub threads: Vec<Thread>,
+    pub turn: Turn,
+    /// The Session became the human's Turn while another tab was displayed, and its tab
+    /// hasn't been opened since.
+    pub attention: bool,
 }
 
 /// A `review` call waiting for the human. Dropping it stops waiting.
@@ -112,9 +126,23 @@ struct Inner {
     next_id: u64,
     sessions: Vec<Session>,
     subscribers: Vec<Subscriber>,
+    /// The Session whose tab the human has open.
+    displayed: Option<SessionId>,
 }
 
 impl Inner {
+    /// The Session at `at` became the human's Turn. It never takes the view: unless it's
+    /// displayed it gets attention. With nothing displayed, there's no view to take, so it's
+    /// displayed instead.
+    fn became_humans_turn(&mut self, at: usize) {
+        let view = &mut self.sessions[at].view;
+        view.turn = Turn::Human;
+        match &self.displayed {
+            None => self.displayed = Some(view.id.clone()),
+            Some(displayed) => view.attention = displayed != &view.id,
+        }
+    }
+
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
         self.sessions.iter().position(|s| &s.view.id == id).ok_or_else(|| Error::UnknownSession(id.clone()))
     }
@@ -165,6 +193,24 @@ impl Service {
         Some(inner.sessions[at].view.clone())
     }
 
+    /// The Session whose tab the human has open, if any.
+    pub fn displayed(&self) -> Option<SessionId> {
+        self.lock().displayed.clone()
+    }
+
+    /// Human: opens the Session's tab, which clears its attention.
+    pub fn display(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        if inner.displayed.as_ref() == Some(id) && !inner.sessions[at].view.attention {
+            return Ok(());
+        }
+        inner.displayed = Some(id.clone());
+        inner.sessions[at].view.attention = false;
+        inner.notify();
+        Ok(())
+    }
+
     /// Agent: asks for review of the local work in `request.cwd`, opening the Session for that
     /// repository and branch, or attaching to it. Returns once the Session shows the Changeset;
     /// wait on the result for the human's answer.
@@ -182,16 +228,30 @@ impl Service {
                 session.view.changeset = changeset;
                 if session.queued.is_empty() {
                     session.waiter = Some(tx);
+                    if session.view.turn != Turn::Human {
+                        inner.became_humans_turn(at);
+                    }
                 } else {
                     let _ = tx.send(Outcome::Round(session.queued.remove(0)));
                 }
-                session.view.id.clone()
+                inner.sessions[at].view.id.clone()
             }
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
-                let view = SessionView { id: id.clone(), repo, branch, changeset, round: 1, threads: Vec::new() };
+                let view = SessionView {
+                    id: id.clone(),
+                    repo,
+                    branch,
+                    changeset,
+                    round: 1,
+                    threads: Vec::new(),
+                    turn: Turn::Human,
+                    attention: false,
+                };
                 inner.sessions.push(Session { view, waiter: Some(tx), threads_opened: 0, queued: Vec::new() });
+                let at = inner.sessions.len() - 1;
+                inner.became_humans_turn(at);
                 id
             }
         };
@@ -244,6 +304,7 @@ impl Service {
             return Err(Error::NoDrafts);
         }
         session.view.round += 1;
+        session.view.turn = Turn::Agent;
         let round = Round { number, threads };
         match session.waiter.take() {
             // A waiter that went away gives the Round back, for the next call.
@@ -272,6 +333,9 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = inner.sessions.remove(at);
+        if inner.displayed.as_ref() == Some(id) {
+            inner.displayed = None;
+        }
         if let Some(waiter) = session.waiter {
             // The agent may have gone away; the Session ends regardless.
             let _ = waiter.send(outcome);
