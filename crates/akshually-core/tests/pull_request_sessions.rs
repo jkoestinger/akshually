@@ -237,12 +237,12 @@ fn checking_the_disk_leaves_pull_request_sessions_alone() {
 }
 
 #[test]
-fn a_pull_request_session_does_not_reload_from_disk() {
+fn reloading_a_pull_request_without_a_push_changes_nothing() {
     let (svc, _) = service();
     let id = svc.open_pull_request(URL).unwrap();
     let before = svc.session(&id).unwrap();
 
-    assert!(svc.reload(&id).is_err());
+    svc.reload(&id).unwrap();
     assert_eq!(svc.session(&id).unwrap(), before);
 }
 
