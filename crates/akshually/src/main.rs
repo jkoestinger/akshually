@@ -14,10 +14,13 @@ use akshually_core::{LocalOptions, Outcome, Paths, Service, Settings, ThreadId};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-/// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
+/// The agent skill `agent-help` prints.
+const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
+
 /// How often the app looks for changes on disk in Sessions waiting on the human.
 const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
 mod exit {
     pub const APPROVED: u8 = 0;
     pub const ERROR: u8 = 1;
@@ -59,6 +62,9 @@ enum Command {
         /// The Thread ID from the Round, e.g. `T3`.
         thread: String,
     },
+    /// Print the guide for agents: the review loop, the commands and the exit codes. It is
+    /// also a `SKILL.md` you can install as an agent skill.
+    AgentHelp,
     /// Run the app (launched by the first CLI call). Arguments after the options go to Rune,
     /// e.g. `--snap out.png --scene session` for a headless render.
     #[command(hide = true)]
@@ -121,6 +127,10 @@ fn main() -> ExitCode {
         }
         Some(Command::Resolve { thread }) => {
             agent_call(|conn, cwd| conn.resolve(cwd, &ThreadId::new(thread)).map_err(Into::into))
+        }
+        Some(Command::AgentHelp) => {
+            print!("{SKILL}");
+            Ok(ExitCode::SUCCESS)
         }
         Some(Command::App { headless, rune_args }) => app(headless, rune_args),
         None => app(false, Vec::new()),
