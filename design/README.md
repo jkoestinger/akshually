@@ -12,7 +12,7 @@
 
 ## Design tokens
 
-The Rune theme JSON in the repo is the source of truth for colours, radii and type. The `akshually` variable collection here (Dark and Light modes) mirrors it. Until the theme JSON exists (issue #1), these variables are the provisional values to start it from.
+The Rune theme JSON in the repo is the source of truth for colours, radii and type. The `akshually` variable collection here (Dark and Light modes) mirrors it. Until the theme JSON exists (see the spec, #7), these variables are the provisional values to start it from.
 
 ## Constraints from Rune
 
