@@ -5,7 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, mpsc};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{Outcome, Paths, ReviewRequest, Service};
+use crate::{LocalOptions, Outcome, Paths, ReviewRequest, Service};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
@@ -70,7 +70,7 @@ impl Server {
             return;
         }
         let reply = match parse(&line) {
-            Ok(Request::Review { cwd }) => return self.review(cwd, &stream, reader),
+            Ok(Request::Review { cwd, local }) => return self.review(cwd, local, &stream, reader),
             Ok(request) => self.answer(request),
             Err(error) => Reply::Err(error),
         };
@@ -81,8 +81,14 @@ impl Server {
     /// Serves a `review` call: waits for the human while watching the connection, so a CLI
     /// that goes away frees the Session, and hands a Round over for good only once the CLI
     /// acknowledges it.
-    fn review(&self, cwd: std::path::PathBuf, stream: &UnixStream, mut reader: BufReader<UnixStream>) {
-        let pending = match self.service.review(ReviewRequest::new(cwd)) {
+    fn review(
+        &self,
+        cwd: std::path::PathBuf,
+        local: LocalOptions,
+        stream: &UnixStream,
+        mut reader: BufReader<UnixStream>,
+    ) {
+        let pending = match self.service.review(ReviewRequest { cwd, local }) {
             Ok(pending) => pending,
             Err(error) => {
                 let _ = send(stream, Reply::Err(failed(error)));
@@ -123,6 +129,7 @@ impl Server {
             Request::Review { .. } | Request::Ack => {
                 Err(ErrorReply::new(ErrorCode::BadRequest, "`review` and `ack` need a connection of their own"))
             }
+            Request::Start { cwd } => self.service.start(&cwd).map(|()| serde_json::json!({})).map_err(failed),
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {
                 Err(ErrorReply::new(ErrorCode::Forbidden, "this app was not started for tests"))
             }

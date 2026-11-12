@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
-use crate::{Outcome, Paths};
+use crate::{LocalOptions, Outcome, Paths};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -34,9 +34,10 @@ impl Connection {
     pub fn review(
         mut self,
         cwd: &Path,
+        local: LocalOptions,
         deliver: impl FnOnce(&Outcome) -> io::Result<()>,
     ) -> Result<Outcome, ClientError> {
-        self.send(Request::Review { cwd: cwd.to_owned() })?;
+        self.send(Request::Review { cwd: cwd.to_owned(), local })?;
         let mut reader = BufReader::new(self.stream.try_clone()?);
         let outcome: Outcome = read_reply(&mut reader)?;
         deliver(&outcome)?;
@@ -45,6 +46,11 @@ impl Connection {
             read_reply::<IgnoredAny>(&mut reader)?;
         }
         Ok(outcome)
+    }
+
+    /// Records the Session base for the local work in `cwd`.
+    pub fn start(self, cwd: &Path) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::Start { cwd: cwd.to_owned() }).map(drop)
     }
 
     /// Test control: the app's pid and Sessions.

@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 
-use akshually_core::{Anchor, Changeset, Party, Service, SessionId, SessionView, Side, Thread, Turn};
+use akshually_core::{
+    Anchor, Changeset, ChangesetView, Collapsed, FileChange, Party, Service, SessionId, SessionView, Side, Thread, Turn,
+};
 use rune::{AppSpec, Cx, El, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffState, DiffView, FileDiff, LineRange, LineRef};
-use rune_kit::shell::{TabItem, TabOrientation, TabStrip};
+use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{Badge, BadgeVariant, Button, ButtonVariant, Kit, TextArea};
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -77,7 +79,8 @@ struct SessionTab {
 
 impl SessionTab {
     fn new(session: SessionView) -> Self {
-        let diff = DiffState::new(file_diffs(&session.changeset));
+        let mut diff = DiffState::new(Vec::new());
+        show_files(&mut diff, session.shown());
         let mut tab = SessionTab { session, diff };
         tab.annotate(None);
         tab
@@ -85,7 +88,7 @@ impl SessionTab {
 
     /// Puts each Thread, and the composer when it's on this Session, under its last line.
     fn annotate(&mut self, composer: Option<&Composer>) {
-        let changeset = &self.session.changeset;
+        let changeset = self.session.shown();
         let mut notes: Vec<Annotation> = self
             .session
             .threads
@@ -143,14 +146,50 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
         .iter()
         .map(|f| {
             let path = |side: &Option<String>| side.as_ref().map(|_| f.path.clone());
-            FileDiff::between(
+            let mut diff = FileDiff::between(
                 path(&f.old),
                 path(&f.new),
                 f.old.as_deref().unwrap_or(""),
                 f.new.as_deref().unwrap_or(""),
-            )
+            );
+            diff.binary = f.binary.is_some();
+            diff
         })
         .collect()
+}
+
+/// Shows `changeset` in `diff`, with generated and large files collapsed.
+fn show_files(diff: &mut DiffState, changeset: &Changeset) {
+    diff.set_files(file_diffs(changeset));
+    for (at, file) in changeset.files.iter().enumerate() {
+        if file.collapsed.is_some() {
+            diff.set_collapsed(at, true);
+        }
+    }
+}
+
+/// What a file's header says about it beyond the diff: "binary changed (size)", or why it is
+/// collapsed.
+fn file_note(file: &FileChange) -> Option<String> {
+    if let Some(sizes) = file.binary {
+        let size = match (sizes.old, sizes.new) {
+            (Some(old), Some(new)) => format!("{} → {}", bytes(old), bytes(new)),
+            (old, new) => bytes(old.or(new).unwrap_or(0)),
+        };
+        return Some(format!("binary changed ({size})"));
+    }
+    file.collapsed.map(|why| match why {
+        Collapsed::Generated => "Generated file".to_owned(),
+        Collapsed::Large => "Large file".to_owned(),
+    })
+}
+
+fn bytes(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{:.1} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
 }
 
 impl State {
@@ -171,8 +210,8 @@ impl State {
             .map(|session| match old.iter().position(|t| t.session.id == session.id) {
                 Some(at) => {
                     let mut tab = old.swap_remove(at);
-                    if tab.session.changeset != session.changeset {
-                        tab.diff.set_files(file_diffs(&session.changeset));
+                    if tab.session.shown() != session.shown() {
+                        show_files(&mut tab.diff, session.shown());
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -189,7 +228,25 @@ impl State {
         }
         self.annotate();
         if self.active_tab().is_none() {
-            self.active = self.tabs.first().map(|t| t.session.id.clone());
+            // The displayed Session ended (or none was): open the first tab, if any.
+            if let Some(id) = self.tabs.first().map(|t| t.session.id.clone()) {
+                self.open_tab(id);
+            } else {
+                self.active = None;
+            }
+        }
+    }
+
+    /// Shows the Session's tab and tells the service, which clears its attention.
+    fn open_tab(&mut self, id: SessionId) {
+        // The Session may have ended meanwhile; its tab goes with the next update.
+        let _ = self.service.display(&id);
+        self.active = Some(id);
+    }
+
+    fn show(&self, id: &SessionId, view: ChangesetView) {
+        if let Err(error) = self.service.show(id, view) {
+            eprintln!("akshually: {error}");
         }
     }
 
@@ -202,7 +259,7 @@ impl State {
     /// Opens the composer on `range` of the active Session.
     fn compose(&mut self, range: LineRange) {
         let Some(tab) = self.active_tab() else { return };
-        let Some(anchor) = anchor_for(&tab.session.changeset, range) else { return };
+        let Some(anchor) = anchor_for(tab.session.shown(), range) else { return };
         let at = Annotation::new(range.file, range.end, COMPOSER);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at });
         self.composer_text = TextEdit::new("");
@@ -248,12 +305,18 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         Some(tab) => {
             let tabs = TabStrip::new("tabs", TabOrientation::Horizontal)
                 .tabs(s.tabs.iter().map(|t| {
-                    TabItem::new(t.session.id.as_str(), t.title()).icon(&rune_kit::glyphs::FILE_CODE).closable(false)
+                    TabItem::new(t.session.id.as_str(), t.title())
+                        .icon(&rune_kit::glyphs::FILE_CODE)
+                        .closable(false)
+                        .status(tab_status(&t.session))
                 }))
                 .active(s.active.as_ref().map(SessionId::as_str))
                 .viewport_width(cx.layout_size("tabbar").map(|z| z[0]))
                 .on_select(|s: &mut State, id: &str, _| {
-                    s.active = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone());
+                    if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone())
+                    {
+                        s.open_tab(id);
+                    }
                 })
                 .build_layered(k, &mut layer);
             col()
@@ -274,9 +337,26 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(body.fill(k.c.bg_base), layer)
 }
 
+/// The tab's marker: attention when the Session became the human's Turn unseen, a quiet
+/// working indicator during the agent's Turn.
+fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
+    if session.attention {
+        Some(TabItemStatus::Attention)
+    } else if session.turn == Turn::Agent {
+        Some(TabItemStatus::Busy)
+    } else {
+        None
+    }
+}
+
 fn session_header(k: &Kit, tab: &SessionTab) -> El {
     let session = &tab.session;
-    let base = &session.changeset.base[..session.changeset.base.len().min(8)];
+    let shown = session.shown();
+    let base = if shown == &session.changeset {
+        format!("→ {}", &shown.base[..shown.base.len().min(8)])
+    } else {
+        "since Session base".to_owned()
+    };
     let (approve_id, abandon_id, hand_over_id) = (session.id.clone(), session.id.clone(), session.id.clone());
     let take_back_id = session.id.clone();
     let drafts = tab.drafts();
@@ -294,6 +374,17 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
             .on_press(move |s: &mut State| s.act(&take_back_id, Service::take_turn_back))
             .build(k)
     };
+    let toggle = session.since_session_base.as_ref().map(|_| {
+        let view_button = |label: &str, view: ChangesetView| {
+            let id = session.id.clone();
+            let variant = if session.view == view { ButtonVariant::Neutral } else { ButtonVariant::Ghost };
+            Button::new(label).variant(variant).on_press(move |s: &mut State| s.show(&id, view)).build(k)
+        };
+        row()
+            .gap(4.0)
+            .child(view_button("Since Session base", ChangesetView::SinceSessionBase))
+            .child(view_button("Full Changeset", ChangesetView::Full))
+    });
     row()
         .key("session-header")
         .w_full()
@@ -303,10 +394,11 @@ fn session_header(k: &Kit, tab: &SessionTab) -> El {
         .items_center()
         .fill(k.c.layer_01)
         .child(text(session.branch.clone()).font(k.ty.mono).color(k.c.text_base))
-        .child(text(format!("→ {base}")).font(k.ty.mono).color(k.c.text_muted))
+        .child(text(base).font(k.ty.mono).color(k.c.text_muted))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
+        .children(toggle)
         .child(
             Button::new("Abandon")
                 .variant(ButtonVariant::Ghost)
@@ -353,11 +445,18 @@ fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
 fn session_diff(k: &Kit, s: &State, tab: &SessionTab) -> El {
     let id = tab.session.id.clone();
     let id_mut = id.clone();
+    let id_header = id.clone();
+    let kc = k.clone();
     DiffView::new(
         move |s: &State| &s.tabs.iter().find(|t| t.session.id == id).expect("the active tab").diff,
         move |s: &mut State| &mut s.tabs.iter_mut().find(|t| t.session.id == id_mut).expect("the active tab").diff,
     )
     .key(format!("diff-{}", tab.session.id))
+    .header_actions(move |s: &State, file: usize| {
+        let tab = s.tabs.iter().find(|t| t.session.id == id_header).expect("the active tab");
+        let note = tab.session.shown().files.get(file).and_then(file_note).unwrap_or_default();
+        text(note).font(kc.ty.small).color(kc.c.text_muted)
+    })
     .annotation({
         let k = k.clone();
         move |s: &State, a: &Annotation| annotation(&k, s, a)
@@ -443,23 +542,38 @@ fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     s.active_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
 }
 
-/// `--scene session`: a sample Session, for headless renders.
+/// `--scene session`: a sample Session, plus tabs for an unseen human's Turn and an agent's
+/// Turn, for headless renders.
 fn scene_session(s: &mut State) {
     let changeset: Changeset = sample_changeset();
     let session = SessionView {
         id: SessionId::new("sample"),
         repo: "/home/me/akshually".into(),
         branch: "feat/round-snapshots".into(),
+        since_session_base: Some(Changeset { base: "5e5510nba5e".into(), files: changeset.files[..2].to_vec() }),
         changeset,
+        view: ChangesetView::Full,
         round: 2,
-        turn: Turn::Human,
         agent_waiting: true,
         threads: vec![
             sample_thread("T1", 3..=4, "Take the snapshot before building the Round.", Some(1)),
             sample_thread("T2", 5..=5, "Should this return the snapshot error as is?", None),
         ],
+        turn: Turn::Human,
+        attention: false,
     };
-    s.apply(vec![session]);
+    let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
+        id: SessionId::new(id),
+        branch: branch.into(),
+        round: 1,
+        threads: Vec::new(),
+        turn,
+        attention,
+        ..session.clone()
+    };
+    let unseen = other("unseen", "fix/inbox-refresh", Turn::Human, true);
+    let working = other("working", "feat/publish", Turn::Agent, false);
+    s.apply(vec![session, unseen, working]);
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
@@ -473,16 +587,25 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
 }
 
 fn sample_changeset() -> Changeset {
-    use akshually_core::FileChange;
     Changeset {
         base: "3e61ed7c0ffee".into(),
         files: vec![
             FileChange {
+                binary: None,
+                collapsed: None,
                 path: "src/session.rs".into(),
                 old: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let round = Round::new(drafts);\n    Ok(round)\n}\n".into()),
                 new: Some("pub fn hand_over_round(&mut self) -> Result<Round> {\n    let drafts = self.take_drafts();\n    let snapshot = self.changeset.snapshot()?;\n    let round = Round::new(drafts, snapshot);\n    Ok(round)\n}\n".into()),
             },
-            FileChange { path: "src/round.rs".into(), old: None, new: Some("pub struct Round;\n".into()) },
+            FileChange::text("src/round.rs", None, Some("pub struct Round;\n")),
+            FileChange {
+                binary: Some(akshually_core::BinarySizes { old: Some(12_288), new: Some(14_745) }),
+                ..FileChange::text("docs/screenshot.png", Some(""), Some(""))
+            },
+            FileChange {
+                collapsed: Some(Collapsed::Generated),
+                ..FileChange::text("Cargo.lock", Some("# @generated\nold\n"), Some("# @generated\nnew\n"))
+            },
         ],
     }
 }

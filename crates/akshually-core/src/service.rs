@@ -1,16 +1,17 @@
 //! The core review service: the single entry point both the UI and the CLI channel talk to.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::changeset::{self, Changeset};
+use crate::changeset::{self, Changeset, LocalOptions};
 use crate::thread::{Anchor, Comment, Party, Round, Thread, ThreadId};
-use crate::{Error, git};
+use crate::{Error, Settings, git};
 
 /// Identifies a Session for as long as the app runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +52,8 @@ pub enum Outcome {
 pub enum Turn {
     /// The agent asked for review: the human reads, comments and hands over a Round.
     Human,
-    /// The agent is addressing a Round. The human can still read and draft for the next one.
+    /// The human handed over a Round; the agent is working on it. The human can still read
+    /// and draft for the next one, or take the Turn back.
     Agent,
 }
 
@@ -60,11 +62,31 @@ pub enum Turn {
 pub struct ReviewRequest {
     /// Any directory inside the repository (or worktree) under Review.
     pub cwd: PathBuf,
+    /// Which local changes make up the Changeset.
+    pub local: LocalOptions,
 }
 
 impl ReviewRequest {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        ReviewRequest { cwd: cwd.into() }
+        ReviewRequest { cwd: cwd.into(), local: LocalOptions::default() }
+    }
+
+    /// Shows the changes since HEAD's merge-base with `base` instead of the default branch.
+    pub fn base(mut self, base: impl Into<String>) -> Self {
+        self.local.base = Some(base.into());
+        self
+    }
+
+    /// Includes untracked, non-ignored files (`true`) or not, whatever the setting says.
+    pub fn untracked(mut self, untracked: bool) -> Self {
+        self.local.untracked = Some(untracked);
+        self
+    }
+
+    /// Shows exactly the commit range `<from>..<to>` or `<from>...<to>`.
+    pub fn range(mut self, range: impl Into<String>) -> Self {
+        self.local.range = Some(range.into());
+        self
     }
 }
 
@@ -75,15 +97,43 @@ pub struct SessionView {
     /// The working tree root: each worktree is its own Session.
     pub repo: PathBuf,
     pub branch: String,
+    /// The full Changeset.
     pub changeset: Changeset,
     /// The Round being drafted: 1 until the first handover, then one more after each.
     pub round: u32,
-    pub turn: Turn,
     /// Whether an agent's `review` call is connected and waiting for the human. A Round handed
     /// over while none is waits for the next call.
     pub agent_waiting: bool,
     /// In the order they were opened.
     pub threads: Vec<Thread>,
+    pub turn: Turn,
+    /// The Session became the human's Turn while another tab was displayed, and its tab
+    /// hasn't been opened since.
+    pub attention: bool,
+    /// The agent's changes since the Session base, when it ran `start` first.
+    pub since_session_base: Option<Changeset>,
+    /// Which Changeset the human is looking at.
+    pub view: ChangesetView,
+}
+
+impl SessionView {
+    /// The Changeset the human is looking at.
+    pub fn shown(&self) -> &Changeset {
+        match (self.view, &self.since_session_base) {
+            (ChangesetView::SinceSessionBase, Some(since)) => since,
+            _ => &self.changeset,
+        }
+    }
+}
+
+/// Which of a Session's Changesets the human is looking at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangesetView {
+    /// Only the agent's changes since the Session base (the default after `start`).
+    SinceSessionBase,
+    /// The whole Changeset.
+    Full,
 }
 
 /// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
@@ -184,10 +234,12 @@ impl Drop for PendingReview {
         self.call.release();
         let waiter = self.call.waiter;
         self.call.with_session(|session| {
-            // Received but not acknowledged: the agent may never have seen it.
+            // Received but not acknowledged: the agent may never have seen it. It goes to the
+            // call waiting now, if any, or the next one.
             if session.in_flight.as_ref().is_some_and(|(w, _)| *w == waiter) {
                 let (_, round) = session.in_flight.take().expect("checked");
                 session.queued.insert(0, round);
+                session.deliver();
             }
         });
     }
@@ -238,10 +290,27 @@ struct Inner {
     next_id: u64,
     next_waiter: u64,
     sessions: Vec<Session>,
+    settings: Settings,
+    /// Session bases from `start`, by repository and branch, kept until the Session ends.
+    session_bases: HashMap<(PathBuf, String), String>,
     subscribers: Vec<Subscriber>,
+    /// The Session whose tab the human has open.
+    displayed: Option<SessionId>,
 }
 
 impl Inner {
+    /// The Session at `at` became the human's Turn. It never takes the view: unless it's
+    /// displayed it gets attention. With nothing displayed, there's no view to take, so it's
+    /// displayed instead.
+    fn became_humans_turn(&mut self, at: usize) {
+        let view = &mut self.sessions[at].view;
+        view.turn = Turn::Human;
+        match &self.displayed {
+            None => self.displayed = Some(view.id.clone()),
+            Some(displayed) => view.attention = displayed != &view.id,
+        }
+    }
+
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
         self.sessions.iter().position(|s| &s.view.id == id).ok_or_else(|| Error::UnknownSession(id.clone()))
     }
@@ -287,6 +356,15 @@ impl Service {
         self.lock().subscribers.push(Box::new(f));
     }
 
+    pub fn settings(&self) -> Settings {
+        self.lock().settings.clone()
+    }
+
+    /// Human: changes the settings; they apply from the next agent call.
+    pub fn set_settings(&self, settings: Settings) {
+        self.lock().settings = settings;
+    }
+
     pub fn sessions(&self) -> Vec<SessionView> {
         self.lock().views()
     }
@@ -297,6 +375,44 @@ impl Service {
         Some(inner.sessions[at].view.clone())
     }
 
+    /// The Session whose tab the human has open, if any.
+    pub fn displayed(&self) -> Option<SessionId> {
+        self.lock().displayed.clone()
+    }
+
+    /// Human: opens the Session's tab, which clears its attention.
+    pub fn display(&self, id: &SessionId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        if inner.displayed.as_ref() == Some(id) && !inner.sessions[at].view.attention {
+            return Ok(());
+        }
+        inner.displayed = Some(id.clone());
+        inner.sessions[at].view.attention = false;
+        inner.notify();
+        Ok(())
+    }
+
+    /// Agent: snapshots the working tree of the repository containing `cwd` as the Session
+    /// base, so the next `review` on this branch shows only the changes made after it.
+    pub fn start(&self, cwd: &Path) -> Result<(), Error> {
+        let repo = git::toplevel(cwd)?;
+        let branch = git::branch(&repo)?;
+        let base = changeset::snapshot(&repo)?;
+        self.lock().session_bases.insert((repo, branch), base);
+        Ok(())
+    }
+
+    /// Human: switches the Session between its full Changeset and the changes since the
+    /// Session base.
+    pub fn show(&self, id: &SessionId, view: ChangesetView) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        inner.sessions[at].view.view = view;
+        inner.notify();
+        Ok(())
+    }
+
     /// Agent: asks for review of the local work in `request.cwd`, opening the Session for that
     /// repository and branch, or attaching to it. Returns once the Session shows the Changeset;
     /// wait on the result for the human's answer, or for a Round queued for the agent.
@@ -305,7 +421,12 @@ impl Service {
     pub fn review(&self, request: ReviewRequest) -> Result<PendingReview, Error> {
         let repo = git::toplevel(&request.cwd)?;
         let branch = git::branch(&repo)?;
-        let changeset = changeset::local(&repo)?;
+        let (settings, session_base) = {
+            let inner = self.lock();
+            (inner.settings.clone(), inner.session_bases.get(&(repo.clone(), branch.clone())).cloned())
+        };
+        let local = changeset::local(&repo, &request.local, &settings, session_base.as_deref())?;
+        let (changeset, since_session_base) = (local.full, local.since_session_base);
         let (tx, rx) = mpsc::channel();
 
         let mut inner = self.lock();
@@ -316,31 +437,39 @@ impl Service {
         let id = match existing {
             Some(at) => {
                 let session = &mut inner.sessions[at];
-                if session.waiter.is_some() || session.in_flight.is_some() {
+                if session.waiter.is_some() {
                     return Err(Error::Busy);
                 }
                 session.view.changeset = changeset;
+                session.view.since_session_base = since_session_base;
                 session.waiter = Some(waiter);
                 session.view.agent_waiting = true;
-                if session.queued.is_empty() {
-                    session.view.turn = Turn::Human;
-                } else {
+                if !session.queued.is_empty() {
                     session.deliver();
+                } else if session.view.turn != Turn::Human {
+                    inner.became_humans_turn(at);
                 }
-                session.view.id.clone()
+                inner.sessions[at].view.id.clone()
             }
             None => {
                 inner.next_id += 1;
                 let id = SessionId::new(format!("s{}", inner.next_id));
+                let view = match since_session_base {
+                    Some(_) => ChangesetView::SinceSessionBase,
+                    None => ChangesetView::Full,
+                };
                 let view = SessionView {
                     id: id.clone(),
                     repo,
                     branch,
                     changeset,
+                    since_session_base,
+                    view,
                     round: 1,
-                    turn: Turn::Human,
                     agent_waiting: true,
                     threads: Vec::new(),
+                    turn: Turn::Human,
+                    attention: false,
                 };
                 inner.sessions.push(Session {
                     view,
@@ -349,6 +478,8 @@ impl Service {
                     queued: Vec::new(),
                     in_flight: None,
                 });
+                let at = inner.sessions.len() - 1;
+                inner.became_humans_turn(at);
                 id
             }
         };
@@ -369,7 +500,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        let excerpt = anchor.excerpt(&session.view.changeset).map_err(Error::InvalidAnchor)?;
+        let excerpt = anchor.excerpt(session.view.shown()).map_err(Error::InvalidAnchor)?;
         session.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", session.threads_opened));
         let comment = Comment { author: Party::Human, body, round: None };
@@ -424,7 +555,6 @@ impl Service {
         if session.view.turn == Turn::Human {
             return Err(Error::AlreadyYourTurn);
         }
-        session.view.turn = Turn::Human;
         // Rounds no agent received yet go back to being Drafts, for the human to keep editing.
         if let Some(first) = session.queued.first().map(|r| r.number) {
             session.queued.clear();
@@ -435,6 +565,7 @@ impl Service {
             }
             session.view.round = first;
         }
+        inner.became_humans_turn(at);
         inner.notify();
         Ok(())
     }
@@ -453,6 +584,10 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = inner.sessions.remove(at);
+        if inner.displayed.as_ref() == Some(id) {
+            inner.displayed = None;
+        }
+        inner.session_bases.remove(&(session.view.repo.clone(), session.view.branch.clone()));
         if let Some(waiter) = session.waiter {
             // The agent may have gone away; the Session ends regardless.
             let _ = waiter.outcome.send(outcome);

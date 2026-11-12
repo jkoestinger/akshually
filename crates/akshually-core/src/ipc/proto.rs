@@ -2,7 +2,7 @@
 //! exactly one reply (possibly after a long wait).
 //!
 //! ```jsonc
-//! {"v":1,"op":"review","cwd":"/abs/repo"}            // client → app
+//! {"v":1,"op":"review","cwd":"/abs/repo","base":"main"} // client → app; options optional
 //! {"v":1,"ok":{"outcome":"approved"}}                // app → client
 //! {"v":1,"err":{"code":"version","message":"…"}}
 //! ```
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionId, SessionView};
+use crate::{LocalOptions, SessionId, SessionView};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
 pub const VERSION: u32 = 1;
@@ -24,9 +24,15 @@ pub const VERSION: u32 = 1;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     /// Blocks until the human answers; replies with an `Outcome`.
-    Review { cwd: PathBuf },
+    Review {
+        cwd: PathBuf,
+        #[serde(flatten)]
+        local: LocalOptions,
+    },
     /// After a `review` replied with a Round: the CLI printed it. Replies `{}`.
     Ack,
+    /// Records the Session base; replies `{}` at once.
+    Start { cwd: PathBuf },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
