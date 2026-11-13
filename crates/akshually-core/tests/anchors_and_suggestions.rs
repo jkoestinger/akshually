@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use akshually_core::{Anchor, NewComment, Outcome, ReviewRequest, Service, Side};
+use akshually_core::{Anchor, Error, NewComment, Outcome, ReviewRequest, Service, Side};
 use akshually_testkit::TestRepo;
 use serde_json::json;
 
@@ -84,6 +84,49 @@ fn markdown_without_a_suggestion_fence_is_kept_whole() {
     let written = "Use this:\n\n```rust\nfn b() {}\n```\n";
 
     assert_eq!(NewComment::from_markdown(written), NewComment::new(written));
+}
+
+#[test]
+fn a_comment_with_a_suggestion_is_written_as_markdown_that_reads_back_the_same() {
+    let comment = NewComment::new("Name it.").suggest("    okta();\n");
+
+    let written = comment.to_markdown();
+
+    assert_eq!(written, "Name it.\n\n```suggestion\n    okta();\n```\n");
+    assert_eq!(NewComment::from_markdown(&written), comment);
+}
+
+#[test]
+fn a_suggestion_holding_a_fence_is_written_inside_a_longer_one() {
+    let comment = NewComment::new("Quote it.").suggest("/// ```\n/// okta();\n/// ```\n");
+
+    let written = comment.to_markdown();
+
+    assert!(written.contains("\n````suggestion\n"), "{written}");
+    assert_eq!(NewComment::from_markdown(&written), comment);
+}
+
+#[test]
+fn a_comment_without_a_suggestion_is_written_as_its_body() {
+    let comment = NewComment::new("Use this:\n\n```rust\nfn b() {}\n```\n");
+
+    let written = comment.to_markdown();
+
+    assert_eq!(NewComment::from_markdown(&written), comment);
+}
+
+#[test]
+fn checking_an_anchor_refuses_a_file_outside_the_changeset() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let session = svc.session(pending.session()).unwrap();
+
+    let (changed, unchanged) =
+        (session.check_anchor(&Anchor::file("lib.rs")), session.check_anchor(&Anchor::file("other.rs")));
+
+    assert!(changed.is_ok(), "{changed:?}");
+    assert!(matches!(unchanged, Err(Error::InvalidAnchor(_))), "{unchanged:?}");
 }
 
 #[test]

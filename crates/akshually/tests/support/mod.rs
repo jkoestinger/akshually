@@ -140,7 +140,11 @@ impl ForgeAdapter for FakeForge {
         Ok(Vec::new())
     }
 
-    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
         Ok(Verdict::ALL.to_vec())
     }
 

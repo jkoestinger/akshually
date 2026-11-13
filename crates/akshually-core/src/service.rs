@@ -14,19 +14,21 @@ use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
+mod actions;
 mod co_review;
-mod diff_layout;
 mod disk;
 mod drafts;
 mod handoff;
 mod inbox;
 mod pull_request;
 mod threads;
+mod window;
 
-pub use diff_layout::DiffLayout;
+pub use actions::{Ending, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
+pub use window::{DiffLayout, Displayed, WindowView};
 
 use handoff::{Call, Waiter};
 
@@ -279,6 +281,9 @@ pub struct SessionView {
     pub agent: Option<Role>,
     /// The full Changeset.
     pub changeset: Changeset,
+    /// Moves whenever the Changeset shown changes: a refresh, a reload, or the human switching
+    /// Changeset views. It stays put otherwise, so the UI rebuilds its diff only when it moves.
+    pub changeset_rev: u64,
     /// The Round being drafted: 1 until the first handover, then one more after each.
     pub round: u32,
     /// Whether an agent's `review` call is connected and waiting for the human. A Round handed
@@ -358,6 +363,29 @@ impl SessionView {
         }
     }
 
+    /// The Changeset views the Session has, in the order to offer them: the changes since the
+    /// last Round, since the Session base, then the full Changeset, which it always has.
+    pub fn offered_views(&self) -> Vec<ChangesetView> {
+        let since_last_round = self.since_last_round.as_ref().map(|_| ChangesetView::SinceLastRound);
+        let since_session_base = self.since_session_base.as_ref().map(|_| ChangesetView::SinceSessionBase);
+        [since_last_round, since_session_base, Some(ChangesetView::Full)].into_iter().flatten().collect()
+    }
+
+    /// What the Session's tab marks it with, the first that applies: it needs attention, a
+    /// reload is on offer (files changed on disk, or the Pull Request received pushes), or it's
+    /// the agent's Turn. `None` otherwise.
+    pub fn mark(&self) -> Option<SessionMark> {
+        if self.attention {
+            Some(SessionMark::Attention)
+        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() {
+            Some(SessionMark::ReloadOffered)
+        } else if self.turn == Turn::Agent {
+            Some(SessionMark::AgentsTurn)
+        } else {
+            None
+        }
+    }
+
     /// The Changeset Threads are anchored in: the shown one, except since the last Round,
     /// where the old side is that Round's code rather than a base and files the agent left
     /// alone are hidden, so Threads stay anchored in the full Changeset.
@@ -366,6 +394,17 @@ impl SessionView {
             ChangesetView::SinceLastRound => &self.changeset,
             _ => self.shown(),
         }
+    }
+
+    /// Makes `change`, then moves `changeset_rev` if the Changeset shown is no longer the one it
+    /// was. Every change that can alter the Changeset shown goes through here.
+    pub(super) fn change_shown<T>(&mut self, change: impl FnOnce(&mut SessionView) -> T) -> T {
+        let before = self.shown().clone();
+        let changed = change(self);
+        if self.shown() != &before {
+            self.changeset_rev += 1;
+        }
+        changed
     }
 
     /// Since the last Round, the old side is that Round's code, not a base: no Thread is on it.
@@ -399,6 +438,34 @@ impl SessionView {
         }
         let (first, last) = if start.0 == side { (start.1.min(end.1), start.1.max(end.1)) } else { (end.1, end.1) };
         Some(Anchor::lines(side, path, first..=last))
+    }
+
+    /// Whether a Thread can be opened at `anchor` now: it must fit the Changeset Threads are
+    /// anchored in (`InvalidAnchor`), and a Forge takes line Comments only within its diff's
+    /// hunks (`OutsideDiff`).
+    pub fn check_anchor(&self, anchor: &Anchor) -> Result<(), Error> {
+        self.excerpt_at(anchor).map(drop)
+    }
+
+    /// Where a Comment can go when the Forge refuses `anchor`'s lines: their whole file. `None`
+    /// when `anchor` isn't refused that way.
+    pub fn fallback_anchor(&self, anchor: &Anchor) -> Option<Anchor> {
+        match self.check_anchor(anchor) {
+            Err(Error::OutsideDiff { path, .. }) => Some(Anchor::file(path)),
+            _ => None,
+        }
+    }
+
+    /// The code a Thread at `anchor` would be written against, once `check_anchor` passes.
+    fn excerpt_at(&self, anchor: &Anchor) -> Result<String, Error> {
+        let excerpt = anchor.excerpt(self.anchored_in()).map_err(Error::InvalidAnchor)?;
+        if !self.changeset.takes_comment_at(anchor) {
+            let Anchor::Lines { path, side, start, end } = anchor.clone() else {
+                unreachable!("only line ranges are refused")
+            };
+            return Err(Error::OutsideDiff { path, side, start, end });
+        }
+        Ok(excerpt)
     }
 
     /// The Round the agent is working on during its Turn: the last one handed over. `None` in
@@ -436,6 +503,17 @@ pub struct PlacedThread {
     pub thread: ThreadId,
 }
 
+/// What a Session's tab marks it with (`SessionView::mark`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionMark {
+    /// It became the human's Turn while another tab was displayed.
+    Attention,
+    /// Files changed on disk, or the Pull Request received pushes: a reload is on offer.
+    ReloadOffered,
+    /// The agent is working on a Round.
+    AgentsTurn,
+}
+
 /// Which of a Session's Changesets the human is looking at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,8 +526,6 @@ pub enum ChangesetView {
     #[default]
     Full,
 }
-
-type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
 
 /// A Session as the service keeps it, and as the store saves it: every field but the waiter
 /// survives a restart, and a field missing from an older saved Session takes its `Default`.
@@ -488,11 +564,7 @@ impl Session {
     /// Opens a Thread at `anchor` whose first Comment is `author`'s Draft `comment` (already
     /// checked with `check_comment`).
     fn open_thread(&mut self, anchor: Anchor, comment: NewComment, author: Party) -> Result<ThreadId, Error> {
-        let excerpt = anchor.excerpt(self.view.anchored_in()).map_err(Error::InvalidAnchor)?;
-        if !self.view.changeset.takes_comment_at(&anchor) {
-            let Anchor::Lines { path, side, start, end } = anchor else { unreachable!("only line ranges are refused") };
-            return Err(Error::OutsideDiff { path, side, start, end });
-        }
+        let excerpt = self.view.excerpt_at(&anchor)?;
         self.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", self.threads_opened));
         let NewComment { body, suggestion } = comment;
@@ -527,24 +599,25 @@ impl Session {
     /// Round, as on each re-attach.
     fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
         self.disk_checked = None;
-        let view = &mut self.view;
-        let before = view.anchored_in().clone();
-        for file in changeset.since(&view.changeset).files {
-            view.viewed.remove(&file.path);
-        }
-        view.changeset = changeset;
-        view.since_session_base = since_session_base;
-        view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
-        view.changed_on_disk.clear();
-        if default_view && view.since_last_round.is_some() {
-            view.view = ChangesetView::SinceLastRound;
-        }
-        // Threads follow the Changeset they are anchored in.
-        if view.anchored_in() != &before {
-            let mut threads = std::mem::take(&mut view.threads);
-            reanchor(&mut threads, view.anchored_in());
-            view.threads = threads;
-        }
+        self.view.change_shown(|view| {
+            let before = view.anchored_in().clone();
+            for file in changeset.since(&view.changeset).files {
+                view.viewed.remove(&file.path);
+            }
+            view.changeset = changeset;
+            view.since_session_base = since_session_base;
+            view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
+            view.changed_on_disk.clear();
+            if default_view && view.since_last_round.is_some() {
+                view.view = ChangesetView::SinceLastRound;
+            }
+            // Threads follow the Changeset they are anchored in.
+            if view.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut view.threads);
+                reanchor(&mut threads, view.anchored_in());
+                view.threads = threads;
+            }
+        });
     }
 }
 
@@ -564,9 +637,6 @@ struct Inner {
     settings: Settings,
     /// Session bases from `start`, by repository and branch, kept until the Session ends.
     session_bases: HashMap<(PathBuf, String), String>,
-    subscribers: Vec<Subscriber>,
-    /// The Session whose tab the human has open.
-    displayed: Option<SessionId>,
     /// Whether the human is looking at akshually's window.
     window_focused: bool,
     notifier: Option<Box<dyn Notifier>>,
@@ -574,23 +644,17 @@ struct Inner {
     show_window: Option<Box<dyn Fn(Option<String>) + Send>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
-    inbox: inbox::InboxState,
-    diff_layout: DiffLayout,
+    inbox: inbox::Inbox,
+    window: window::Window,
 }
 
 impl Inner {
-    /// The Session at `at` became the human's Turn. It never takes the view: unless it's
-    /// displayed it gets attention. With nothing displayed, there's no view to take, so it's
-    /// displayed instead.
+    /// The Session at `at` became the human's Turn: it takes the view from an Inbox the Window
+    /// fell back to, and otherwise gets attention unless it's displayed (`humans_turn_display`).
     fn became_humans_turn(&mut self, at: usize) {
-        let view = &mut self.sessions[at].view;
-        view.turn = Turn::Human;
-        match &self.displayed {
-            // The Inbox is displayed: it keeps the view.
-            None if self.inbox.displayed => view.attention = true,
-            None => self.displayed = Some(view.id.clone()),
-            Some(displayed) => view.attention = displayed != &view.id,
-        }
+        self.sessions[at].view.turn = Turn::Human;
+        self.humans_turn_display(at);
+        let view = &self.sessions[at].view;
         // The window may have been closed (the app keeps running): bring it back.
         if let Some(show) = &self.show_window {
             show(None);
@@ -609,9 +673,7 @@ impl Inner {
     fn reap(&mut self) {
         while let Some(at) = self.sessions.iter().position(|s| s.finished) {
             let session = self.sessions.remove(at);
-            if self.displayed.as_ref() == Some(&session.view.id) {
-                self.displayed = None;
-            }
+            self.session_gone(&session.view.id);
             if let Source::Local { repo, branch } = session.view.source {
                 self.session_bases.remove(&(repo, branch));
             }
@@ -646,16 +708,10 @@ impl Inner {
         }
     }
 
-    /// Publishes a change: saves it, then tells subscribers, the Inbox's too.
+    /// Publishes a change: saves it, then tells the Window subscribers.
     fn notify(&mut self) {
         self.save();
-        if !self.subscribers.is_empty() {
-            let views = self.views();
-            for subscriber in &self.subscribers {
-                subscriber(&views);
-            }
-        }
-        self.tell_inbox_subscribers();
+        self.tell_window_subscribers();
     }
 }
 
@@ -702,8 +758,8 @@ impl Service {
             }
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
-        inner.inbox.saved = store.load_inbox();
-        inner.diff_layout = store.load_diff_layout();
+        inner.inbox = store.load_inbox();
+        inner.window.diff_layout = store.load_diff_layout();
         inner.store = Some(store);
         Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
     }
@@ -731,8 +787,8 @@ impl Service {
 
     /// The UI: `f` brings its window up, given the XDG activation token of the launch that
     /// asked, if any. The service asks whenever a Session becomes the human's Turn, and
-    /// `show_window` on behalf of a second launch. Like `subscribe`, `f` runs while the service
-    /// is locked: hand off, don't call back.
+    /// `show_window` on behalf of a second launch. Like `subscribe_window`, `f` runs while the
+    /// service is locked: hand off, don't call back.
     pub fn on_show_window(&self, f: impl Fn(Option<String>) + Send + 'static) {
         self.lock().show_window = Some(Box::new(f));
     }
@@ -755,12 +811,6 @@ impl Service {
         lock(&self.inner)
     }
 
-    /// Calls `f` with every Session after each change. `f` runs while the service is locked,
-    /// so it must hand the Sessions off (to a channel, a UI thread) rather than call back in.
-    pub fn subscribe(&self, f: impl Fn(&[SessionView]) + Send + 'static) {
-        self.lock().subscribers.push(Box::new(f));
-    }
-
     pub fn settings(&self) -> Settings {
         self.lock().settings.clone()
     }
@@ -778,25 +828,6 @@ impl Service {
         let inner = self.lock();
         let at = inner.position(id).ok()?;
         Some(inner.sessions[at].view.clone())
-    }
-
-    /// The Session whose tab the human has open, if any.
-    pub fn displayed(&self) -> Option<SessionId> {
-        self.lock().displayed.clone()
-    }
-
-    /// Human: opens the Session's tab, which clears its attention.
-    pub fn display(&self, id: &SessionId) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        if inner.displayed.as_ref() == Some(id) && !inner.sessions[at].view.attention {
-            return Ok(());
-        }
-        inner.displayed = Some(id.clone());
-        inner.inbox.displayed = false;
-        inner.sessions[at].view.attention = false;
-        inner.notify();
-        Ok(())
     }
 
     /// Agent: snapshots the working tree of the repository containing `cwd` as the Session
@@ -818,14 +849,16 @@ impl Service {
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at].view;
         if session.view != view {
-            let before = session.anchored_in().clone();
-            session.view = view;
-            // Threads follow the Changeset they are anchored in.
-            if session.anchored_in() != &before {
-                let mut threads = std::mem::take(&mut session.threads);
-                reanchor(&mut threads, session.anchored_in());
-                session.threads = threads;
-            }
+            session.change_shown(|session| {
+                let before = session.anchored_in().clone();
+                session.view = view;
+                // Threads follow the Changeset they are anchored in.
+                if session.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.threads);
+                    reanchor(&mut threads, session.anchored_in());
+                    session.threads = threads;
+                }
+            });
         }
         inner.notify();
         Ok(())
@@ -917,17 +950,19 @@ impl Service {
     /// A Pull Request Session with no agent has no one to tell, and a co-review of local work
     /// has no Verdict: abandoning either closes it.
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
-        let closes = self.lock().sessions.iter().any(|s| {
-            &s.view.id == id
-                && match s.view.source {
-                    Source::PullRequest(_) => s.view.agent.is_none(),
-                    Source::Local { .. } => s.view.agent == Some(Role::CoReviewer),
-                }
-        });
-        if closes {
-            return self.close(id);
+        let (end, pull_request) = {
+            let inner = self.lock();
+            let view = &inner.sessions[inner.position(id)?].view;
+            if view.ended.is_some() {
+                return Err(Error::Ended);
+            }
+            (view.actions().end, view.pull_request().is_some())
+        };
+        // Closing a Pull Request before Publish tells its co-Reviewer, if any, it was Abandoned.
+        match end {
+            Ending::Abandon if !pull_request => self.end(id, Outcome::Abandoned),
+            _ => self.close(id),
         }
-        self.end(id, Outcome::Abandoned)
     }
 
     /// Human: closes the Session. One that has its outcome already (a Verdict, Published,
@@ -975,14 +1010,8 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        if outcome == Outcome::Approved && session.view.pull_request().is_some() {
-            return Err(Error::InvalidRequest("a Pull Request is approved by publishing the Verdict".into()));
-        }
-        if outcome == Outcome::Approved && session.view.agent == Some(Role::CoReviewer) {
-            return Err(Error::InvalidRequest("a co-review of local work has no Verdict: close it".into()));
-        }
-        if outcome == Outcome::Approved && session.view.turn != Turn::Human {
-            return Err(Error::NotYourTurn);
+        if outcome == Outcome::Approved {
+            session.view.check_approve()?;
         }
         session.conclude(outcome);
         inner.reap();

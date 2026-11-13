@@ -27,7 +27,7 @@ impl Service {
     pub fn open_pull_request(&self, url: &str) -> Result<SessionId, Error> {
         let (id, pr) = self.open_pull_request_session(url, None)?;
         let mut inner = self.lock();
-        inner.inbox.saved.looked_at(&pr);
+        inner.inbox.looked_at(&pr);
         inner.notify_inbox();
         Ok(id)
     }
@@ -124,8 +124,7 @@ impl Service {
         let threads_opened = view.threads.len() as u32;
         inner.sessions.push(Session { view, threads_opened, ..Session::default() });
         if agent.is_none() {
-            inner.displayed = Some(id.clone());
-            inner.inbox.displayed = false;
+            inner.window.display_session(&id);
         }
         inner.notify();
         Ok((id, pr))
@@ -173,7 +172,7 @@ impl Service {
         // A co-Reviewer learns what went out; without one, the human closes the Session.
         session.conclude(Outcome::Published { verdict, url: url.clone() });
         inner.reap();
-        inner.inbox.saved.published(&pr.id);
+        inner.inbox.published(&pr.id);
         inner.notify();
         inner.notify_inbox();
         Ok(url)
@@ -182,7 +181,7 @@ impl Service {
     /// Sends the review of `drafts` to `pr`'s Forge, if it takes `verdict`.
     fn send_review(&self, pr: &PullRequest, verdict: Verdict, summary: &str, drafts: &Drafts) -> Result<String, Error> {
         let forge = self.forge_for(pr).ok_or_else(|| Error::NotAPullRequest(pr.url.clone()))?;
-        if !forge.verdicts(pr)?.contains(&verdict) {
+        if !forge.verdicts(pr, is_own(forge, pr)?)?.contains(&verdict) {
             return Err(Error::VerdictNotOffered(verdict));
         }
         let review = review(verdict, summary, drafts);
@@ -264,14 +263,21 @@ impl Service {
             drafts(&inner.sessions[inner.position(id)?].view)?
         };
         let forge = self.forge_for(&pr).ok_or_else(|| Error::NotAPullRequest(pr.url.clone()))?;
-        let verdicts = forge.verdicts(&pr)?;
-        Ok(PublishPlan { verdicts, kept, discarded, resolve, reopen })
+        let own = is_own(forge, &pr)?;
+        let verdicts = forge.verdicts(&pr, own)?;
+        Ok(PublishPlan { verdicts, own, kept, discarded, resolve, reopen })
     }
 
     /// The adapter serving `pr`.
     fn forge_for(&self, pr: &PullRequest) -> Option<&dyn ForgeAdapter> {
         self.forges.iter().map(|f| f.as_ref()).find(|f| f.recognise(&pr.url).as_ref() == Some(&pr.id))
     }
+}
+
+/// Whether the human wrote `pr`, as `forge` knows them. Both Forges match logins whatever
+/// their case. Blocks on the Forge.
+fn is_own(forge: &dyn ForgeAdapter, pr: &PullRequest) -> Result<bool, Error> {
+    Ok(forge.viewer()?.eq_ignore_ascii_case(&pr.author))
 }
 
 /// A Pull Request Session's Pull Request and Drafts, unless it has ended.
@@ -290,6 +296,8 @@ fn drafts(view: &SessionView) -> Result<(PullRequest, Drafts), Error> {
 pub struct PublishPlan {
     /// The Verdicts the Forge accepts here, in the order to offer them.
     pub verdicts: Vec<Verdict>,
+    /// The human wrote the Pull Request, which on GitHub leaves feedback the only Verdict.
+    pub own: bool,
     /// The Drafts Publish sends, each Thread with only its Drafts: new Threads, and replies in
     /// Threads already on the Forge.
     pub kept: Vec<Thread>,
@@ -299,6 +307,16 @@ pub struct PublishPlan {
     pub resolve: Vec<Thread>,
     /// Threads Resolved on the Forge that Publish reopens there.
     pub reopen: Vec<Thread>,
+}
+
+impl PublishPlan {
+    /// The Verdict to start from: the only one offered, or `None` when the human has a choice.
+    pub fn default_verdict(&self) -> Option<Verdict> {
+        match self.verdicts[..] {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
 }
 
 /// A Pull Request Session's Drafts, as Publish sorts them (each Thread with only its Drafts),

@@ -58,13 +58,34 @@ impl ForgeKind {
             ForgeKind::GitLab => '!',
         }
     }
+
+    /// The Forge's name, as the human reads it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub",
+            ForgeKind::GitLab => "GitLab",
+        }
+    }
+
+    /// The Forge's own public host.
+    pub fn default_host(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "github.com",
+            ForgeKind::GitLab => "gitlab.com",
+        }
+    }
+
+    /// Whether `host` is the Forge's own public host, whatever its case.
+    pub fn is_default_host(self, host: &str) -> bool {
+        host.eq_ignore_ascii_case(self.default_host())
+    }
 }
 
 /// Every host to serve: `configured`, plus github.com unless configured.
 pub(super) fn with_github_com(configured: &[HostConfig]) -> Vec<HostConfig> {
     let mut hosts = configured.to_vec();
-    if !hosts.iter().any(|h| h.kind == ForgeKind::GitHub && h.host.eq_ignore_ascii_case("github.com")) {
-        hosts.insert(0, HostConfig::new(ForgeKind::GitHub, "github.com"));
+    if !hosts.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host)) {
+        hosts.insert(0, HostConfig::new(ForgeKind::GitHub, ForgeKind::GitHub.default_host()));
     }
     hosts
 }

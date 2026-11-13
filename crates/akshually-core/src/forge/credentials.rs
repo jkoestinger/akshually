@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::{ForgeError, HostConfig};
+use super::{ForgeError, ForgeKind, HostConfig};
 
 /// Where tokens come from, injectable so tests use a fake `gh`/`glab` and a controlled
 /// environment.
@@ -38,7 +38,7 @@ impl CredentialSources {
     /// Enterprise, `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`, as `gh` does, so a
     /// github.com token never goes to another host), then the pasted one.
     pub(crate) fn github_token(&self, host: &HostConfig) -> Option<String> {
-        let vars: &[&str] = if host.host.eq_ignore_ascii_case("github.com") {
+        let vars: &[&str] = if ForgeKind::GitHub.is_default_host(&host.host) {
             &["GITHUB_TOKEN"]
         } else {
             &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]

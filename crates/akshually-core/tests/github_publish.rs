@@ -64,22 +64,30 @@ fn pull_request(author: &str) -> PullRequest {
 // --- Verdicts ---
 
 #[test]
-fn every_verdict_is_offered_on_someone_else_s_pull_request() {
+fn the_viewer_is_the_login_of_the_token_s_user() {
     let mut h = Harness::new();
     let viewer = h.viewer("lee");
 
-    let verdicts = h.github().verdicts(&pull_request("maria")).unwrap();
+    let login = h.github().viewer().unwrap();
 
     viewer.assert();
+    assert_eq!(login, "lee");
+}
+
+#[test]
+fn every_verdict_is_offered_on_someone_else_s_pull_request() {
+    let h = Harness::new();
+
+    let verdicts = h.github().verdicts(&pull_request("maria"), false).unwrap();
+
     assert_eq!(verdicts, vec![Verdict::Approve, Verdict::RequestChanges, Verdict::Feedback]);
 }
 
 #[test]
 fn only_feedback_is_offered_on_your_own_pull_request() {
-    let mut h = Harness::new();
-    h.viewer("Maria");
+    let h = Harness::new();
 
-    let verdicts = h.github().verdicts(&pull_request("maria")).unwrap();
+    let verdicts = h.github().verdicts(&pull_request("maria"), true).unwrap();
 
     assert_eq!(verdicts, vec![Verdict::Feedback], "GitHub refuses to let authors approve or request changes");
 }

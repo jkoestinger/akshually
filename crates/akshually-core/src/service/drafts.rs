@@ -37,12 +37,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        if session.view.turn != Turn::Human {
-            return Err(Error::NotYourTurn);
-        }
+        session.view.check_hand_over()?;
         let number = session.view.round;
         let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
@@ -65,16 +60,14 @@ impl Service {
                 thread.reopened = false;
             }
         }
-        if threads.is_empty() {
-            return Err(Error::NoDrafts);
-        }
         session.view.round += 1;
         session.view.turn = Turn::Agent;
         // The agent's next `review` refreshes the Changeset anyway.
         session.view.changed_on_disk.clear();
-        session.view.since_last_round =
-            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
-        let replaced = session.view.last_round.replace(session.view.changeset.clone());
+        let replaced = session.view.change_shown(|view| {
+            view.since_last_round = Some(Changeset { base: view.changeset.base.clone(), files: Vec::new() });
+            view.last_round.replace(view.changeset.clone())
+        });
         session.replaced_last_rounds.push((number, replaced));
         session.queued.push(Outcome::Round(Round { number, threads }));
         session.deliver();
@@ -88,12 +81,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        if session.view.ended.is_some() {
-            return Err(Error::Ended);
-        }
-        if session.view.turn == Turn::Human {
-            return Err(Error::AlreadyYourTurn);
-        }
+        session.view.check_take_turn_back()?;
         // Rounds no agent received yet go back to being Drafts, for the human to keep editing,
         // and the last Round is the one before them again.
         let first = session.queued.iter().find_map(|o| match o {
@@ -122,11 +110,13 @@ impl Service {
                 // The withdrawn Rounds' entries go too.
                 let (_, last_round) =
                     session.replaced_last_rounds.drain(at..).next().expect("`at` is in `replaced_last_rounds`");
-                session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
-                session.view.last_round = last_round;
-                if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {
-                    session.view.view = ChangesetView::Full;
-                }
+                session.view.change_shown(|view| {
+                    view.since_last_round = last_round.as_ref().map(|s| view.changeset.since(s));
+                    view.last_round = last_round;
+                    if view.since_last_round.is_none() && view.view == ChangesetView::SinceLastRound {
+                        view.view = ChangesetView::Full;
+                    }
+                });
             }
         }
         inner.became_humans_turn(at);
@@ -167,11 +157,12 @@ impl Service {
     ) -> Result<T, Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let threads = &mut inner.sessions[at].view.threads;
-        let found = threads.iter().position(|t| &t.id == thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
-        if !threads[found].comments.first().is_some_and(Comment::is_agent_draft) {
+        let view = &mut inner.sessions[at].view;
+        if !view.thread_offered(thread)?.agent_draft {
             return Err(Error::NotAnAgentDraft(thread.clone()));
         }
+        let threads = &mut view.threads;
+        let found = threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
         let result = f(threads, found);
         inner.notify();
         Ok(result)

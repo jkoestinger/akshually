@@ -1,8 +1,8 @@
 //! Seam C: the GitLab adapter at the HTTP boundary, against a mock server, a fake `glab` and a
-//! controlled environment. Nothing here reaches the network or real credentials.
+//! controlled environment: GitLab's endpoints, error body and credentials; what every adapter does
+//! the same is in `forge_http.rs`. Nothing here reaches the network or real credentials.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use akshually_core::forge::{
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
 use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
-use akshually_testkit::{TestDirs, threaded_http_server};
+use akshually_testkit::{TestDirs, fake_cli, threaded_http_server};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value, json};
 
@@ -25,19 +25,14 @@ fn fixture(name: &str) -> String {
 /// A `glab` that prints `token` for `config get token --host <host>` and prints nothing
 /// otherwise (as glab does for an unset key).
 fn fake_glab(dir: &Path, host: &str, token: &str) -> PathBuf {
-    let glab = dir.join("glab");
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\nif [ \"$*\" = 'config get token --host {host}' ]; then echo '{token}'; fi\nexit 0\n"
-    );
-    std::fs::write(&glab, script).unwrap();
-    std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // A child forked by another test thread while the script was open for writing keeps it
-    // "busy" (ETXTBSY) until that child execs; wait for it to be runnable.
-    while let Err(e) = std::process::Command::new(&glab).arg("--probe").status() {
-        assert_eq!(e.raw_os_error(), Some(26), "can't run the fake glab: {e}");
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    glab
+    fake_cli(
+        &dir.join("glab"),
+        &format!(
+            "if [ \"$*\" = 'config get token --host {host}' ]; then echo '{token}'; fi
+exit 0
+"
+        ),
+    )
 }
 
 /// A mock GitLab API, and the adapter for one host pointed at it.
@@ -475,17 +470,6 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!(inbox[1].created_at, 1_794_308_400);
 }
 
-#[test]
-fn a_refused_token_fails_the_inbox() {
-    let mut h = Harness::new();
-    let gitlab = h.gitlab();
-    h.server.mock("GET", "/user").with_status(401).with_body(r#"{"message":"401 Unauthorized"}"#).create();
-
-    let error = gitlab.inbox().unwrap_err();
-
-    assert!(matches!(error, ForgeError::Unauthorized { status: 401, .. }), "{error:?}");
-}
-
 // --- Credentials: `glab`, then the environment, then the pasted token ---
 
 impl Harness {
@@ -494,18 +478,6 @@ impl Harness {
         let config = HostConfig { token: pasted.map(Into::into), ..self.host(host) };
         GitLab::new(config, sources).pull_request(&PullRequestRef { host: host.into(), ..mr_ref() }).map(drop)
     }
-}
-
-#[test]
-fn the_token_comes_from_glab_first() {
-    let mut h = Harness::new();
-    let mock = h.get("/projects/platform%2Finfra/merge_requests/97", "from-glab", &fixture("mr.json"));
-    let env = [("GITLAB_HOST", "gitlab.example.com"), ("GITLAB_TOKEN", "from-env")];
-    let sources = h.sources(Some(("gitlab.example.com", "from-glab")), &env);
-
-    h.fetch_with("gitlab.example.com", sources, Some("pasted")).unwrap();
-
-    mock.assert();
 }
 
 #[test]
@@ -546,23 +518,6 @@ fn gitlab_token_never_goes_to_another_host() {
 }
 
 #[test]
-fn with_no_token_anywhere_nothing_is_sent() {
-    let mut h = Harness::new();
-    let mock = h.server.mock("GET", Matcher::Any).expect(0).create();
-    let sources = h.sources(None, &[("GITLAB_HOST", "gitlab.other.com"), ("GITLAB_TOKEN", "from-env")]);
-
-    let error = h.fetch_with("gitlab.example.com", sources, None).unwrap_err();
-
-    mock.assert();
-    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "gitlab.example.com"), "{error:?}");
-    let message = error.to_string();
-    assert!(message.contains("glab auth login --hostname gitlab.example.com"), "{message}");
-    let paste = "/home/me/.config/akshually/config.toml:\n\n[[hosts]]\nkind = \"gitlab\"\n\
-                 host = \"gitlab.example.com\"\ntoken = \"<your token>\"";
-    assert!(message.contains(paste), "{message}");
-}
-
-#[test]
 fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads() {
     let mut h = Harness::new();
     h.get("/projects/platform%2Finfra/merge_requests/97", TOKEN, &fixture("mr.json"));
@@ -588,20 +543,6 @@ fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads()
     assert_eq!(thread.anchor, Anchor::lines(Side::New, "src/a.rs", 1..=1));
     assert_eq!(thread.excerpt, "fn a2() {}\n");
     assert_eq!(thread.comments[0].author, Party::Other("lee".into()));
-}
-
-#[test]
-fn a_missing_merge_request_is_not_found() {
-    let mut h = Harness::new();
-    h.server
-        .mock("GET", "/projects/platform%2Finfra/merge_requests/97")
-        .with_status(404)
-        .with_body(r#"{"message":"404 Not found"}"#)
-        .create();
-
-    let error = h.gitlab().pull_request(&mr_ref()).unwrap_err();
-
-    assert!(matches!(&error, ForgeError::NotFound(what) if what.contains("platform/infra")), "{error:?}");
 }
 
 #[test]
@@ -639,31 +580,41 @@ impl Harness {
 #[test]
 fn gitlab_offers_the_verdicts_its_version_and_approval_rules_allow() {
     use Verdict::*;
-    // (GitLab's version, the human, can approve, has approved) and what's offered.
+    // (GitLab's version, the human's own, can approve, has approved) and what's offered.
     let cases = [
-        ("19.2.0-ee", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
-        ("19.10.1", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
-        ("20.0.0", "lee", true, false, vec![Approve, RequestChanges, Feedback]),
+        ("19.2.0-ee", false, true, false, vec![Approve, RequestChanges, Feedback]),
+        ("19.10.1", false, true, false, vec![Approve, RequestChanges, Feedback]),
+        ("20.0.0", false, true, false, vec![Approve, RequestChanges, Feedback]),
         // Requesting changes through the API came with GitLab 19.2.
-        ("19.1.3-ee", "lee", true, false, vec![Approve, Feedback]),
-        ("18.11.0", "lee", true, false, vec![Approve, Feedback]),
+        ("19.1.3-ee", false, true, false, vec![Approve, Feedback]),
+        ("18.11.0", false, true, false, vec![Approve, Feedback]),
         // Approval rules (or the author approving their own) decide approving.
-        ("19.2.0", "lee", false, false, vec![RequestChanges, Feedback]),
+        ("19.2.0", false, false, false, vec![RequestChanges, Feedback]),
         // Approving again keeps the approval.
-        ("19.2.0", "lee", false, true, vec![Approve, RequestChanges, Feedback]),
+        ("19.2.0", false, false, true, vec![Approve, RequestChanges, Feedback]),
         // Authors can't request changes on their own merge request.
-        ("19.2.0", "tom", false, false, vec![Feedback]),
+        ("19.2.0", true, false, false, vec![Feedback]),
     ];
-    for (version, me, can, has, offered) in cases {
+    for (version, own, can, has, offered) in cases {
         let mut h = Harness::new();
         h.version(version);
-        h.user(me);
         h.approvals(can, has);
 
-        let verdicts = h.gitlab().verdicts(&rotate_creds()).unwrap();
+        let verdicts = h.gitlab().verdicts(&rotate_creds(), own).unwrap();
 
-        assert_eq!(verdicts, offered, "GitLab {version} as {me}, can approve {can}, has approved {has}");
+        assert_eq!(verdicts, offered, "GitLab {version}, own {own}, can approve {can}, has approved {has}");
     }
+}
+
+#[test]
+fn the_gitlab_viewer_is_the_username_of_the_token_s_user() {
+    let mut h = Harness::new();
+    let user = h.user("lee");
+
+    let username = h.gitlab().viewer().unwrap();
+
+    user.assert();
+    assert_eq!(username, "lee");
 }
 
 // --- Publish: draft notes, then the Verdict ---

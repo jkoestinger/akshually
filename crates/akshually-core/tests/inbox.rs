@@ -6,7 +6,7 @@ use std::time::Duration;
 use akshually_core::forge::{
     ForgeAdapter, ForgeError, ForgeKind, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, FileChange, InboxRowState, ReviewRequest, Service, Side, Verdict};
+use akshually_core::{Anchor, Changeset, Displayed, FileChange, InboxRowState, ReviewRequest, Service, Side, Verdict};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 
 /// One Forge host whose Inbox the test sets, serving each listed Pull Request.
@@ -80,7 +80,11 @@ impl ForgeAdapter for FakeForge {
         self.inbox.lock().unwrap().clone().map_err(|message| ForgeError::Http { host: self.host.into(), message })
     }
 
-    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
         Ok(Verdict::ALL.to_vec())
     }
 
@@ -230,8 +234,7 @@ fn displaying_the_inbox_clears_its_attention() {
     svc.display_inbox();
 
     assert!(!svc.inbox().attention);
-    assert!(svc.inbox_displayed());
-    assert_eq!(svc.displayed(), None);
+    assert_eq!(svc.window().displayed, Displayed::Inbox);
 }
 
 #[test]
@@ -273,7 +276,7 @@ fn a_session_needing_the_human_while_the_inbox_is_displayed_gets_attention() {
 
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    assert_eq!(svc.displayed(), None, "the Inbox keeps the view");
+    assert_eq!(svc.window().displayed, Displayed::Inbox, "the Inbox keeps the view");
     assert!(svc.session(pending.session()).unwrap().attention);
 }
 
@@ -285,18 +288,17 @@ fn opening_a_session_leaves_the_inbox() {
 
     let id = svc.open_pull_request("https://github.com/acme/web/pull/3").unwrap();
 
-    assert!(!svc.inbox_displayed());
-    assert_eq!(svc.displayed(), Some(id));
+    assert_eq!(svc.window().displayed, Displayed::Session(id));
 }
 
 #[test]
-fn inbox_subscribers_hear_of_each_refresh() {
+fn window_subscribers_hear_of_each_inbox_refresh() {
     let github = FakeForge::new("github.com");
     github.lists(vec![github.item(1, InboxRole::Reviewer, 100)]);
     let svc = service(&[&github]);
     let heard = Arc::new(Mutex::new(Vec::new()));
     let sink = heard.clone();
-    svc.subscribe_inbox(move |inbox| sink.lock().unwrap().push(inbox.rows.len()));
+    svc.subscribe_window(move |window| sink.lock().unwrap().push(window.inbox.rows.len()));
 
     svc.refresh_inbox();
 
@@ -365,7 +367,7 @@ fn a_pull_request_listed_as_assignee_and_reviewer_is_a_review_request() {
 }
 
 #[test]
-fn inbox_subscribers_hear_when_a_session_changes_a_rows_state() {
+fn window_subscribers_hear_when_a_session_changes_an_inbox_rows_state() {
     let github = FakeForge::new("github.com");
     github.lists(vec![github.item(1, InboxRole::Reviewer, 100)]);
     let svc = service(&[&github]);
@@ -373,7 +375,7 @@ fn inbox_subscribers_hear_when_a_session_changes_a_rows_state() {
     let id = svc.open_pull_request("https://github.com/acme/web/pull/1").unwrap();
     let heard = Arc::new(Mutex::new(Vec::new()));
     let sink = heard.clone();
-    svc.subscribe_inbox(move |inbox| sink.lock().unwrap().push(inbox.rows[0].state.clone()));
+    svc.subscribe_window(move |window| sink.lock().unwrap().push(window.inbox.rows[0].state.clone()));
 
     svc.comment(&id, Anchor::file("a.rs"), "Why b?").unwrap();
 

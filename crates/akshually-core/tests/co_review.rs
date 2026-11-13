@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{
-    Anchor, Changeset, Error, FileChange, NewComment, Outcome, Party, ReviewRequest, Role, Service, Side, ThreadRef,
-    Turn, Verdict,
+    Anchor, Changeset, Displayed, Error, FileChange, NewComment, Outcome, Party, ReviewRequest, Role, Service, Side,
+    ThreadRef, Turn, Verdict,
 };
 use akshually_testkit::TestRepo;
 
@@ -54,7 +54,11 @@ impl ForgeAdapter for FakeForge {
         Ok(Vec::new())
     }
 
-    fn verdicts(&self, _: &PullRequest) -> Result<Vec<Verdict>, ForgeError> {
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
         Ok(Verdict::ALL.to_vec())
     }
 
@@ -134,7 +138,7 @@ fn an_agent_draft_does_not_take_the_view_from_the_human() {
 
     svc.draft(URL, Anchor::Review, "Small and clear.").unwrap();
 
-    assert_eq!(svc.displayed(), Some(mine.clone()));
+    assert_eq!(svc.window().displayed, Displayed::Session(mine.clone()));
     let session = svc.session(&mine).unwrap();
     assert_eq!(session.agent, Some(Role::CoReviewer));
     assert_eq!(session.turn, Turn::Human, "the human was reviewing already");
@@ -348,7 +352,7 @@ fn a_draft_on_local_work_opens_its_session_with_the_agent_as_co_reviewer() {
     assert_eq!(session.changeset.files[0].path, "lib.rs");
     assert_eq!(session.threads[0].id, thread);
     assert!(session.threads.iter().all(|t| t.comments[0].is_agent_draft()));
-    assert_eq!(svc.displayed(), None, "the human isn't asked until the agent calls `review`");
+    assert_eq!(svc.window().displayed, Displayed::Inbox, "the human isn't asked until the agent calls `review`");
 }
 
 #[test]
