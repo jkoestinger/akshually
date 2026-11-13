@@ -16,19 +16,19 @@ use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 mod actions;
 mod co_review;
-mod diff_layout;
 mod disk;
 mod drafts;
 mod handoff;
 mod inbox;
 mod pull_request;
 mod threads;
+mod window;
 
 pub use actions::{Ending, HandOver, SessionActions, ThreadActions, VerdictAction};
-pub use diff_layout::DiffLayout;
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
+pub use window::{DiffLayout, Displayed, WindowView};
 
 use handoff::{Call, Waiter};
 
@@ -281,6 +281,9 @@ pub struct SessionView {
     pub agent: Option<Role>,
     /// The full Changeset.
     pub changeset: Changeset,
+    /// Moves whenever the Changeset shown changes: a refresh, a reload, or the human switching
+    /// Changeset views. It stays put otherwise, so the UI rebuilds its diff only when it moves.
+    pub changeset_rev: u64,
     /// The Round being drafted: 1 until the first handover, then one more after each.
     pub round: u32,
     /// Whether an agent's `review` call is connected and waiting for the human. A Round handed
@@ -391,6 +394,17 @@ impl SessionView {
             ChangesetView::SinceLastRound => &self.changeset,
             _ => self.shown(),
         }
+    }
+
+    /// Makes `change`, then moves `changeset_rev` if the Changeset shown is no longer the one it
+    /// was. Every change that can alter the Changeset shown goes through here.
+    pub(super) fn change_shown<T>(&mut self, change: impl FnOnce(&mut SessionView) -> T) -> T {
+        let before = self.shown().clone();
+        let changed = change(self);
+        if self.shown() != &before {
+            self.changeset_rev += 1;
+        }
+        changed
     }
 
     /// Since the last Round, the old side is that Round's code, not a base: no Thread is on it.
@@ -513,8 +527,6 @@ pub enum ChangesetView {
     Full,
 }
 
-type Subscriber = Box<dyn Fn(&[SessionView]) + Send>;
-
 /// A Session as the service keeps it, and as the store saves it: every field but the waiter
 /// survives a restart, and a field missing from an older saved Session takes its `Default`.
 #[derive(Default, Serialize, Deserialize)]
@@ -587,24 +599,25 @@ impl Session {
     /// Round, as on each re-attach.
     fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
         self.disk_checked = None;
-        let view = &mut self.view;
-        let before = view.anchored_in().clone();
-        for file in changeset.since(&view.changeset).files {
-            view.viewed.remove(&file.path);
-        }
-        view.changeset = changeset;
-        view.since_session_base = since_session_base;
-        view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
-        view.changed_on_disk.clear();
-        if default_view && view.since_last_round.is_some() {
-            view.view = ChangesetView::SinceLastRound;
-        }
-        // Threads follow the Changeset they are anchored in.
-        if view.anchored_in() != &before {
-            let mut threads = std::mem::take(&mut view.threads);
-            reanchor(&mut threads, view.anchored_in());
-            view.threads = threads;
-        }
+        self.view.change_shown(|view| {
+            let before = view.anchored_in().clone();
+            for file in changeset.since(&view.changeset).files {
+                view.viewed.remove(&file.path);
+            }
+            view.changeset = changeset;
+            view.since_session_base = since_session_base;
+            view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
+            view.changed_on_disk.clear();
+            if default_view && view.since_last_round.is_some() {
+                view.view = ChangesetView::SinceLastRound;
+            }
+            // Threads follow the Changeset they are anchored in.
+            if view.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut view.threads);
+                reanchor(&mut threads, view.anchored_in());
+                view.threads = threads;
+            }
+        });
     }
 }
 
@@ -624,9 +637,6 @@ struct Inner {
     settings: Settings,
     /// Session bases from `start`, by repository and branch, kept until the Session ends.
     session_bases: HashMap<(PathBuf, String), String>,
-    subscribers: Vec<Subscriber>,
-    /// The Session whose tab the human has open.
-    displayed: Option<SessionId>,
     /// Whether the human is looking at akshually's window.
     window_focused: bool,
     notifier: Option<Box<dyn Notifier>>,
@@ -634,23 +644,17 @@ struct Inner {
     show_window: Option<Box<dyn Fn(Option<String>) + Send>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
-    inbox: inbox::InboxState,
-    diff_layout: DiffLayout,
+    inbox: inbox::Inbox,
+    window: window::Window,
 }
 
 impl Inner {
-    /// The Session at `at` became the human's Turn. It never takes the view: unless it's
-    /// displayed it gets attention. With nothing displayed, there's no view to take, so it's
-    /// displayed instead.
+    /// The Session at `at` became the human's Turn: it takes the view from an Inbox the Window
+    /// fell back to, and otherwise gets attention unless it's displayed (`humans_turn_display`).
     fn became_humans_turn(&mut self, at: usize) {
-        let view = &mut self.sessions[at].view;
-        view.turn = Turn::Human;
-        match &self.displayed {
-            // The Inbox is displayed: it keeps the view.
-            None if self.inbox.displayed => view.attention = true,
-            None => self.displayed = Some(view.id.clone()),
-            Some(displayed) => view.attention = displayed != &view.id,
-        }
+        self.sessions[at].view.turn = Turn::Human;
+        self.humans_turn_display(at);
+        let view = &self.sessions[at].view;
         // The window may have been closed (the app keeps running): bring it back.
         if let Some(show) = &self.show_window {
             show(None);
@@ -669,9 +673,7 @@ impl Inner {
     fn reap(&mut self) {
         while let Some(at) = self.sessions.iter().position(|s| s.finished) {
             let session = self.sessions.remove(at);
-            if self.displayed.as_ref() == Some(&session.view.id) {
-                self.displayed = None;
-            }
+            self.session_gone(&session.view.id);
             if let Source::Local { repo, branch } = session.view.source {
                 self.session_bases.remove(&(repo, branch));
             }
@@ -706,16 +708,10 @@ impl Inner {
         }
     }
 
-    /// Publishes a change: saves it, then tells subscribers, the Inbox's too.
+    /// Publishes a change: saves it, then tells the Window subscribers.
     fn notify(&mut self) {
         self.save();
-        if !self.subscribers.is_empty() {
-            let views = self.views();
-            for subscriber in &self.subscribers {
-                subscriber(&views);
-            }
-        }
-        self.tell_inbox_subscribers();
+        self.tell_window_subscribers();
     }
 }
 
@@ -762,8 +758,8 @@ impl Service {
             }
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
-        inner.inbox.saved = store.load_inbox();
-        inner.diff_layout = store.load_diff_layout();
+        inner.inbox = store.load_inbox();
+        inner.window.diff_layout = store.load_diff_layout();
         inner.store = Some(store);
         Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
     }
@@ -791,8 +787,8 @@ impl Service {
 
     /// The UI: `f` brings its window up, given the XDG activation token of the launch that
     /// asked, if any. The service asks whenever a Session becomes the human's Turn, and
-    /// `show_window` on behalf of a second launch. Like `subscribe`, `f` runs while the service
-    /// is locked: hand off, don't call back.
+    /// `show_window` on behalf of a second launch. Like `subscribe_window`, `f` runs while the
+    /// service is locked: hand off, don't call back.
     pub fn on_show_window(&self, f: impl Fn(Option<String>) + Send + 'static) {
         self.lock().show_window = Some(Box::new(f));
     }
@@ -815,12 +811,6 @@ impl Service {
         lock(&self.inner)
     }
 
-    /// Calls `f` with every Session after each change. `f` runs while the service is locked,
-    /// so it must hand the Sessions off (to a channel, a UI thread) rather than call back in.
-    pub fn subscribe(&self, f: impl Fn(&[SessionView]) + Send + 'static) {
-        self.lock().subscribers.push(Box::new(f));
-    }
-
     pub fn settings(&self) -> Settings {
         self.lock().settings.clone()
     }
@@ -838,25 +828,6 @@ impl Service {
         let inner = self.lock();
         let at = inner.position(id).ok()?;
         Some(inner.sessions[at].view.clone())
-    }
-
-    /// The Session whose tab the human has open, if any.
-    pub fn displayed(&self) -> Option<SessionId> {
-        self.lock().displayed.clone()
-    }
-
-    /// Human: opens the Session's tab, which clears its attention.
-    pub fn display(&self, id: &SessionId) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        if inner.displayed.as_ref() == Some(id) && !inner.sessions[at].view.attention {
-            return Ok(());
-        }
-        inner.displayed = Some(id.clone());
-        inner.inbox.displayed = false;
-        inner.sessions[at].view.attention = false;
-        inner.notify();
-        Ok(())
     }
 
     /// Agent: snapshots the working tree of the repository containing `cwd` as the Session
@@ -878,14 +849,16 @@ impl Service {
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at].view;
         if session.view != view {
-            let before = session.anchored_in().clone();
-            session.view = view;
-            // Threads follow the Changeset they are anchored in.
-            if session.anchored_in() != &before {
-                let mut threads = std::mem::take(&mut session.threads);
-                reanchor(&mut threads, session.anchored_in());
-                session.threads = threads;
-            }
+            session.change_shown(|session| {
+                let before = session.anchored_in().clone();
+                session.view = view;
+                // Threads follow the Changeset they are anchored in.
+                if session.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.threads);
+                    reanchor(&mut threads, session.anchored_in());
+                    session.threads = threads;
+                }
+            });
         }
         inner.notify();
         Ok(())

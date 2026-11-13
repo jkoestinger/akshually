@@ -27,11 +27,11 @@ fn window(service: &Arc<Service>) -> Runtime<State> {
     rt
 }
 
-/// Hands the service's Sessions to the window, as its subscriber does, and rebuilds the view.
-fn deliver_sessions(rt: &mut Runtime<State>, service: &Service) {
-    let sessions = service.sessions();
+/// Hands the service's Window to the window, as its subscriber does, and rebuilds the view.
+fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
+    let window = service.window();
     rt.update_if(move |s: &mut State, _| {
-        s.apply(sessions);
+        s.apply(window);
         true
     });
     rt.frame(0.0);
@@ -78,11 +78,11 @@ fn a_session_arriving_after_the_switch_opens_in_the_current_layout() {
     pick_side_by_side(&mut rt);
 
     let pending_b = service.review(ReviewRequest::new(repo_b.path())).unwrap();
-    deliver_sessions(&mut rt, &service);
+    deliver_window(&mut rt, &service);
     open_tab(&mut rt, pending_b.session());
 
     assert_eq!(shown_layout(&rt), DiffLayout::SideBySide);
-    assert_eq!(service.diff_layout(), DiffLayout::SideBySide, "the service keeps the layout");
+    assert_eq!(service.window().diff_layout, DiffLayout::SideBySide, "the service keeps the layout");
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn reloading_a_session_keeps_the_current_layout() {
 
     repo.write("a.txt", "three\n");
     service.reload(pending.session()).unwrap();
-    deliver_sessions(&mut rt, &service);
+    deliver_window(&mut rt, &service);
 
     assert_eq!(shown_layout(&rt), DiffLayout::SideBySide);
 }

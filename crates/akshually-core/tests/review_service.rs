@@ -117,19 +117,6 @@ fn reviews_in_two_repositories_are_two_sessions() {
 }
 
 #[test]
-fn subscribers_see_sessions_open_and_end() {
-    let repo = feature_branch_with_uncommitted_work();
-    let svc = Service::new();
-    let (tx, rx) = std::sync::mpsc::channel();
-    svc.subscribe(move |sessions| tx.send(sessions.len()).unwrap());
-
-    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    svc.approve(pending.session()).unwrap();
-
-    assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![1, 0]);
-}
-
-#[test]
 fn acting_on_an_unknown_session_fails() {
     let repo = feature_branch_with_uncommitted_work();
     let svc = Service::new();

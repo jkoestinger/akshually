@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use akshually_core::forge::{
     ForgeAdapter, ForgeError, ForgeKind, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
 };
-use akshually_core::{Anchor, Changeset, Error, FileChange, Party, ReviewRequest, Service, Side, Turn, Verdict};
+use akshually_core::{
+    Anchor, Changeset, Displayed, Error, FileChange, Party, ReviewRequest, Service, Side, Turn, Verdict,
+};
 use akshually_testkit::{TestDirs, TestRepo};
 
 const URL: &str = "https://forge.test/acme/web/pull/7";
@@ -126,7 +128,7 @@ fn the_opened_pull_request_is_displayed_even_when_already_open() {
 
     svc.open_pull_request(URL).unwrap();
 
-    assert_eq!(svc.displayed(), Some(pr.clone()));
+    assert_eq!(svc.window().displayed, Displayed::Session(pr.clone()));
     assert!(!svc.session(&pr).unwrap().attention);
 }
 

@@ -14,6 +14,7 @@ mod config;
 mod credentials;
 mod github;
 mod gitlab;
+mod http;
 
 pub use config::{ForgeKind, HostConfig};
 pub use credentials::CredentialSources;

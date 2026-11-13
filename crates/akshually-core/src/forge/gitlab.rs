@@ -1,8 +1,6 @@
 //! The GitLab adapter, for gitlab.com and self-hosted GitLab: REST v4 for merge requests, their
 //! diffs and discussions.
 
-use std::sync::Mutex;
-
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -12,28 +10,42 @@ use ureq::{Body, RequestBuilder};
 use url::Url;
 
 use super::{
-    CredentialSources, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment,
+    CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
+    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, epoch_seconds, fetch_files,
+    http::{Client, Dialect, host_matches, not_found_as},
+    with_suggestion,
 };
-use super::{FileFetch, REQUEST_TIMEOUT, epoch_seconds, fetch_files, with_suggestion};
 use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitLab's maximum.
 const PAGE: &str = "100";
-/// The most of a file read for its contents.
-const MAX_FILE: u64 = 100 * 1024 * 1024;
+
+/// How GitLab's API takes a token and words an error.
+const DIALECT: Dialect = Dialect {
+    token: CredentialSources::gitlab_token,
+    // Every token goes as a Bearer token: glab may hold an OAuth token, which needs one, and
+    // personal access tokens work either way.
+    authorization: |token| format!("Bearer {token}"),
+    // GitLab answers `message` or `error`, and a `message` may be an object of field errors.
+    error_message: |body| {
+        #[derive(Deserialize)]
+        struct Message {
+            #[serde(alias = "error")]
+            message: Value,
+        }
+        match serde_json::from_str::<Message>(&body) {
+            Ok(Message { message: Value::String(m) }) => m,
+            Ok(Message { message }) => message.to_string(),
+            Err(_) => body,
+        }
+    },
+};
 
 /// The [`ForgeAdapter`] for one GitLab host.
 pub struct GitLab {
-    host: HostConfig,
-    /// The REST API's base URL, without a trailing `/`.
-    api: String,
+    client: Client,
     /// The path GitLab is installed under (`/gitlab`), as segments; empty at the root.
     root: Vec<String>,
-    credentials: CredentialSources,
-    /// Resolved on first use; forgotten when the host refuses it, so a fresh login is picked up.
-    token: Mutex<Option<String>>,
-    agent: ureq::Agent,
 }
 
 impl GitLab {
@@ -51,30 +63,7 @@ impl GitLab {
                 Some(path.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect())
             })
             .unwrap_or_default();
-        let agent = ureq::Agent::config_builder()
-            // Read 4xx/5xx bodies for GitLab's error messages.
-            .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
-        GitLab { host, api, root, credentials, token: Mutex::new(None), agent }
-    }
-
-    fn token(&self) -> Result<String, ForgeError> {
-        let mut cached = self.token.lock().unwrap_or_else(|e| e.into_inner());
-        if cached.is_none() {
-            *cached = self.credentials.gitlab_token(&self.host);
-        }
-        cached.clone().ok_or_else(|| self.credentials.none_for(&self.host))
-    }
-
-    /// `segments` appended to the REST base, each percent-encoded (so a project path's `/`
-    /// becomes `%2F`, as GitLab wants).
-    fn endpoint(&self, segments: &[&str]) -> Url {
-        let mut url = Url::parse(&self.api).expect("the API base is a URL");
-        url.path_segments_mut().expect("the API base is a URL with a path").pop_if_empty().extend(segments);
-        url
+        GitLab { client: Client::new(host, &api, credentials, DIALECT), root }
     }
 
     /// `projects/:id/merge_requests/:iid` followed by `rest`.
@@ -82,66 +71,29 @@ impl GitLab {
         let iid = pr.number.to_string();
         let mut segments = vec!["projects", pr.repo.as_str(), "merge_requests", iid.as_str()];
         segments.extend(rest);
-        self.endpoint(&segments)
-    }
-
-    /// Sends `request` with the token. Every token goes as a Bearer token: glab may hold an
-    /// OAuth token, which needs one, and personal access tokens work either way.
-    fn send<B>(
-        &self,
-        request: RequestBuilder<B>,
-        send: impl FnOnce(RequestBuilder<B>) -> Result<Response<Body>, ureq::Error>,
-    ) -> Result<Response<Body>, ForgeError> {
-        let request = request.header("Authorization", format!("Bearer {}", self.token()?));
-        let mut response = send(request).map_err(|e| self.http(e))?;
-        let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            return Ok(response);
-        }
-        let host = self.host.host.clone();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        Err(match status {
-            401 => {
-                *self.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                ForgeError::Unauthorized { host, status }
-            }
-            404 => ForgeError::NotFound(host),
-            _ => {
-                #[derive(Deserialize)]
-                struct Message {
-                    #[serde(alias = "error")]
-                    message: serde_json::Value,
-                }
-                let message = match serde_json::from_str::<Message>(&body) {
-                    Ok(Message { message: serde_json::Value::String(m) }) => m,
-                    Ok(Message { message }) => message.to_string(),
-                    Err(_) => body,
-                };
-                ForgeError::Api { host, status, message }
-            }
-        })
+        self.client.endpoint(&segments)
     }
 
     fn get(&self, url: &Url) -> Result<Response<Body>, ForgeError> {
-        self.send(self.agent.get(url.as_str()), RequestBuilder::call)
+        self.client.send(self.client.agent().get(url.as_str()), RequestBuilder::call)
     }
 
     fn get_json<T: DeserializeOwned>(&self, url: &Url) -> Result<T, ForgeError> {
-        self.get(url)?.body_mut().read_json().map_err(|e| self.unexpected(e))
+        self.get(url)?.body_mut().read_json().map_err(|e| self.client.unexpected(e))
     }
 
     /// `POST url` with the JSON `body`.
     fn post(&self, url: &Url, body: Value) -> Result<Response<Body>, ForgeError> {
-        self.send(self.agent.post(url.as_str()), |r| r.send_json(body))
+        self.client.send(self.client.agent().post(url.as_str()), |r| r.send_json(body))
     }
 
     /// `PUT url` with the JSON `body`.
     fn put(&self, url: &Url, body: Value) -> Result<Response<Body>, ForgeError> {
-        self.send(self.agent.put(url.as_str()), |r| r.send_json(body))
+        self.client.send(self.client.agent().put(url.as_str()), |r| r.send_json(body))
     }
 
     fn delete(&self, url: &Url) -> Result<Response<Body>, ForgeError> {
-        self.send(self.agent.delete(url.as_str()), RequestBuilder::call)
+        self.client.send(self.client.agent().delete(url.as_str()), RequestBuilder::call)
     }
 
     /// GitLab's version, as `(major, minor)`.
@@ -151,22 +103,22 @@ impl GitLab {
             /// `19.2.0-ee`.
             version: String,
         }
-        let answer: Answer = self.get_json(&self.endpoint(&["version"]))?;
+        let answer: Answer = self.get_json(&self.client.endpoint(&["version"]))?;
         let mut numbers = answer.version.split(['.', '-']).map(str::parse::<u32>);
         match (numbers.next(), numbers.next()) {
             (Some(Ok(major)), Some(Ok(minor))) => Ok((major, minor)),
-            _ => Err(self.unexpected(format!("a version of {:?}", answer.version))),
+            _ => Err(self.client.unexpected(format!("a version of {:?}", answer.version))),
         }
     }
 
     /// The merge request's diff, file by file.
     fn diffs(&self, pr: &PullRequestRef) -> Result<Vec<Diff>, ForgeError> {
-        self.pages(&self.merge_request_url(pr, &["diffs"])).map_err(|e| self.not_found_as(e, pr))
+        self.pages(&self.merge_request_url(pr, &["diffs"])).map_err(|e| not_found_as(e, pr))
     }
 
     /// Whether the human can approve `pr`, and whether they have.
     fn approvals(&self, pr: &PullRequestRef) -> Result<Approvals, ForgeError> {
-        self.get_json(&self.merge_request_url(pr, &["approvals"])).map_err(|e| self.not_found_as(e, pr))
+        self.get_json(&self.merge_request_url(pr, &["approvals"])).map_err(|e| not_found_as(e, pr))
     }
 
     /// Every item of a paginated list at `url`, following GitLab's `x-next-page` header (on
@@ -180,7 +132,7 @@ impl GitLab {
             let mut response = self.get(&next)?;
             let following = response.headers().get("x-next-page").and_then(|v| v.to_str().ok()).map(str::trim);
             let following = following.filter(|p| !p.is_empty()).map(str::to_owned);
-            items.extend(response.body_mut().read_json::<Vec<T>>().map_err(|e| self.unexpected(e))?);
+            items.extend(response.body_mut().read_json::<Vec<T>>().map_err(|e| self.client.unexpected(e))?);
             match following {
                 Some(p) if p != page => page = p,
                 _ => return Ok(items),
@@ -190,25 +142,9 @@ impl GitLab {
 
     /// A file's contents at `sha`.
     fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
-        let mut url = self.endpoint(&["projects", &pr.repo, "repository", "files", path, "raw"]);
+        let mut url = self.client.endpoint(&["projects", &pr.repo, "repository", "files", path, "raw"]);
         url.query_pairs_mut().append_pair("ref", sha);
-        self.get(&url)?.body_mut().with_config().limit(MAX_FILE).read_to_vec().map_err(|e| self.http(e))
-    }
-
-    /// A 404 names the Pull Request.
-    fn not_found_as(&self, error: ForgeError, pr: &PullRequestRef) -> ForgeError {
-        match error {
-            ForgeError::NotFound(_) => ForgeError::NotFound(pr.to_string()),
-            e => e,
-        }
-    }
-
-    fn http(&self, error: impl std::fmt::Display) -> ForgeError {
-        ForgeError::Http { host: self.host.host.clone(), message: error.to_string() }
-    }
-
-    fn unexpected(&self, error: impl std::fmt::Display) -> ForgeError {
-        ForgeError::Unexpected { host: self.host.host.clone(), message: error.to_string() }
+        self.client.file(self.client.agent().get(url.as_str()))
     }
 }
 
@@ -368,14 +304,7 @@ impl Position {
 impl ForgeAdapter for GitLab {
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         let url = Url::parse(url).ok()?;
-        if !matches!(url.scheme(), "https" | "http") {
-            return None;
-        }
-        let host = match url.port() {
-            Some(port) => format!("{}:{port}", url.host_str()?),
-            None => url.host_str()?.to_owned(),
-        };
-        if !host.eq_ignore_ascii_case(&self.host.host) {
+        if !host_matches(&url, self.client.host()) {
             return None;
         }
         let segments: Vec<&str> = url.path_segments()?.collect();
@@ -387,15 +316,16 @@ impl ForgeAdapter for GitLab {
             return None;
         }
         Some(PullRequestRef {
-            host: self.host.host.clone(),
+            host: self.client.host().to_owned(),
             repo: project.join("/"),
             number: segments.get(at + 2)?.parse().ok()?,
         })
     }
 
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError> {
-        let mr: MergeRequest = self.get_json(&self.merge_request_url(pr, &[])).map_err(|e| self.not_found_as(e, pr))?;
-        let refs = mr.diff_refs.ok_or_else(|| self.unexpected(format!("{pr} has no diff yet; try again shortly")))?;
+        let mr: MergeRequest = self.get_json(&self.merge_request_url(pr, &[])).map_err(|e| not_found_as(e, pr))?;
+        let refs =
+            mr.diff_refs.ok_or_else(|| self.client.unexpected(format!("{pr} has no diff yet; try again shortly")))?;
         Ok(PullRequest {
             id: pr.clone(),
             url: mr.web_url,
@@ -444,12 +374,12 @@ impl ForgeAdapter for GitLab {
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
         let discussions: Vec<Discussion> =
-            self.pages(&self.merge_request_url(&pr.id, &["discussions"])).map_err(|e| self.not_found_as(e, &pr.id))?;
+            self.pages(&self.merge_request_url(&pr.id, &["discussions"])).map_err(|e| not_found_as(e, &pr.id))?;
         Ok(discussions.into_iter().filter_map(|d| d.into_remote(&pr.head_sha)).collect())
     }
 
     fn viewer(&self) -> Result<String, ForgeError> {
-        let me: User = self.get_json(&self.endpoint(&["user"]))?;
+        let me: User = self.get_json(&self.client.endpoint(&["user"]))?;
         Ok(me.username)
     }
 
@@ -477,8 +407,9 @@ impl ForgeAdapter for GitLab {
     /// draft notes and undoes the Resolved changes and the approval.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError> {
         let id = &pr.id;
-        let mr: MergeRequest = self.get_json(&self.merge_request_url(id, &[])).map_err(|e| self.not_found_as(e, id))?;
-        let refs = mr.diff_refs.ok_or_else(|| self.unexpected(format!("{id} has no diff yet; try again shortly")))?;
+        let mr: MergeRequest = self.get_json(&self.merge_request_url(id, &[])).map_err(|e| not_found_as(e, id))?;
+        let refs =
+            mr.diff_refs.ok_or_else(|| self.client.unexpected(format!("{id} has no diff yet; try again shortly")))?;
         if refs.head_sha != pr.head_sha {
             return Err(ForgeError::Moved(id.to_string()));
         }
@@ -562,7 +493,7 @@ impl GitLab {
             /// `group/project!iid`.
             full: String,
         }
-        let mut url = self.endpoint(&["merge_requests"]);
+        let mut url = self.client.endpoint(&["merge_requests"]);
         url.query_pairs_mut()
             .append_pair("state", "opened")
             // The default scope is the human's own merge requests.
@@ -575,9 +506,9 @@ impl GitLab {
             .into_iter()
             .map(|mr| {
                 let repo = mr.references.full.rsplit_once('!').map_or(mr.references.full.as_str(), |(p, _)| p);
-                let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.unexpected(format!("a time of {t:?}")));
+                let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.client.unexpected(format!("a time of {t:?}")));
                 Ok(InboxItem {
-                    id: PullRequestRef { host: self.host.host.clone(), repo: repo.to_owned(), number: mr.iid },
+                    id: PullRequestRef { host: self.client.host().to_owned(), repo: repo.to_owned(), number: mr.iid },
                     kind: ForgeKind::GitLab,
                     url: mr.web_url,
                     title: mr.title,
@@ -637,7 +568,7 @@ impl GitLab {
                 Some(Side::New) => d.new_path == *path && !d.deleted_file,
                 None => d.new_path == *path || d.old_path == *path,
             })
-            .ok_or_else(|| self.unexpected(format!("{path} isn't in the merge request's diff")))?;
+            .ok_or_else(|| self.client.unexpected(format!("{path} isn't in the merge request's diff")))?;
         let mut position = json!({
             "base_sha": refs.base_sha,
             "start_sha": refs.start_sha,
@@ -686,7 +617,7 @@ impl GitLab {
         let draft_notes = self.merge_request_url(pr, &["draft_notes"]);
         for note in sending.notes {
             let created: Created =
-                self.post(&draft_notes, note)?.body_mut().read_json().map_err(|e| self.unexpected(e))?;
+                self.post(&draft_notes, note)?.body_mut().read_json().map_err(|e| self.client.unexpected(e))?;
             done.notes.push(created.id);
         }
         for (thread, resolved) in sending.resolutions {
@@ -734,7 +665,7 @@ impl GitLab {
     }
 
     fn unsupported(&self, what: &'static str) -> ForgeError {
-        ForgeError::Unsupported { host: self.host.host.clone(), what }
+        ForgeError::Unsupported { host: self.client.host().to_owned(), what }
     }
 }
 

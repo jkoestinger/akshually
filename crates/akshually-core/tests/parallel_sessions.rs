@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use akshually_core::{Anchor, Outcome, ReviewRequest, Service, SessionId, Side, Turn};
+use akshually_core::{Anchor, Displayed, Outcome, ReviewRequest, Service, SessionId, Side, Turn};
 use akshually_testkit::TestRepo;
 
 /// A repository on branch `agent` with a committed change to `lib.rs`.
@@ -36,7 +36,7 @@ fn the_first_session_is_displayed_without_attention() {
 
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    assert_eq!(svc.displayed().as_ref(), Some(pending.session()));
+    assert_eq!(svc.window().displayed, Displayed::Session(pending.session().clone()));
     assert!(!svc.session(pending.session()).unwrap().attention);
 }
 
@@ -48,7 +48,7 @@ fn a_session_opening_while_another_is_displayed_gets_attention_and_does_not_take
 
     let second = svc.review(ReviewRequest::new(b.path())).unwrap();
 
-    assert_eq!(svc.displayed().as_ref(), Some(first.session()));
+    assert_eq!(svc.window().displayed, Displayed::Session(first.session().clone()));
     assert!(svc.session(second.session()).unwrap().attention);
     assert!(!svc.session(first.session()).unwrap().attention);
 }
@@ -62,7 +62,7 @@ fn displaying_a_session_clears_its_attention() {
 
     svc.display(second.session()).unwrap();
 
-    assert_eq!(svc.displayed().as_ref(), Some(second.session()));
+    assert_eq!(svc.window().displayed, Displayed::Session(second.session().clone()));
     assert!(!svc.session(second.session()).unwrap().attention);
 }
 
@@ -81,7 +81,7 @@ fn a_session_becoming_the_humans_turn_again_while_not_displayed_gets_attention()
     let _again = svc.review(ReviewRequest::new(a.path())).unwrap();
 
     assert!(svc.session(&id).unwrap().attention);
-    assert_eq!(svc.displayed().as_ref(), Some(other.session()), "the view stays put");
+    assert_eq!(svc.window().displayed, Displayed::Session(other.session().clone()), "the view stays put");
 }
 
 #[test]
@@ -99,17 +99,17 @@ fn the_displayed_session_becoming_the_humans_turn_gets_no_attention() {
 }
 
 #[test]
-fn when_the_displayed_session_ends_none_is_displayed_and_the_next_one_opening_is() {
+fn when_the_displayed_session_ends_the_inbox_is_displayed_and_the_next_session_opening_takes_the_view() {
     let (a, b) = (agent_branch(), agent_branch());
     let svc = Service::new();
     let first = svc.review(ReviewRequest::new(a.path())).unwrap();
     let id = first.session().clone();
 
     svc.approve(&id).unwrap();
-    assert_eq!(svc.displayed(), None);
+    assert_eq!(svc.window().displayed, Displayed::Inbox);
 
     let next = svc.review(ReviewRequest::new(b.path())).unwrap();
-    assert_eq!(svc.displayed().as_ref(), Some(next.session()));
+    assert_eq!(svc.window().displayed, Displayed::Session(next.session().clone()));
     assert!(!svc.session(next.session()).unwrap().attention);
 }
 

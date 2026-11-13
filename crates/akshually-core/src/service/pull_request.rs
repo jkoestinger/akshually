@@ -27,7 +27,7 @@ impl Service {
     pub fn open_pull_request(&self, url: &str) -> Result<SessionId, Error> {
         let (id, pr) = self.open_pull_request_session(url, None)?;
         let mut inner = self.lock();
-        inner.inbox.saved.looked_at(&pr);
+        inner.inbox.looked_at(&pr);
         inner.notify_inbox();
         Ok(id)
     }
@@ -124,8 +124,7 @@ impl Service {
         let threads_opened = view.threads.len() as u32;
         inner.sessions.push(Session { view, threads_opened, ..Session::default() });
         if agent.is_none() {
-            inner.displayed = Some(id.clone());
-            inner.inbox.displayed = false;
+            inner.window.display_session(&id);
         }
         inner.notify();
         Ok((id, pr))
@@ -173,7 +172,7 @@ impl Service {
         // A co-Reviewer learns what went out; without one, the human closes the Session.
         session.conclude(Outcome::Published { verdict, url: url.clone() });
         inner.reap();
-        inner.inbox.saved.published(&pr.id);
+        inner.inbox.published(&pr.id);
         inner.notify();
         inner.notify_inbox();
         Ok(url)
