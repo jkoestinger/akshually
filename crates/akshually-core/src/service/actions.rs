@@ -13,7 +13,7 @@ pub struct SessionActions {
     /// its Verdict at Publish, a co-review of local work has none, and an ended Session is done.
     pub verdict: Option<VerdictAction>,
     /// How the human ends the Session.
-    pub end: Ending,
+    pub end: EndAction,
     /// Handing the next Round over; `None` while the Session has no agent to hand it to.
     pub hand_over: Option<HandOver>,
     /// What the human can do in each Thread, in the Session's order.
@@ -38,7 +38,7 @@ pub enum VerdictAction {
 
 /// How the human ends a Session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ending {
+pub enum EndAction {
     /// Closing is a normal end: the Session has its outcome already, or it's a co-review of
     /// local work, which has no Verdict.
     Close,
@@ -85,9 +85,9 @@ impl SessionView {
             Source::Local { .. } => Some(VerdictAction::Approve),
         };
         let end = match &self.source {
-            _ if ended => Ending::Close,
-            Source::Local { .. } if self.agent == Some(Role::CoReviewer) => Ending::Close,
-            _ => Ending::Abandon,
+            _ if ended => EndAction::Close,
+            Source::Local { .. } if self.agent == Some(Role::CoReviewer) => EndAction::Close,
+            _ => EndAction::Abandon,
         };
         let hand_over = self.agent.map(|_| {
             let items = self.to_hand_over();
@@ -122,7 +122,7 @@ impl SessionView {
             _ if self.ended.is_some() => Error::Ended,
             _ if self.turn == Turn::Human => Error::AlreadyYourTurn,
             _ => Error::InvalidRequest(
-                "a Pull Request's co-Reviewer gives the Turn back with its next `akshually review --pr`".into(),
+                "a Pull Request's co-Reviewer gives the Turn back when it next asks for review".into(),
             ),
         })
     }

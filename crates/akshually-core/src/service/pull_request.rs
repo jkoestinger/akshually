@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::handoff::{Call, Waiter};
 use super::{
-    ChangesetView, Outcome, PendingReview, Role, Service, Session, SessionId, SessionView, Source, Turn, Verdict,
+    ChangesetView, Ending, PendingReview, Role, Service, Session, SessionId, SessionView, Source, Turn, Verdict,
 };
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
@@ -170,7 +170,7 @@ impl Service {
             }
         }
         // A co-Reviewer learns what went out; without one, the human closes the Session.
-        session.conclude(Outcome::Published { verdict, url: url.clone() });
+        session.conclude(Ending::Published { verdict, url: url.clone() });
         inner.reap();
         inner.inbox.published(&pr.id);
         inner.notify();

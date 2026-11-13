@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
-use super::{Inner, Outcome, Session, SessionId, Turn, lock};
+use super::{Ending, Inner, Outcome, Session, SessionId, Turn, lock};
 
 /// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
 /// the next `review` call.
@@ -170,15 +170,15 @@ impl Session {
         }
     }
 
-    /// Ends the Session with `outcome`. With no agent, that's it; otherwise it replaces any
+    /// Ends the Session with `ending`. With no agent, that's it; otherwise it replaces any
     /// Round the agent hasn't received, and the Session ends once the agent receives it.
-    pub(super) fn conclude(&mut self, outcome: Outcome) {
-        self.view.ended = Some(outcome.clone());
+    pub(super) fn conclude(&mut self, ending: Ending) {
+        self.view.ended = Some(ending.clone());
         if self.view.agent.is_none() {
             return;
         }
         self.queued.clear();
-        self.queued.push(outcome);
+        self.queued.push(ending.into());
         self.deliver();
     }
 }

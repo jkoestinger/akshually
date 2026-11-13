@@ -66,6 +66,10 @@ _Avoid_: Tab, window, conversation
 Whose move a Session is waiting on: the human's or the agent's. A Session that becomes the human's Turn needs attention.
 _Avoid_: State, status
 
+**Ending**:
+How a Session ended: Approved (the Verdict on local work), Abandoned, Published, or Closed (a co-review of local work, which has no Verdict). The agent's next `review` call receives it as its outcome; a Round never ends a Session.
+_Avoid_: Result, end state
+
 **Abandoned**:
 The outcome of a Session the human closes without a Verdict while an agent is its Author; the agent is told to stop. Closing a Session where the agent is a co-Reviewer of local work is a normal end, not Abandoned.
 _Avoid_: Rejected, cancelled

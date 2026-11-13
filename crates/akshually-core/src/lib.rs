@@ -22,9 +22,10 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, DiffLayout, Displayed, Ending, HandOver, InboxRow, InboxRowState, InboxView, Outcome,
-    PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark,
-    SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, Verdict, VerdictAction, WindowView,
+    CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
+    InboxView, Outcome, PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions,
+    SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, Verdict, VerdictAction,
+    WindowView,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
@@ -52,13 +53,13 @@ pub enum Error {
     NotYourTurn,
     #[error("it's already your Turn")]
     AlreadyYourTurn,
-    #[error("another `akshually review` is already waiting on this Session")]
+    #[error("another agent's `review` call is already waiting on this Session")]
     Busy,
-    #[error("this Session has ended; the agent's next `akshually review` collects its outcome")]
+    #[error("this Session has ended")]
     Ended,
-    #[error("no Session for {} on branch {branch}; run `akshually review` first", repo.display())]
+    #[error("no Session for {} on branch {branch}", repo.display())]
     NoSessionHere { repo: std::path::PathBuf, branch: String },
-    #[error("no Session for {0}; run `akshually review --pr {0}` first")]
+    #[error("no Session for {0}")]
     NoPullRequestSession(String),
     #[error("no Thread {0} in this Session")]
     UnknownThread(ThreadId),

@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use akshually_core::ipc::{self, BindError, Connection, Server};
+use akshually_core::ipc::{self, BindError, ClientError, Connection, ErrorCode, Server};
 use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
 
 /// The agent skill `agent-help` prints.
@@ -110,6 +110,19 @@ enum Command {
     },
 }
 
+impl Command {
+    /// The Pull Request the command names with `--pr`, if any.
+    fn pr(&self) -> Option<&str> {
+        match self {
+            Command::Review(ReviewArgs { pr, .. })
+            | Command::Draft(DraftArgs { pr, .. })
+            | Command::Reply { pr, .. }
+            | Command::Resolve { pr, .. } => pr.as_deref(),
+            Command::Start | Command::AgentHelp | Command::App { .. } => None,
+        }
+    }
+}
+
 #[derive(clap::Args)]
 struct ReviewArgs {
     /// Review the changes since HEAD's merge-base with this ref, instead of the default branch.
@@ -199,6 +212,8 @@ impl ReviewArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let pr = cli.command.as_ref().and_then(Command::pr).map(str::to_owned);
+    let reviewing = matches!(cli.command, Some(Command::Review(_)));
     let result = match cli.command {
         Some(Command::Start) => start(),
         Some(Command::Review(args)) => {
@@ -223,9 +238,30 @@ fn main() -> ExitCode {
         None => app(false, Vec::new()),
     };
     result.unwrap_or_else(|error| {
-        eprintln!("akshually: {error:#}");
+        eprintln!("akshually: {error:#}{}", hint(&error, pr.as_deref(), reviewing));
         ExitCode::from(exit::ERROR)
     })
+}
+
+/// What the agent can do about `error`, said after the app's own message, which states only the
+/// fact; empty when there's nothing to add. `pr` is the command's `--pr`, and `reviewing` says
+/// the command was `review`. Picked by the reply's `ErrorCode`, never by its wording.
+fn hint(error: &anyhow::Error, pr: Option<&str>, reviewing: bool) -> String {
+    let code = error.chain().find_map(|e| match e.downcast_ref::<ClientError>() {
+        Some(ClientError::App(reply)) => Some(reply.code),
+        _ => None,
+    });
+    let review = match pr {
+        Some(url) => format!("`akshually review --pr {url}`"),
+        None => "`akshually review`".to_owned(),
+    };
+    match code {
+        // `review` itself is refused as `Ended` only when there's nothing left to collect.
+        Some(ErrorCode::Ended) if reviewing => String::new(),
+        Some(ErrorCode::Ended) => format!("; your next {review} collects its outcome"),
+        Some(ErrorCode::NoSession) => format!("; run {review} first"),
+        _ => String::new(),
+    }
 }
 
 fn start() -> Result<ExitCode> {

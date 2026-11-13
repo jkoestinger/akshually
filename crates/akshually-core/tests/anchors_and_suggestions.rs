@@ -1,5 +1,5 @@
 //! Seam A: File and Review Anchors, and code suggestions, through the core review service
-//! against real throwaway git repositories.
+//! against real throwaway git repositories; and how an Anchor reads, wherever it is shown.
 
 use std::time::Duration;
 
@@ -13,6 +13,22 @@ fn agent_branch() -> TestRepo {
     repo.write("lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n").commit_all("base");
     repo.branch("agent").write("lib.rs", "fn a() {}\nfn b2() {}\nfn c2() {}\nfn d() {}\n");
     repo
+}
+
+#[test]
+fn an_anchor_reads_as_its_file_side_and_lines_or_as_a_whole_file_or_review() {
+    let cases = [
+        (Anchor::lines(Side::New, "lib.rs", 3..=3), "lib.rs, new line 3"),
+        (Anchor::lines(Side::New, "lib.rs", 2..=3), "lib.rs, new lines 2-3"),
+        (Anchor::lines(Side::Old, "lib.rs", 1..=1), "lib.rs, old line 1"),
+        (Anchor::lines(Side::Old, "lib.rs", 1..=2), "lib.rs, old lines 1-2"),
+        (Anchor::file("lib.rs"), "lib.rs, whole file"),
+        (Anchor::Review, "whole Review"),
+    ];
+
+    for (anchor, expected) in cases {
+        assert_eq!(anchor.to_string(), expected, "{anchor:?}");
+    }
 }
 
 #[test]

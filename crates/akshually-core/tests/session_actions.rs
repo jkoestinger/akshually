@@ -8,7 +8,7 @@ use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteThread, Review,
 };
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Comment, Ending, Error, FileChange, HandOver, Outcome, Party, ReviewRequest,
+    Anchor, Changeset, ChangesetView, Comment, EndAction, Ending, Error, FileChange, HandOver, Party, ReviewRequest,
     Role, Service, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn,
     Verdict, VerdictAction,
 };
@@ -62,7 +62,7 @@ impl ForgeAdapter for FakeForge {
     }
 }
 
-fn local(agent: Role, turn: Turn, ended: Option<Outcome>) -> SessionView {
+fn local(agent: Role, turn: Turn, ended: Option<Ending>) -> SessionView {
     SessionView {
         source: Source::Local { repo: "/work/web".into(), branch: "sso".into() },
         agent: Some(agent),
@@ -73,12 +73,12 @@ fn local(agent: Role, turn: Turn, ended: Option<Outcome>) -> SessionView {
     }
 }
 
-fn pull_request(agent: Option<Role>, turn: Turn, ended: Option<Outcome>) -> SessionView {
+fn pull_request(agent: Option<Role>, turn: Turn, ended: Option<Ending>) -> SessionView {
     SessionView { source: Source::PullRequest(pr()), agent, round: 1, turn, ended, ..SessionView::default() }
 }
 
-fn published() -> Option<Outcome> {
-    Some(Outcome::Published { verdict: Verdict::Feedback, url: "https://forge.test/r/1".into() })
+fn published() -> Option<Ending> {
+    Some(Ending::Published { verdict: Verdict::Feedback, url: "https://forge.test/r/1".into() })
 }
 
 // --- The Verdict and how the Session ends ---
@@ -90,11 +90,11 @@ fn every_session() -> [(&'static str, SessionView); 11] {
     [
         ("local work, the human's Turn", local(Author, Human, None)),
         ("local work, the agent's Turn", local(Author, Agent, None)),
-        ("local work approved", local(Author, Human, Some(Outcome::Approved))),
-        ("local work abandoned", local(Author, Agent, Some(Outcome::Abandoned))),
+        ("local work approved", local(Author, Human, Some(Ending::Approved))),
+        ("local work abandoned", local(Author, Agent, Some(Ending::Abandoned))),
         ("a local co-review, the human's Turn", local(CoReviewer, Human, None)),
         ("a local co-review, the agent's Turn", local(CoReviewer, Agent, None)),
-        ("a local co-review closed", local(CoReviewer, Human, Some(Outcome::Closed))),
+        ("a local co-review closed", local(CoReviewer, Human, Some(Ending::Closed))),
         ("a Pull Request alone", pull_request(None, Human, None)),
         ("a Pull Request, the co-Reviewer's Turn", pull_request(Some(CoReviewer), Agent, None)),
         ("a Pull Request, the human's Turn", pull_request(Some(CoReviewer), Human, None)),
@@ -115,7 +115,7 @@ fn the_verdict_is_approve_in_the_humans_turn_and_take_turn_back_in_the_agents_on
 
 #[test]
 fn a_session_ends_by_abandoning_it_unless_it_has_its_outcome_or_is_a_local_co_review() {
-    use Ending::{Abandon, Close};
+    use EndAction::{Abandon, Close};
     let expected = [Abandon, Abandon, Close, Close, Close, Close, Close, Abandon, Abandon, Abandon, Close];
 
     let endings = every_session().map(|(what, session)| (what, session.actions().end));
@@ -181,7 +181,7 @@ fn a_round_can_t_be_handed_over_in_the_agents_turn() {
 #[test]
 fn a_round_can_t_be_handed_over_once_the_session_ended() {
     let drafts = vec![thread("T1", vec![comment(Party::Human, None)])];
-    let session = with_threads(local(Role::Author, Turn::Human, Some(Outcome::Approved)), drafts);
+    let session = with_threads(local(Role::Author, Turn::Human, Some(Ending::Approved)), drafts);
 
     let hand_over = session.actions().hand_over;
 

@@ -111,6 +111,18 @@ fn review_pr_prints_the_published_outcome_as_json() {
 }
 
 #[test]
+fn review_pr_on_a_pull_request_the_human_published_alone_says_it_has_ended_without_a_hint() {
+    let app = HostedApp::with_pull_request();
+    let session = app.service.open_pull_request(PR_URL).unwrap();
+    app.service.publish(&session, Verdict::Approve, "").unwrap();
+
+    let out = run(&app, &["review", "--pr", PR_URL]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "akshually: this Session has ended\n");
+}
+
+#[test]
 fn review_pr_exits_3_when_the_human_abandons_the_co_review() {
     let app = HostedApp::with_pull_request();
     let child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();

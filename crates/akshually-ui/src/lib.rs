@@ -17,8 +17,8 @@ use rune_kit::{
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, Ending, FileChange, HandOver,
-    InboxRow, InboxRowState, InboxView, NewComment, Outcome, Party, PublishPlan, Role, Service, SessionActions,
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
+    HandOver, InboxRow, InboxRowState, InboxView, NewComment, Party, PublishPlan, Role, Service, SessionActions,
     SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, Verdict,
     VerdictAction, WindowView, fence_for,
 };
@@ -907,9 +907,9 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
             Button::new("Close")
                 .variant(ButtonVariant::Ghost)
                 .on_press(move |s: &mut State| match end {
-                    Ending::Close => s.act(&close_id, Service::close),
+                    EndAction::Close => s.act(&close_id, Service::close),
                     // Unpublished Drafts go with it: ask first.
-                    Ending::Abandon => s.confirming_end = Some(close_id.clone()),
+                    EndAction::Abandon => s.confirming_end = Some(close_id.clone()),
                 })
                 .build(k),
         )
@@ -1039,7 +1039,7 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
 
 /// One Thread's Drafts in the Publish dialog, ticked when they're sent.
 fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
-    let on = publish_place(thread);
+    let on = thread.anchor.to_string();
     let first = first_line(thread);
     let on = if thread.forge.is_some() { format!("Reply in {} on {on}", thread.id) } else { on };
     let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
@@ -1053,20 +1053,10 @@ fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
         .children(suggestion.then(|| text("suggestion").font(k.ty.small).color(k.c.text_faint)))
 }
 
-/// Where a Thread is, as the Publish dialog names it.
-fn publish_place(thread: &Thread) -> String {
-    match &thread.anchor {
-        Anchor::Lines { path, side: Side::New, start, end } if start == end => format!("{path}:{end}"),
-        Anchor::Lines { path, side: Side::New, start, end } => format!("{path}:{start}-{end}"),
-        Anchor::Lines { path, side: Side::Old, start, end } => format!("{path}, old {start}-{end}"),
-        anchor => general_label(anchor).unwrap_or_default(),
-    }
-}
-
 /// A Thread Publish resolves or reopens on the Forge (`what`), in the Publish dialog.
 fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
     let first = first_line(thread);
-    let line = format!("{what} {} on {} — {first}", thread.id, publish_place(thread));
+    let line = format!("{what} {} on {} — {first}", thread.id, thread.anchor);
     row()
         .w_full()
         .gap(8.0)
@@ -1206,8 +1196,8 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         )
         .child(
             match tab.actions.end {
-                Ending::Close => Button::new("Close").on_press(move |s: &mut State| s.act(&end_id, Service::close)),
-                Ending::Abandon => {
+                EndAction::Close => Button::new("Close").on_press(move |s: &mut State| s.act(&end_id, Service::close)),
+                EndAction::Abandon => {
                     Button::new("Abandon").on_press(move |s: &mut State| s.confirming_end = Some(end_id.clone()))
                 }
             }
@@ -1265,20 +1255,20 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
 /// collected the outcome yet.
 fn turn_banner(k: &Kit, session: &SessionView) -> Option<El> {
     let note = match &session.ended {
-        Some(Outcome::Approved) => {
+        Some(Ending::Approved) => {
             "Approved. The agent's next `akshually review` receives the Verdict and ends this Session, or close it \
              now."
                 .to_owned()
         }
-        Some(Outcome::Published { verdict, url }) => {
+        Some(Ending::Published { verdict, url }) => {
             format!("Published with the Verdict {verdict}: {url}. Close this Session when you're done.")
         }
-        Some(Outcome::Closed) => {
+        Some(Ending::Closed) => {
             "Closed. The agent's next `akshually review` is told the co-review is over, which ends this Session, \
              or close it now."
                 .to_owned()
         }
-        Some(Outcome::Abandoned | Outcome::Round(_)) => {
+        Some(Ending::Abandoned) => {
             "Abandoned. The agent's next `akshually review` is told to stop, which ends this Session, or close it \
              now."
                 .to_owned()
@@ -1770,12 +1760,6 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
     let mut list = col().key("outdated-threads").w_full().px(16.0).gap(8.0);
     for thread in tab.session.threads.iter().filter(|t| t.outdated) {
         let expanded = tab.expanded.contains(&thread.id);
-        let place = match &thread.anchor {
-            Anchor::Lines { path, side, start, end } if start == end => format!("{path}, {side} line {start}"),
-            Anchor::Lines { path, side, start, end } => format!("{path}, {side} lines {start}-{end}"),
-            Anchor::File { path } => path.clone(),
-            Anchor::Review => "Whole Review".to_owned(),
-        };
         let first = first_line(thread);
         let count = match thread.comments.len() {
             1 => "1 Comment".to_owned(),
@@ -1789,9 +1773,14 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             .gap(8.0)
             .items_center()
             .child(
-                text(format!("Outdated · {}{} · {place} · “{first}” · {count}", resolved_by(thread), thread.id))
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
+                text(format!(
+                    "Outdated · {}{} · {} · “{first}” · {count}",
+                    resolved_by(thread),
+                    thread.id,
+                    thread.anchor
+                ))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
             )
             .child(row().grow(1.0))
             .children(resolve)
