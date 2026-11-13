@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "akshually"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "akshually-core",
  "akshually-testkit",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "akshually-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "akshually-testkit",
  "dirs",
@@ -140,14 +140,14 @@ dependencies = [
 
 [[package]]
 name = "akshually-testkit"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "akshually-ui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "akshually-core",
  "akshually-testkit",
