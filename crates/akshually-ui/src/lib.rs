@@ -47,6 +47,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// Runs the app's window over `service` until the app quits. `rune_args` are Rune's own
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
+    let headless = is_headless_run(&rune_args);
     let spec = AppSpec {
         scenes: &[
             ("session", scene_session),
@@ -63,11 +64,10 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         on_key: Some(on_key),
         ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
     };
-    let headless = is_headless_run(&rune_args);
     let init_service = service.clone();
     let app = rune::App::new(spec)
         .args(rune_args)
-        .init(move || State::new(init_service))
+        .init(move || State::new(init_service).headless(headless))
         // The app outlives its window: agents keep calling in (ADR 0002).
         .keep_running()
         // Notifications are for when the human looks elsewhere.
@@ -98,14 +98,15 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
 pub struct State {
     service: Arc<Service>,
     tabs: Vec<SessionTab>,
-    /// What the service's Window displays. A tab or the Inbox the human picks shows at once,
-    /// ahead of the service's update saying the same: a scene's service holds none of its
-    /// Sessions, so it never sends one.
+    /// What the service's Window displays. A tab or the Inbox the human picks shows once the
+    /// service took it, ahead of its update saying the same; one it refused changes nothing.
     displayed: Displayed,
     inbox: InboxView,
-    /// How every tab lays out its diff: the service's, or the one the human just picked (as
-    /// `displayed`).
+    /// How every tab lays out its diff: the service's, or the one the human just picked.
     diff_layout: DiffLayout,
+    /// A headless render (`run`): the service sends it no updates and holds none of its scene's
+    /// Sessions, so the tab the human picks shows even though the service refuses it.
+    headless: bool,
     /// An Inbox refresh the human asked for is running.
     refreshing: bool,
     /// The Comment being written, at most one in the window.
@@ -278,6 +279,7 @@ impl State {
             service,
             tabs: Vec::new(),
             displayed: Displayed::Inbox,
+            headless: false,
             inbox: InboxView::default(),
             diff_layout: DiffLayout::default(),
             refreshing: false,
@@ -298,6 +300,12 @@ impl State {
         let window = state.service.window();
         state.apply(window);
         state
+    }
+
+    /// Marks a headless render's view model (see `State::headless`).
+    fn headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
     }
 
     /// Mirrors the service's Window, keeping each Session's view state (scroll, folds) and
@@ -459,9 +467,11 @@ impl State {
 
     /// Shows the Session's tab and tells the service, which clears its attention.
     fn open_tab(&mut self, id: SessionId) {
-        // The Session may have ended meanwhile; its tab goes with the next update.
-        let _ = self.service.display(&id);
-        self.displayed = Displayed::Session(id);
+        // The Session may have ended meanwhile: the view stays, and its tab goes with the next
+        // update.
+        if self.service.display(&id).is_ok() || self.headless {
+            self.displayed = Displayed::Session(id);
+        }
     }
 
     /// Human: lays out every Session's Changeset as `layout`.
