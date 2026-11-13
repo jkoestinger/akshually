@@ -265,6 +265,22 @@ fn reply_with_no_session_for_the_pull_request_says_so_and_to_run_review_pr_first
 }
 
 #[test]
+fn draft_on_an_ended_session_says_so_and_that_the_next_review_collects_its_outcome() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+    app.service.abandon(&session).unwrap();
+
+    let out = finish(app.akshually(repo.path(), &["draft", "--file", "lib.rs", "Split this."]).spawn().unwrap());
+
+    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "akshually: this Session has ended; your next `akshually review` collects its outcome\n"
+    );
+}
+
+#[test]
 fn review_outside_a_repository_exits_1_with_an_error() {
     let app = HostedApp::start();
     let not_a_repo = TestDirs::new();

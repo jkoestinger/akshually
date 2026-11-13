@@ -213,6 +213,7 @@ impl ReviewArgs {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let pr = cli.command.as_ref().and_then(Command::pr).map(str::to_owned);
+    let reviewing = matches!(cli.command, Some(Command::Review(_)));
     let result = match cli.command {
         Some(Command::Start) => start(),
         Some(Command::Review(args)) => {
@@ -237,15 +238,15 @@ fn main() -> ExitCode {
         None => app(false, Vec::new()),
     };
     result.unwrap_or_else(|error| {
-        eprintln!("akshually: {error:#}{}", hint(&error, pr.as_deref()));
+        eprintln!("akshually: {error:#}{}", hint(&error, pr.as_deref(), reviewing));
         ExitCode::from(exit::ERROR)
     })
 }
 
 /// What the agent can do about `error`, said after the app's own message, which states only the
-/// fact; empty when there's nothing to add. `pr` is the command's `--pr`. Picked by the
-/// reply's `ErrorCode`, never by its wording.
-fn hint(error: &anyhow::Error, pr: Option<&str>) -> String {
+/// fact; empty when there's nothing to add. `pr` is the command's `--pr`, and `reviewing` says
+/// the command was `review`. Picked by the reply's `ErrorCode`, never by its wording.
+fn hint(error: &anyhow::Error, pr: Option<&str>, reviewing: bool) -> String {
     let code = error.chain().find_map(|e| match e.downcast_ref::<ClientError>() {
         Some(ClientError::App(reply)) => Some(reply.code),
         _ => None,
@@ -255,6 +256,8 @@ fn hint(error: &anyhow::Error, pr: Option<&str>) -> String {
         None => "`akshually review`".to_owned(),
     };
     match code {
+        // `review` itself is refused as `Ended` only when there's nothing left to collect.
+        Some(ErrorCode::Ended) if reviewing => String::new(),
         Some(ErrorCode::Ended) => format!("; your next {review} collects its outcome"),
         Some(ErrorCode::NoSession) => format!("; run {review} first"),
         _ => String::new(),
