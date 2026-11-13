@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Displayed, Inner, Service, Session, SessionId};
+use super::{Inner, Service, Session, SessionId};
 use crate::forge::{InboxItem, InboxRole, PullRequestRef};
 
 /// What the UI (and tests) can observe of the Inbox.
@@ -107,17 +107,11 @@ impl Inbox {
     }
 }
 
-/// The Inbox-related state of the service, beside its Sessions.
-#[derive(Default)]
-pub(super) struct InboxState {
-    pub(super) saved: Inbox,
-}
-
 impl Inner {
-    /// Saves the Inbox and tells the window subscribers.
+    /// Saves the Inbox and tells the Window subscribers.
     pub(super) fn notify_inbox(&mut self) {
         if let Some(store) = &mut self.store
-            && let Err(error) = store.sync_inbox(&self.inbox.saved)
+            && let Err(error) = store.sync_inbox(&self.inbox)
         {
             eprintln!("akshually: couldn't save the Inbox: {error}");
         }
@@ -129,7 +123,7 @@ impl Service {
     /// The Inbox as of its last refresh, with each row's state now.
     pub fn inbox(&self) -> InboxView {
         let inner = self.lock();
-        inner.inbox.saved.view(&inner.sessions)
+        inner.inbox.view(&inner.sessions)
     }
 
     /// Asks every Forge host for its Inbox; blocks on them. A host that fails keeps its rows
@@ -141,7 +135,7 @@ impl Service {
         let mut items = Vec::new();
         let mut errors = Vec::new();
         let mut inner = self.lock();
-        let before = std::mem::take(&mut inner.inbox.saved.items);
+        let before = std::mem::take(&mut inner.inbox.items);
         for (forge, result) in fetched {
             match result {
                 Ok(found) => items.extend(found),
@@ -166,16 +160,16 @@ impl Service {
             items.iter().any(|i| &i.id == pr && i.role == InboxRole::Reviewer)
         };
         let new_request = items.iter().any(|i| i.role == InboxRole::Reviewer && !requested(&before, &i.id));
-        let opened = inner.window.inbox_opened && inner.window.displayed == Displayed::Inbox;
+        let opened = inner.window.inbox_opened();
         let state = &mut inner.inbox;
         if new_request && !opened {
-            state.saved.attention = true;
+            state.attention = true;
         }
         // What the human saw of a Pull Request that left the Inbox no longer matters.
-        state.saved.seen.retain(|s| items.iter().any(|i| i.id == s.pr));
-        state.saved.items = items;
-        state.saved.errors = errors;
-        state.saved.refreshed_at = Some(now());
+        state.seen.retain(|s| items.iter().any(|i| i.id == s.pr));
+        state.items = items;
+        state.errors = errors;
+        state.refreshed_at = Some(now());
         inner.notify_inbox();
     }
 

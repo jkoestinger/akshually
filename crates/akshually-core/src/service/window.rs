@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Inner, InboxView, Service, SessionId, SessionView};
+use super::{InboxView, Inner, Service, SessionId, SessionView};
 use crate::Error;
 
 /// Everything the Window shows, as one snapshot: what the UI renders, whole, after each change.
@@ -39,16 +39,36 @@ pub enum DiffLayout {
 
 type WindowSubscriber = Box<dyn Fn(&WindowView) + Send>;
 
+impl Displayed {
+    /// Whether this is the Session `id`.
+    pub fn is_session(&self, id: &SessionId) -> bool {
+        matches!(self, Displayed::Session(displayed) if displayed == id)
+    }
+}
+
 /// The Window as the service keeps it, beside its Sessions and the Inbox.
 #[derive(Default)]
 pub(super) struct Window {
-    pub(super) displayed: Displayed,
+    displayed: Displayed,
     /// The human opened the Inbox, rather than the Window falling back to it at startup or when
-    /// its Session went away. Only then does the Inbox keep the view from a Session that becomes
-    /// the human's Turn, and take no attention from a new review request.
-    pub(super) inbox_opened: bool,
+    /// its Session went away; only ever set while it displays the Inbox.
+    inbox_opened: bool,
     pub(super) diff_layout: DiffLayout,
     subscribers: Vec<WindowSubscriber>,
+}
+
+impl Window {
+    /// Displays the Session `id`, without telling anyone yet.
+    pub(super) fn display_session(&mut self, id: &SessionId) {
+        self.displayed = Displayed::Session(id.clone());
+        self.inbox_opened = false;
+    }
+
+    /// Whether the human has the Inbox open. Only then does it keep the view from a Session
+    /// that becomes the human's Turn, and a new review request doesn't mark it.
+    pub(super) fn inbox_opened(&self) -> bool {
+        self.inbox_opened
+    }
 }
 
 impl Inner {
@@ -56,12 +76,12 @@ impl Inner {
         WindowView {
             sessions: self.views(),
             displayed: self.window.displayed.clone(),
-            inbox: self.inbox.saved.view(&self.sessions),
+            inbox: self.inbox.view(&self.sessions),
             diff_layout: self.window.diff_layout,
         }
     }
 
-    /// Gives the window subscribers the Window as it is now.
+    /// Gives the Window subscribers the Window as it is now.
     pub(super) fn tell_window_subscribers(&self) {
         if self.window.subscribers.is_empty() {
             return;
@@ -72,12 +92,6 @@ impl Inner {
         }
     }
 
-    /// Displays the Session `id`, without telling anyone yet.
-    pub(super) fn display_session(&mut self, id: &SessionId) {
-        self.window.displayed = Displayed::Session(id.clone());
-        self.window.inbox_opened = false;
-    }
-
     /// The Session at `at` became the human's Turn. It takes the view only from an Inbox the
     /// Window fell back to; otherwise, unless it's displayed, it gets attention.
     pub(super) fn humans_turn_display(&mut self, at: usize) {
@@ -85,7 +99,7 @@ impl Inner {
         let attention = match &self.window.displayed {
             Displayed::Inbox if self.window.inbox_opened => true,
             Displayed::Inbox => {
-                self.display_session(&id);
+                self.window.display_session(&id);
                 false
             }
             Displayed::Session(displayed) => displayed != &id,
@@ -95,9 +109,8 @@ impl Inner {
 
     /// The Session `id` went away: if the Window displayed it, it displays the Inbox.
     pub(super) fn session_gone(&mut self, id: &SessionId) {
-        if self.window.displayed == Displayed::Session(id.clone()) {
+        if self.window.displayed.is_session(id) {
             self.window.displayed = Displayed::Inbox;
-            self.window.inbox_opened = false;
         }
     }
 }
@@ -120,10 +133,10 @@ impl Service {
     pub fn display(&self, id: &SessionId) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        if inner.window.displayed == Displayed::Session(id.clone()) && !inner.sessions[at].view.attention {
+        if inner.window.displayed.is_session(id) && !inner.sessions[at].view.attention {
             return Ok(());
         }
-        inner.display_session(id);
+        inner.window.display_session(id);
         inner.sessions[at].view.attention = false;
         inner.notify();
         Ok(())
@@ -133,11 +146,10 @@ impl Service {
     /// meanwhile get attention rather than the view.
     pub fn display_inbox(&self) {
         let mut inner = self.lock();
-        let window = &mut inner.window;
-        let already = window.displayed == Displayed::Inbox && window.inbox_opened;
-        window.displayed = Displayed::Inbox;
-        window.inbox_opened = true;
-        if inner.inbox.saved.clear_attention() {
+        let already = std::mem::replace(&mut inner.window.inbox_opened, true);
+        inner.window.displayed = Displayed::Inbox;
+        // The Inbox is saved only when its attention changed: what's displayed isn't saved.
+        if inner.inbox.clear_attention() {
             inner.notify_inbox();
         } else if !already {
             inner.tell_window_subscribers();

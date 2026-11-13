@@ -396,11 +396,15 @@ impl SessionView {
         }
     }
 
-    /// Moves `changeset_rev` if the Changeset shown is no longer `before`.
-    fn shown_changed_from(&mut self, before: &Changeset) {
-        if self.shown() != before {
+    /// Makes `change`, then moves `changeset_rev` if the Changeset shown is no longer the one it
+    /// was. Every change that can alter the Changeset shown goes through here.
+    pub(super) fn change_shown<T>(&mut self, change: impl FnOnce(&mut SessionView) -> T) -> T {
+        let before = self.shown().clone();
+        let changed = change(self);
+        if self.shown() != &before {
             self.changeset_rev += 1;
         }
+        changed
     }
 
     /// Since the last Round, the old side is that Round's code, not a base: no Thread is on it.
@@ -595,26 +599,25 @@ impl Session {
     /// Round, as on each re-attach.
     fn refresh(&mut self, changeset: Changeset, since_session_base: Option<Changeset>, default_view: bool) {
         self.disk_checked = None;
-        let view = &mut self.view;
-        let before = view.anchored_in().clone();
-        let shown = view.shown().clone();
-        for file in changeset.since(&view.changeset).files {
-            view.viewed.remove(&file.path);
-        }
-        view.changeset = changeset;
-        view.since_session_base = since_session_base;
-        view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
-        view.changed_on_disk.clear();
-        if default_view && view.since_last_round.is_some() {
-            view.view = ChangesetView::SinceLastRound;
-        }
-        // Threads follow the Changeset they are anchored in.
-        if view.anchored_in() != &before {
-            let mut threads = std::mem::take(&mut view.threads);
-            reanchor(&mut threads, view.anchored_in());
-            view.threads = threads;
-        }
-        view.shown_changed_from(&shown);
+        self.view.change_shown(|view| {
+            let before = view.anchored_in().clone();
+            for file in changeset.since(&view.changeset).files {
+                view.viewed.remove(&file.path);
+            }
+            view.changeset = changeset;
+            view.since_session_base = since_session_base;
+            view.since_last_round = view.last_round.as_ref().map(|s| view.changeset.since(s));
+            view.changed_on_disk.clear();
+            if default_view && view.since_last_round.is_some() {
+                view.view = ChangesetView::SinceLastRound;
+            }
+            // Threads follow the Changeset they are anchored in.
+            if view.anchored_in() != &before {
+                let mut threads = std::mem::take(&mut view.threads);
+                reanchor(&mut threads, view.anchored_in());
+                view.threads = threads;
+            }
+        });
     }
 }
 
@@ -641,7 +644,7 @@ struct Inner {
     show_window: Option<Box<dyn Fn(Option<String>) + Send>>,
     /// Where Sessions are saved; `None` keeps them in memory only.
     store: Option<Store>,
-    inbox: inbox::InboxState,
+    inbox: inbox::Inbox,
     window: window::Window,
 }
 
@@ -705,7 +708,7 @@ impl Inner {
         }
     }
 
-    /// Publishes a change: saves it, then tells the window subscribers.
+    /// Publishes a change: saves it, then tells the Window subscribers.
     fn notify(&mut self) {
         self.save();
         self.tell_window_subscribers();
@@ -755,7 +758,7 @@ impl Service {
             }
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
-        inner.inbox.saved = store.load_inbox();
+        inner.inbox = store.load_inbox();
         inner.window.diff_layout = store.load_diff_layout();
         inner.store = Some(store);
         Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
@@ -846,16 +849,16 @@ impl Service {
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at].view;
         if session.view != view {
-            let before = session.anchored_in().clone();
-            let shown = session.shown().clone();
-            session.view = view;
-            // Threads follow the Changeset they are anchored in.
-            if session.anchored_in() != &before {
-                let mut threads = std::mem::take(&mut session.threads);
-                reanchor(&mut threads, session.anchored_in());
-                session.threads = threads;
-            }
-            session.shown_changed_from(&shown);
+            session.change_shown(|session| {
+                let before = session.anchored_in().clone();
+                session.view = view;
+                // Threads follow the Changeset they are anchored in.
+                if session.anchored_in() != &before {
+                    let mut threads = std::mem::take(&mut session.threads);
+                    reanchor(&mut threads, session.anchored_in());
+                    session.threads = threads;
+                }
+            });
         }
         inner.notify();
         Ok(())

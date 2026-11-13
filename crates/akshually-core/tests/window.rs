@@ -15,7 +15,7 @@ fn repo_with_one_edit() -> TestRepo {
     repo
 }
 
-/// Every Window the service tells its window subscribers of, in order.
+/// Every Window the service tells its Window subscribers of, in order.
 fn heard(svc: &Service) -> Arc<Mutex<Vec<WindowView>>> {
     let heard = Arc::new(Mutex::new(Vec::new()));
     let sink = heard.clone();

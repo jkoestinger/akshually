@@ -64,9 +64,10 @@ impl Service {
         session.view.turn = Turn::Agent;
         // The agent's next `review` refreshes the Changeset anyway.
         session.view.changed_on_disk.clear();
-        session.view.since_last_round =
-            Some(Changeset { base: session.view.changeset.base.clone(), files: Vec::new() });
-        let replaced = session.view.last_round.replace(session.view.changeset.clone());
+        let replaced = session.view.change_shown(|view| {
+            view.since_last_round = Some(Changeset { base: view.changeset.base.clone(), files: Vec::new() });
+            view.last_round.replace(view.changeset.clone())
+        });
         session.replaced_last_rounds.push((number, replaced));
         session.queued.push(Outcome::Round(Round { number, threads }));
         session.deliver();
@@ -109,11 +110,13 @@ impl Service {
                 // The withdrawn Rounds' entries go too.
                 let (_, last_round) =
                     session.replaced_last_rounds.drain(at..).next().expect("`at` is in `replaced_last_rounds`");
-                session.view.since_last_round = last_round.as_ref().map(|s| session.view.changeset.since(s));
-                session.view.last_round = last_round;
-                if session.view.since_last_round.is_none() && session.view.view == ChangesetView::SinceLastRound {
-                    session.view.view = ChangesetView::Full;
-                }
+                session.view.change_shown(|view| {
+                    view.since_last_round = last_round.as_ref().map(|s| view.changeset.since(s));
+                    view.last_round = last_round;
+                    if view.since_last_round.is_none() && view.view == ChangesetView::SinceLastRound {
+                        view.view = ChangesetView::Full;
+                    }
+                });
             }
         }
         inner.became_humans_turn(at);

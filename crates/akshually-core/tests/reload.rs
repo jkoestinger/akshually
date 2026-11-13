@@ -232,18 +232,101 @@ fn switching_the_changeset_view_moves_its_revision() {
     assert_ne!(svc.session(&id).unwrap().changeset_rev, before);
 }
 
+/// A Session in Round 2, shown since the last Round, with a Draft and no `review` call waiting.
+fn round_2_since_last_round(svc: &Service, repo: &TestRepo) -> akshually_core::SessionId {
+    let round_1 = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = round_1.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    drop(round_1);
+    repo.write("other.rs", "y\n");
+    drop(svc.review(ReviewRequest::new(repo.path())).unwrap());
+    svc.comment(&id, Anchor::lines(Side::New, "other.rs", 1..=1), "Why y?").unwrap();
+    assert_eq!(svc.session(&id).unwrap().view, ChangesetView::SinceLastRound);
+    id
+}
+
 #[test]
-fn what_leaves_the_changeset_shown_alone_leaves_its_revision_put() {
+fn handing_over_a_round_while_shown_since_the_last_round_moves_its_revision() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = round_2_since_last_round(&svc, &repo);
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    svc.hand_over_round(&id).unwrap();
+
+    assert_ne!(svc.session(&id).unwrap().changeset_rev, before, "nothing has changed since the new last Round");
+}
+
+#[test]
+fn taking_the_turn_back_from_a_round_no_agent_received_moves_its_revision() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = round_2_since_last_round(&svc, &repo);
+    svc.hand_over_round(&id).unwrap();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    svc.take_turn_back(&id).unwrap();
+
+    assert_ne!(svc.session(&id).unwrap().changeset_rev, before, "the Round 1 changes since show again");
+}
+
+#[test]
+fn commenting_leaves_the_changeset_revision_put() {
     let repo = agent_branch();
     let svc = Service::new();
     let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
     let before = svc.session(&id).unwrap().changeset_rev;
 
     svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why?").unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn ticking_a_file_viewed_leaves_the_changeset_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
     svc.mark_viewed(&id, "lib.rs", true).unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn showing_the_changeset_view_already_shown_leaves_its_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
     svc.show(&id, ChangesetView::Full).unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn offering_changes_on_disk_leaves_the_changeset_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
     repo.write("other.rs", "y\n");
     svc.check_disk();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn displaying_the_inbox_leaves_the_changeset_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
     svc.display_inbox();
 
     assert_eq!(svc.session(&id).unwrap().changeset_rev, before);

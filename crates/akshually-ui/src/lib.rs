@@ -304,7 +304,7 @@ impl State {
     /// rebuilding its diff only when the Changeset it shows moved on (`changeset_rev`).
     pub fn apply(&mut self, window: WindowView) {
         let WindowView { sessions, displayed, inbox, diff_layout } = window;
-        self.lay_out(diff_layout);
+        self.lay_out_tabs(diff_layout);
         let mut old = std::mem::take(&mut self.tabs);
         let layout = self.diff_layout;
         self.tabs = sessions
@@ -467,11 +467,11 @@ impl State {
     /// Human: lays out every Session's Changeset as `layout`.
     fn set_diff_layout(&mut self, layout: DiffLayout) {
         self.service.set_diff_layout(layout);
-        self.lay_out(layout);
+        self.lay_out_tabs(layout);
     }
 
     /// Lays out every tab's diff as `layout`, and keeps it for tabs opened later.
-    fn lay_out(&mut self, layout: DiffLayout) {
+    fn lay_out_tabs(&mut self, layout: DiffLayout) {
         if self.diff_layout == layout {
             return;
         }
@@ -633,11 +633,6 @@ impl State {
     fn displayed_tab_mut(&mut self) -> Option<&mut SessionTab> {
         let Displayed::Session(id) = &self.displayed else { return None };
         self.tabs.iter_mut().find(|t| &t.session.id == id)
-    }
-
-    /// Whether the Window displays the Session `id`.
-    fn displays(&self, id: &SessionId) -> bool {
-        matches!(&self.displayed, Displayed::Session(displayed) if displayed == id)
     }
 
     /// Runs a human action on the service; the service's update then refreshes the view.
@@ -1406,7 +1401,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
                     .variant(ButtonVariant::GhostMuted)
                     .on_press(move |s: &mut State| {
                         // Composing goes to the displayed Session; a stale press must not reach another.
-                        if s.displays(&id_file) {
+                        if s.displayed.is_session(&id_file) {
                             s.compose_general(Some(file));
                         }
                     })
@@ -1426,7 +1421,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     .on_comment(move |s: &mut State, range: LineRange, _: &mut Tx| {
         // `compose` goes to the displayed Session; a stale "+" must not open a composer on another
         // Session at this one's lines.
-        if s.displays(&id_comment) {
+        if s.displayed.is_session(&id_comment) {
             s.compose(range);
         }
     })
@@ -1921,7 +1916,7 @@ fn scene_session(s: &mut State) {
     };
     let unseen = other("unseen", "fix/inbox-refresh", Turn::Human, true);
     let working = other("working", "feat/publish", Turn::Agent, false);
-    s.apply(scene_window(vec![session, unseen, working]));
+    s.apply(scene_window(vec![session, unseen, working], Some("sample")));
 }
 
 /// `--scene threads`: Review, file and suggestion Threads, with markdown bodies, an agent
@@ -1994,13 +1989,13 @@ fn scene_threads(s: &mut State) {
     session.threads[2].comments.push(reply);
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
-    s.apply(scene_window(vec![session]));
+    s.apply(scene_window(vec![session], Some("sample")));
 }
 
-/// A scene's Window, displaying the first of `sessions`. The scene's service holds none of
-/// them, so this is the one update the scene's window gets.
-fn scene_window(sessions: Vec<SessionView>) -> WindowView {
-    let displayed = sessions.first().map_or(Displayed::Inbox, |s| Displayed::Session(s.id.clone()));
+/// A scene's Window of `sessions`, displaying the Session `displayed`, else the Inbox. The
+/// scene's service holds none of them, so this is the one update the scene gets.
+fn scene_window(sessions: Vec<SessionView>, displayed: Option<&str>) -> WindowView {
+    let displayed = displayed.map_or(Displayed::Inbox, |id| Displayed::Session(SessionId::new(id)));
     WindowView { sessions, displayed, ..WindowView::default() }
 }
 
@@ -2076,7 +2071,7 @@ fn scene_publish(s: &mut State) {
         threads: vec![suggested.clone(), sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
         ..SessionView::default()
     };
-    s.apply(WindowView { sessions: vec![session], ..WindowView::default() });
+    s.apply(scene_window(vec![session], None));
     let plan = PublishPlan {
         verdicts: Verdict::ALL.to_vec(),
         own: false,
@@ -2103,7 +2098,7 @@ fn scene_publish_gitlab(s: &mut State) {
     pr.id = PullRequestRef { host: "gitlab.example.com".into(), repo: "platform/infra".into(), number: 97 };
     // `kind()` tells GitLab by its merge request URL.
     pr.url = "https://gitlab.example.com/platform/infra/-/merge_requests/97".into();
-    s.apply(WindowView { sessions: vec![session], ..WindowView::default() });
+    s.apply(scene_window(vec![session], None));
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
@@ -2122,7 +2117,7 @@ fn scene_co_review(s: &mut State) {
     review.comments[0].author = Party::Agent;
     session.threads.push(review);
     session.threads.push(sample_thread("T5", 4..=4, "Is `Round::new` fallible now?", None));
-    s.apply(scene_window(vec![session]));
+    s.apply(scene_window(vec![session], Some("pr")));
 }
 
 fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, round: Option<u32>) -> Thread {
