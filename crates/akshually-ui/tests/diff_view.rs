@@ -1,6 +1,6 @@
 //! UI: a Session's Changeset view in Rune's headless `Runtime`, against real Sessions in the
 //! core service, for what the render smoke check can't reach: input that lands between an
-//! update and the next rebuild (#37).
+//! update and the next rebuild (#37), and the comment box across updates (#48).
 
 use std::sync::Arc;
 
@@ -25,14 +25,23 @@ fn window(service: &Arc<Service>) -> Runtime<State> {
     rt
 }
 
-/// Hands the service's Sessions to the window, as its subscriber does: the tabs change at once,
+/// Hands the service's Window to the window, as its subscriber does: the tabs change at once,
 /// and the view rebuilds on the next frame.
-fn deliver_sessions(rt: &mut Runtime<State>, service: &Service) {
-    let sessions = service.sessions();
+fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
+    let window = service.window();
     rt.update_if(move |s: &mut State, _| {
-        s.apply(sessions);
+        s.apply(window);
         true
     });
+}
+
+/// Opens the comment box on the first line the shown Changeset offers a Comment on.
+fn open_comment_box(rt: &mut Runtime<State>) {
+    let (x, y) = rt.find("plus").expect("the Session's Changeset offers a Comment on its lines");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.0);
+    assert!(rt.find("composer").is_some(), "the comment box didn't open");
 }
 
 #[test]
@@ -44,7 +53,7 @@ fn hovering_the_changeset_of_a_session_that_just_ended_drops_it_without_panickin
     let (x, y) = rt.find("code").expect("the Session's Changeset shows");
 
     service.approve(pending.session()).unwrap();
-    deliver_sessions(&mut rt, &service);
+    deliver_window(&mut rt, &service);
     rt.pointer_move(x, y);
     rt.frame(0.0);
 
@@ -63,12 +72,43 @@ fn commenting_on_a_line_of_a_session_that_just_ended_opens_no_composer_on_the_se
     let (x, y) = rt.find("plus").expect("the Session's Changeset offers a Comment on its lines");
 
     service.approve(ended).unwrap();
-    deliver_sessions(&mut rt, &service);
+    deliver_window(&mut rt, &service);
     service.display(next).unwrap();
-    deliver_sessions(&mut rt, &service);
+    deliver_window(&mut rt, &service);
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(0.0);
 
     assert!(rt.find("composer").is_none(), "the ended Session's \"+\" opened a composer on another Session");
+}
+
+#[test]
+fn the_open_comment_box_stays_through_an_update_that_leaves_the_changeset_shown_alone() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let mut rt = window(&service);
+    open_comment_box(&mut rt);
+
+    service.mark_viewed(pending.session(), "a.txt", true).unwrap();
+    deliver_window(&mut rt, &service);
+    rt.frame(0.0);
+
+    assert!(rt.find("composer").is_some(), "an update that left the Changeset shown alone dropped the comment box");
+}
+
+#[test]
+fn the_open_comment_box_goes_when_the_changeset_shown_changes() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let mut rt = window(&service);
+    open_comment_box(&mut rt);
+
+    repo.write("a.txt", "three\n");
+    service.reload(pending.session()).unwrap();
+    deliver_window(&mut rt, &service);
+    rt.frame(0.0);
+
+    assert!(rt.find("composer").is_none(), "the comment box stayed on lines that may be gone");
 }
