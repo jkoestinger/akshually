@@ -65,6 +65,19 @@ impl Anchor {
     }
 }
 
+/// The one wording of where a Thread is, for the CLI and the UI alike: `lib.rs, new line 3`,
+/// `lib.rs, old lines 1-2`, `lib.rs, whole file` or `whole Review`.
+impl fmt::Display for Anchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Anchor::Lines { path, side, start, end } if start == end => write!(f, "{path}, {side} line {start}"),
+            Anchor::Lines { path, side, start, end } => write!(f, "{path}, {side} lines {start}-{end}"),
+            Anchor::File { path } => write!(f, "{path}, whole file"),
+            Anchor::Review => f.write_str("whole Review"),
+        }
+    }
+}
+
 impl fmt::Display for Side {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

@@ -2,13 +2,13 @@
 //! exactly one reply (possibly after a long wait).
 //!
 //! ```jsonc
-//! {"v":1,"op":"review","cwd":"/abs/repo","base":"main"} // client → app; options optional
-//! {"v":1,"ok":{"outcome":"approved"}}                // app → client
-//! {"v":1,"err":{"code":"version","message":"…"}}
+//! {"v":2,"op":"review","cwd":"/abs/repo","base":"main"} // client → app; options optional
+//! {"v":2,"ok":{"outcome":"approved"}}                // app → client
+//! {"v":2,"err":{"code":"version","message":"…"}}
 //! ```
 //!
 //! `review` is the one exception: once the CLI has printed the outcome, it sends
-//! `{"v":1,"op":"ack"}` on the same connection and the app replies `{"v":1,"ok":{}}`. A Round
+//! `{"v":2,"op":"ack"}` on the same connection and the app replies `{"v":2,"ok":{}}`. A Round
 //! or Verdict never acknowledged (the CLI died before printing it) goes to the next `review`.
 
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Anchor, LocalOptions, SessionId, SessionView, SourceRef, ThreadId};
 
 /// Bumped on any incompatible change, so a newer CLI can tell an older running app apart.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// What a CLI call asks of the running app.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +131,10 @@ pub enum ErrorCode {
     Failed,
     /// Another `review` call already waits on this Session.
     Busy,
+    /// No Session matches the request's branch or Pull Request.
+    NoSession,
+    /// The Session has ended; the agent's next `review` collects its outcome.
+    Ended,
     /// A test-control request reached an app not started for tests.
     Forbidden,
 }

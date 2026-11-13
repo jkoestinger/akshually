@@ -9,9 +9,9 @@ use std::sync::mpsc;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Party, Side, ThreadRef};
+use akshually_core::{Anchor, Party, Side, ThreadId, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
-use support::{HostedApp, LaunchedApp, TIMEOUT, finish, still_running};
+use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -238,6 +238,33 @@ fn reply_and_resolve_on_an_unknown_thread_exit_1_naming_it() {
 }
 
 #[test]
+fn reply_with_no_session_on_the_branch_says_so_and_to_run_review_first() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+
+    let out = finish(app.akshually(repo.path(), &["reply", "T1", "Done."]).spawn().unwrap());
+
+    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("akshually: no Session for {} on branch agent; run `akshually review` first\n", repo.path().display())
+    );
+}
+
+#[test]
+fn reply_with_no_session_for_the_pull_request_says_so_and_to_run_review_pr_first() {
+    let app = HostedApp::with_pull_request();
+
+    let out = finish(app.akshually(&std::env::temp_dir(), &["reply", "--pr", PR_URL, "T1", "Done."]).spawn().unwrap());
+
+    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("akshually: no Session for {PR_URL}; run `akshually review --pr {PR_URL}` first\n")
+    );
+}
+
+#[test]
 fn review_outside_a_repository_exits_1_with_an_error() {
     let app = HostedApp::start();
     let not_a_repo = TestDirs::new();
@@ -347,6 +374,29 @@ fn test_control_is_refused_by_an_app_not_started_for_tests() {
     let refused = ipc::connect(&app.paths()).unwrap().test_state();
 
     assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::Forbidden), "{refused:?}");
+}
+
+#[test]
+fn the_app_answers_no_session_when_the_branch_has_none() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+
+    let refused = ipc::connect(&app.paths()).unwrap().reply(repo.path(), None, &ThreadId::new("T1"), "Done.");
+
+    assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::NoSession), "{refused:?}");
+}
+
+#[test]
+fn the_app_answers_ended_when_the_session_has_ended() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+    app.service.abandon(&session).unwrap();
+
+    let refused =
+        ipc::connect(&app.paths()).unwrap().draft(repo.path(), None, Anchor::file("lib.rs"), "Split this.".into());
+
+    assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::Ended), "{refused:?}");
 }
 
 /// `topic` forks from `main`, and `agent` from `topic`. Each branch adds the file named after
@@ -477,7 +527,7 @@ fn a_second_review_while_one_waits_exits_1_with_a_clear_message() {
     assert!(second.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&second.stderr),
-        "akshually: another `akshually review` is already waiting on this Session\n"
+        "akshually: another agent's `review` call is already waiting on this Session\n"
     );
     assert!(still_running(&mut first), "the first call stopped waiting");
     app.service.approve(&session.id).unwrap();

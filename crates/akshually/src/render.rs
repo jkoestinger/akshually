@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use akshually_core::{Anchor, Outcome, Round, Side, Thread, fence_for};
+use akshually_core::{Anchor, Outcome, Round, Thread, fence_for};
 
 /// What `review --format markdown` prints for `outcome`; `pr` is the Pull Request the agent
 /// co-reviews, if any, which its commands must name.
@@ -39,7 +39,7 @@ fn round_markdown(round: &Round, pr: Option<&str>) -> String {
 fn thread_markdown(out: &mut String, thread: &Thread) {
     let outdated = if thread.outdated { " · Outdated" } else { "" };
     let reopened = if thread.reopened { " · Reopened" } else { "" };
-    let _ = writeln!(out, "\n## {} · {}{outdated}{reopened}", thread.id, anchor_markdown(&thread.anchor));
+    let _ = writeln!(out, "\n## {} · {}{outdated}{reopened}", thread.id, thread.anchor);
     if thread.reopened {
         out.push_str("\nThe human reopened this Thread: it isn't dealt with yet.\n");
     }
@@ -52,25 +52,10 @@ fn thread_markdown(out: &mut String, thread: &Thread) {
     }
     for comment in &thread.comments {
         let _ = writeln!(out, "\n{}", comment.body.trim_end());
-        if let (Some(code), Anchor::Lines { path, side, start, end }) = (&comment.suggestion, &thread.anchor) {
-            let _ = writeln!(out, "\nSuggested change: replace {} of {path} with\n", lines(*side, *start, *end));
+        if let (Some(code), Anchor::Lines { .. }) = (&comment.suggestion, &thread.anchor) {
+            let _ = writeln!(out, "\nSuggested change to {}:\n", thread.anchor);
             code_block(out, code);
         }
-    }
-}
-
-/// `new lines 2-3`, or `old line 1`.
-fn lines(side: Side, start: u32, end: u32) -> String {
-    if start == end { format!("{side} line {start}") } else { format!("{side} lines {start}-{end}") }
-}
-
-/// Where a Thread sits, naming its Anchor kind: `lib.rs, new lines 2-3`, `lib.rs, whole file`
-/// or `whole Review`.
-fn anchor_markdown(anchor: &Anchor) -> String {
-    match anchor {
-        Anchor::Lines { path, side, start, end } => format!("{path}, {}", lines(*side, *start, *end)),
-        Anchor::File { path } => format!("{path}, whole file"),
-        Anchor::Review => "whole Review".to_owned(),
     }
 }
 

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use akshually_core::{
-    Anchor, BinarySizes, ChangesetView, Collapsed, Error, FileChange, Outcome, Party, PlacedThread, ReviewRequest,
-    Round, Service, SessionId, Settings, Side, Source, Thread, ThreadId, ThreadRef, Turn,
+    Anchor, BinarySizes, ChangesetView, Collapsed, Ending, Error, FileChange, Outcome, Party, PlacedThread,
+    ReviewRequest, Round, Service, SessionId, Settings, Side, Source, Thread, ThreadId, ThreadRef, Turn, Verdict,
 };
 use akshually_testkit::{TestDirs, TestRepo};
 
@@ -1425,6 +1425,31 @@ fn sessions_saved_with_a_repo_branch_and_pull_request_still_load_with_their_sour
 }
 
 #[test]
+fn sessions_saved_with_an_outcome_as_how_they_ended_load_with_the_matching_ending() {
+    let dirs = TestDirs::new();
+    let sessions = dirs.state().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    // As saved when `ended` was an `Outcome`.
+    let abandoned = r#"{"view":{"id":"s1","source":{"local":{"repo":"/work/app","branch":"feature"}},"round":1,
+        "ended":{"outcome":"abandoned"}}}"#;
+    let published = r#"{"view":{"id":"s2","source":{"local":{"repo":"/work/app","branch":"other"}},"round":1,
+        "ended":{"outcome":"published","verdict":"request_changes","url":"https://github.com/acme/web/pull/482"}}}"#;
+    std::fs::write(sessions.join("s1.json"), abandoned).unwrap();
+    std::fs::write(sessions.join("s2.json"), published).unwrap();
+
+    let svc = Service::open(dirs.state()).unwrap();
+
+    assert_eq!(svc.session(&SessionId::new("s1")).unwrap().ended, Some(Ending::Abandoned));
+    assert_eq!(
+        svc.session(&SessionId::new("s2")).unwrap().ended,
+        Some(Ending::Published {
+            verdict: Verdict::RequestChanges,
+            url: "https://github.com/acme/web/pull/482".to_owned()
+        })
+    );
+}
+
+#[test]
 fn replies_resolutions_and_reopenings_survive_a_restart_and_still_go_out() {
     let dirs = TestDirs::new();
     let repo = agent_branch();
@@ -1584,7 +1609,7 @@ fn a_verdict_given_while_no_review_waits_goes_to_the_next_review_which_ends_the_
     drop(first);
 
     svc.approve(&id).unwrap();
-    assert_eq!(svc.session(&id).unwrap().ended, Some(Outcome::Approved), "kept until the agent collects it");
+    assert_eq!(svc.session(&id).unwrap().ended, Some(Ending::Approved), "kept until the agent collects it");
     assert!(svc.abandon(&id).is_err(), "the Session already has its outcome");
 
     let next = svc.review(ReviewRequest::new(repo.path())).unwrap();

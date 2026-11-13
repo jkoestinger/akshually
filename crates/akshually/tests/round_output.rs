@@ -67,7 +67,7 @@ fn a_suggestion_follows_its_comment_as_the_replacement_for_the_anchored_lines() 
              \n\
              Merge these.\n\
              \n\
-             Suggested change: replace new lines 2-3 of lib.rs with\n\
+             Suggested change to lib.rs, new lines 2-3:\n\
              \n\
              ```\n\
              fn bc() {}\n\

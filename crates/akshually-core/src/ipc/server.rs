@@ -232,6 +232,8 @@ fn send(stream: &UnixStream, reply: Reply) -> io::Result<()> {
 fn failed(error: crate::Error) -> ErrorReply {
     let code = match error {
         crate::Error::Busy => ErrorCode::Busy,
+        crate::Error::NoSessionHere { .. } | crate::Error::NoPullRequestSession(_) => ErrorCode::NoSession,
+        crate::Error::Ended => ErrorCode::Ended,
         _ => ErrorCode::Failed,
     };
     ErrorReply::new(code, error.to_string())

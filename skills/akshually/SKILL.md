@@ -19,7 +19,7 @@ When you are asked to review a Pull Request or someone's local changes instead, 
    - `3`, Abandoned: the human closed the Session without a Verdict. Stop working on this change.
    - `1`: an error, explained on stderr.
 
-The human can take minutes or hours. Run `review` without a timeout if your shell tool allows it. If the call is killed anyway (a tool timeout, a restart), run `akshually review` again: a Round or Verdict the human gave meanwhile is kept for the next call, and nothing is lost. The human can still close a Session whose Verdict no call collected: your next `review` then starts a new Session, with a fresh Round 1. Run only one `review` per branch at a time; a second one fails with `another akshually review is already waiting on this Session`.
+The human can take minutes or hours. Run `review` without a timeout if your shell tool allows it. If the call is killed anyway (a tool timeout, a restart), run `akshually review` again: a Round or Verdict the human gave meanwhile is kept for the next call, and nothing is lost. The human can still close a Session whose Verdict no call collected: your next `review` then starts a new Session, with a fresh Round 1. Run only one `review` per branch at a time; a second one fails with "another agent's `review` call is already waiting on this Session".
 
 ## Commands
 
@@ -48,7 +48,7 @@ The markdown starts with `# Round N`, then one section per Thread:
 - A Lines Thread shows the code it was written against in a fence, then the Comments, oldest first.
 - `· Outdated`: that code is no longer in the Changeset. Judge whether your change already covers the Comment.
 - `· Reopened`: the human reopened a Thread you or they had Resolved; it isn't dealt with yet.
-- `Suggested change: replace new lines 2-3 of src/lib.rs with`, followed by a fence: the human wrote the exact replacement for those lines. Apply it unless you have a reason not to, and say so in a `reply`.
+- `Suggested change to src/lib.rs, new lines 2-3:`, followed by a fence: the human wrote the exact replacement for those lines. Apply it unless you have a reason not to, and say so in a `reply`.
 
 Thread IDs stay the same across Rounds, so `T3` in Round 2 is the Thread `T3` from Round 1.
 

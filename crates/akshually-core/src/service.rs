@@ -24,7 +24,7 @@ mod pull_request;
 mod threads;
 mod window;
 
-pub use actions::{Ending, HandOver, SessionActions, ThreadActions, VerdictAction};
+pub use actions::{EndAction, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
@@ -81,6 +81,34 @@ pub enum Outcome {
     Published { verdict: Verdict, url: String },
     /// The human closed a co-review of local work, which has no Verdict: a normal end.
     Closed,
+}
+
+/// How a Session ended: the [`Outcome`]s that end it, which a Round never does. It becomes
+/// that `Outcome` when it is queued for the agent, and serialises the same way, so Sessions
+/// saved while `ended` was an `Outcome` still load.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Ending {
+    /// The human approved the agent's local work.
+    Approved,
+    /// The human closed the Session without a Verdict while an agent was in it.
+    Abandoned,
+    /// The human Published their Review of a Pull Request with `verdict`; `url` is the review
+    /// on the Forge.
+    Published { verdict: Verdict, url: String },
+    /// The human closed a co-review of local work, which has no Verdict.
+    Closed,
+}
+
+impl From<Ending> for Outcome {
+    fn from(ending: Ending) -> Self {
+        match ending {
+            Ending::Approved => Outcome::Approved,
+            Ending::Abandoned => Outcome::Abandoned,
+            Ending::Published { verdict, url } => Outcome::Published { verdict, url },
+            Ending::Closed => Outcome::Closed,
+        }
+    }
 }
 
 /// How the human ends a Review of a Pull Request, at Publish. Feedback becomes the Forge's
@@ -294,7 +322,7 @@ pub struct SessionView {
     pub turn: Turn,
     /// The human approved or abandoned the Session while no agent's `review` call received it.
     /// The Session stays until the next `review` call collects this, then ends.
-    pub ended: Option<Outcome>,
+    pub ended: Option<Ending>,
     /// The Session became the human's Turn while another tab was displayed, and its tab
     /// hasn't been opened since.
     pub attention: bool,
@@ -943,7 +971,7 @@ impl Service {
     /// Human: approves the Session, which ends it and returns the Verdict to the agent. Only
     /// on the human's Turn: during the agent's, take the Turn back first.
     pub fn approve(&self, id: &SessionId) -> Result<(), Error> {
-        self.end(id, Outcome::Approved)
+        self.end(id, Ending::Approved)
     }
 
     /// Human: closes the Session without a Verdict and tells the agent to stop.
@@ -960,7 +988,7 @@ impl Service {
         };
         // Closing a Pull Request before Publish tells its co-Reviewer, if any, it was Abandoned.
         match end {
-            Ending::Abandon if !pull_request => self.end(id, Outcome::Abandoned),
+            EndAction::Abandon if !pull_request => self.end(id, Ending::Abandoned),
             _ => self.close(id),
         }
     }
@@ -979,17 +1007,17 @@ impl Service {
             return Err(Error::Publishing);
         }
         if session.view.ended.is_none() {
-            let outcome = match (&session.view.source, session.view.agent) {
-                (Source::Local { .. }, Some(Role::CoReviewer)) => Some(Outcome::Closed),
+            let ending = match (&session.view.source, session.view.agent) {
+                (Source::Local { .. }, Some(Role::CoReviewer)) => Some(Ending::Closed),
                 (Source::Local { .. }, _) => {
                     return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
                 }
-                (Source::PullRequest(_), Some(_)) => Some(Outcome::Abandoned),
+                (Source::PullRequest(_), Some(_)) => Some(Ending::Abandoned),
                 (Source::PullRequest(_), None) => None,
             };
-            if let Some(outcome) = outcome {
+            if let Some(ending) = ending {
                 drop(inner);
-                return self.end(id, outcome);
+                return self.end(id, ending);
             }
         }
         session.finished = true;
@@ -998,9 +1026,9 @@ impl Service {
         Ok(())
     }
 
-    /// Gives the agent `outcome`, which ends the Session once delivered. With no `review` call
-    /// waiting, the Session keeps it for the next one.
-    fn end(&self, id: &SessionId, outcome: Outcome) -> Result<(), Error> {
+    /// Ends the Session with `ending`, which the agent gets as its outcome; the Session goes once
+    /// it is delivered. With no `review` call waiting, the Session keeps it for the next one.
+    fn end(&self, id: &SessionId, ending: Ending) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
@@ -1010,10 +1038,10 @@ impl Service {
         if session.publishing {
             return Err(Error::Publishing);
         }
-        if outcome == Outcome::Approved {
+        if ending == Ending::Approved {
             session.view.check_approve()?;
         }
-        session.conclude(outcome);
+        session.conclude(ending);
         inner.reap();
         inner.notify();
         Ok(())
