@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Inner, Service, Session, SessionId};
+use super::{Displayed, Inner, Service, Session, SessionId};
 use crate::forge::{InboxItem, InboxRole, PullRequestRef};
 
 /// What the UI (and tests) can observe of the Inbox.
@@ -61,8 +61,6 @@ struct Seen {
     updated_at: i64,
 }
 
-type InboxSubscriber = Box<dyn Fn(&InboxView) + Send>;
-
 impl Inbox {
     fn seen(&self, pr: &PullRequestRef) -> Option<i64> {
         self.seen.iter().find(|s| &s.pr == pr).map(|s| s.updated_at)
@@ -75,6 +73,11 @@ impl Inbox {
         self.seen.push(Seen { pr: pr.clone(), updated_at });
     }
 
+    /// The human looked at the Inbox: clears its attention. Whether it had any.
+    pub(super) fn clear_attention(&mut self) -> bool {
+        std::mem::take(&mut self.attention)
+    }
+
     /// The human Published a review of `pr`: the update that makes on the Forge is theirs, so
     /// it doesn't make the row Updated.
     pub(super) fn published(&mut self, pr: &PullRequestRef) {
@@ -82,7 +85,7 @@ impl Inbox {
         self.seen.push(Seen { pr: pr.clone(), updated_at: now() });
     }
 
-    fn view(&self, sessions: &[Session]) -> InboxView {
+    pub(super) fn view(&self, sessions: &[Session]) -> InboxView {
         let rows = self
             .items
             .iter()
@@ -108,31 +111,17 @@ impl Inbox {
 #[derive(Default)]
 pub(super) struct InboxState {
     pub(super) saved: Inbox,
-    /// The human has the Inbox tab open (and so no Session's).
-    pub(super) displayed: bool,
-    subscribers: Vec<InboxSubscriber>,
 }
 
 impl Inner {
-    /// Saves the Inbox and tells its subscribers.
+    /// Saves the Inbox and tells the window subscribers.
     pub(super) fn notify_inbox(&mut self) {
         if let Some(store) = &mut self.store
             && let Err(error) = store.sync_inbox(&self.inbox.saved)
         {
             eprintln!("akshually: couldn't save the Inbox: {error}");
         }
-        self.tell_inbox_subscribers();
-    }
-
-    /// Gives the Inbox subscribers the Inbox as it is now: its rows' states follow the Sessions.
-    pub(super) fn tell_inbox_subscribers(&self) {
-        if self.inbox.subscribers.is_empty() {
-            return;
-        }
-        let view = self.inbox.saved.view(&self.sessions);
-        for subscriber in &self.inbox.subscribers {
-            subscriber(&view);
-        }
+        self.tell_window_subscribers();
     }
 }
 
@@ -143,17 +132,9 @@ impl Service {
         inner.inbox.saved.view(&inner.sessions)
     }
 
-    /// Calls `f` with the Inbox after each refresh, whenever its attention changes, and after
-    /// each change to the Sessions, which the rows' states follow (a Session opened, Drafts
-    /// written, Published). Like `subscribe`, `f` runs while the service is locked: hand the
-    /// Inbox off, don't call back.
-    pub fn subscribe_inbox(&self, f: impl Fn(&InboxView) + Send + 'static) {
-        self.lock().inbox.subscribers.push(Box::new(f));
-    }
-
     /// Asks every Forge host for its Inbox; blocks on them. A host that fails keeps its rows
     /// from before, and its error shows until a refresh succeeds. A review request that wasn't
-    /// listed before marks the Inbox, unless the human has it displayed.
+    /// listed before marks the Inbox, unless the human opened it and the Window displays it.
     pub fn refresh_inbox(&self) {
         // Not holding the lock: the Forges may take a while.
         let fetched: Vec<_> = self.forges.iter().map(|forge| (forge, forge.inbox())).collect();
@@ -185,8 +166,9 @@ impl Service {
             items.iter().any(|i| &i.id == pr && i.role == InboxRole::Reviewer)
         };
         let new_request = items.iter().any(|i| i.role == InboxRole::Reviewer && !requested(&before, &i.id));
+        let opened = inner.window.inbox_opened && inner.window.displayed == Displayed::Inbox;
         let state = &mut inner.inbox;
-        if new_request && !state.displayed {
+        if new_request && !opened {
             state.saved.attention = true;
         }
         // What the human saw of a Pull Request that left the Inbox no longer matters.
@@ -209,23 +191,6 @@ impl Service {
                 std::thread::sleep(every);
             }
         });
-    }
-
-    /// Human: opens the Inbox tab, which clears its attention. Sessions that need the human
-    /// meanwhile get attention rather than the view.
-    pub fn display_inbox(&self) {
-        let mut inner = self.lock();
-        inner.displayed = None;
-        inner.inbox.displayed = true;
-        if inner.inbox.saved.attention {
-            inner.inbox.saved.attention = false;
-            inner.notify_inbox();
-        }
-    }
-
-    /// Whether the human has the Inbox tab open.
-    pub fn inbox_displayed(&self) -> bool {
-        self.lock().inbox.displayed
     }
 }
 

@@ -187,3 +187,76 @@ fn going_back_on_disk_to_what_was_checked_before_a_reload_is_offered() {
 
     assert_eq!(svc.session(&id).unwrap().changed_on_disk, paths(&["other.rs"]), "the diff shows y");
 }
+
+#[test]
+fn reloading_a_changed_changeset_moves_its_revision() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    repo.write("lib.rs", "fn a() {}\nfn b3() {}\n");
+    svc.reload(&id).unwrap();
+
+    assert_ne!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn the_agents_next_review_refreshing_the_changeset_moves_its_revision() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    repo.write("lib.rs", "fn a() {}\nfn b3() {}\n");
+    let _round_2 = svc.review(ReviewRequest::new(repo.path())).unwrap();
+
+    assert_ne!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn switching_the_changeset_view_moves_its_revision() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    repo.write("other.rs", "y\n");
+    let _round_2 = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    svc.show(&id, ChangesetView::Full).unwrap();
+
+    assert_ne!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn what_leaves_the_changeset_shown_alone_leaves_its_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why?").unwrap();
+    svc.mark_viewed(&id, "lib.rs", true).unwrap();
+    svc.show(&id, ChangesetView::Full).unwrap();
+    repo.write("other.rs", "y\n");
+    svc.check_disk();
+    svc.display_inbox();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}
+
+#[test]
+fn reloading_an_unchanged_changeset_leaves_its_revision_put() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let id = svc.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
+    let before = svc.session(&id).unwrap().changeset_rev;
+
+    svc.reload(&id).unwrap();
+
+    assert_eq!(svc.session(&id).unwrap().changeset_rev, before);
+}

@@ -124,8 +124,7 @@ impl Service {
         let threads_opened = view.threads.len() as u32;
         inner.sessions.push(Session { view, threads_opened, ..Session::default() });
         if agent.is_none() {
-            inner.displayed = Some(id.clone());
-            inner.inbox.displayed = false;
+            inner.display_session(&id);
         }
         inner.notify();
         Ok((id, pr))
