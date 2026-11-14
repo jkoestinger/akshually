@@ -220,6 +220,8 @@ test_prints_the_path_line_when_the_bin_dir_isnt_on_path() {
 
     run_install
 
+    # The line the script prints for the user to paste, unexpanded.
+    # shellcheck disable=SC2016
     [[ $output == *'export PATH="$HOME/.local/bin:$PATH"'* ]] || fail "no PATH line: $output"
     [[ ! -e $home/.bashrc && ! -e $home/.zshrc && ! -e $home/.profile ]] || fail "edited a shell rc file"
 }
