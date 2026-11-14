@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use akshually_core::UpdateStage;
 use akshually_core::ipc::{self, HumanCommand};
 use akshually_testkit::{FakeRelease, FakeReleases, TestDirs, TestRepo, tar_gz, wait_until};
 use support::{HostedApp, LaunchedApp, TIMEOUT, finish};
@@ -71,6 +70,7 @@ fn update_on_a_current_install_exits_0_and_says_it_is_current() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn update_replaces_the_install_and_tells_the_running_app_to_offer_restart() {
+    use akshually_core::UpdateStage;
     let app = HostedApp::start();
     let github = newer_release("new binary");
     let (_dir, exe) = install();
