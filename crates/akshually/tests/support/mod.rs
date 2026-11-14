@@ -23,7 +23,12 @@ pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 /// `akshually args` in `cwd`, with state and runtime dirs and config file from `dirs`, so it never
 /// touches the user's own.
 fn akshually(dirs: &TestDirs, cwd: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_akshually"));
+    akshually_at(Path::new(env!("CARGO_BIN_EXE_akshually")), dirs, cwd, args)
+}
+
+/// `akshually`, running the binary at `program`, such as a copy installed for an update.
+fn akshually_at(program: &Path, dirs: &TestDirs, cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
         .env("AKSHUALLY_STATE_DIR", dirs.state())
@@ -70,6 +75,13 @@ impl HostedApp {
     /// `akshually args` in `cwd`, which must find this app rather than launch one.
     pub(crate) fn akshually(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut cmd = akshually(&self.dirs, cwd, args);
+        cmd.env("AKSHUALLY_NO_LAUNCH", "1");
+        cmd
+    }
+
+    /// `akshually args` like [`HostedApp::akshually`], running the binary at `program`.
+    pub(crate) fn akshually_at(&self, program: &Path, cwd: &Path, args: &[&str]) -> Command {
+        let mut cmd = akshually_at(program, &self.dirs, cwd, args);
         cmd.env("AKSHUALLY_NO_LAUNCH", "1");
         cmd
     }

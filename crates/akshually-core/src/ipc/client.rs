@@ -13,11 +13,25 @@ use crate::{Anchor, LocalOptions, NewComment, Outcome, Paths, ThreadId};
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("lost the connection to akshually: {0}")]
-    Io(#[from] io::Error),
+    Io(io::Error),
+    /// The app closed the connection before answering: it restarted, for an update, or quit.
+    #[error("the akshually app restarted (or quit) before it answered; run the command again")]
+    AppGone,
     #[error("akshually sent a reply this CLI doesn't understand: {0}")]
     Protocol(String),
     #[error(transparent)]
     App(#[from] ErrorReply),
+}
+
+impl From<io::Error> for ClientError {
+    fn from(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe => {
+                ClientError::AppGone
+            }
+            _ => ClientError::Io(error),
+        }
+    }
 }
 
 /// Connects to the running app. `NotFound` or `ConnectionRefused` mean no app is running.
@@ -109,6 +123,11 @@ impl Connection {
     /// Brings the running app's window up, activated with `activation_token` if given.
     pub fn show(self, activation_token: Option<String>) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Request::Show { activation_token }).map(drop)
+    }
+
+    /// Tells the running app that `akshually update` installed `version` over its install.
+    pub fn update_installed(self, version: &str) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::UpdateInstalled { version: version.to_owned() }).map(drop)
     }
 
     /// Test control: the app's pid and Sessions.

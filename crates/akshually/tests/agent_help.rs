@@ -48,9 +48,21 @@ fn cli_subcommands() -> BTreeSet<String> {
         .collect()
 }
 
+/// The subcommands for the human alone, which `--help` lists and the agents' skill leaves out.
+const HUMAN_SUBCOMMANDS: [&str; 1] = ["update"];
+
 #[test]
-fn the_skill_documents_exactly_the_cli_subcommands() {
-    assert_eq!(documented_subcommands(), cli_subcommands());
+fn the_skill_documents_exactly_the_cli_subcommands_for_agents() {
+    let for_agents: BTreeSet<String> =
+        cli_subcommands().into_iter().filter(|c| !HUMAN_SUBCOMMANDS.contains(&c.as_str())).collect();
+
+    assert_eq!(documented_subcommands(), for_agents);
+}
+
+#[test]
+fn update_is_listed_in_help_but_not_in_the_agents_skill() {
+    assert!(cli_subcommands().contains("update"), "`--help` doesn't list `update`");
+    assert!(!documented_subcommands().contains("update"), "the agents' skill documents `update`");
 }
 
 /// The codes in the skill's exit code table, rows like ``| `4` | A Round was handed over |``.

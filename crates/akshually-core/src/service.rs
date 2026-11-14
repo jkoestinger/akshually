@@ -12,6 +12,7 @@ use crate::changeset::{self, Changeset, LocalOptions};
 use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+use crate::update::Updater;
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
 mod actions;
@@ -22,12 +23,14 @@ mod handoff;
 mod inbox;
 mod pull_request;
 mod threads;
+mod update;
 mod window;
 
 pub use actions::{EndAction, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
+pub use update::{UpdateStage, UpdateView};
 pub use window::{DiffLayout, Displayed, WindowView};
 
 use handoff::{Call, Waiter};
@@ -674,6 +677,7 @@ struct Inner {
     store: Option<Store>,
     inbox: inbox::Inbox,
     window: window::Window,
+    update: update::Update,
 }
 
 impl Inner {
@@ -757,6 +761,8 @@ pub struct Service {
     inner: Arc<Mutex<Inner>>,
     /// One per Forge host, asked in order which one serves a Pull Request URL.
     forges: Vec<Box<dyn ForgeAdapter>>,
+    /// Looks for newer releases and installs them; `None` never looks (tests, headless renders).
+    updater: Option<Updater>,
 }
 
 impl Service {
@@ -789,7 +795,13 @@ impl Service {
         inner.inbox = store.load_inbox();
         inner.window.diff_layout = store.load_diff_layout();
         inner.store = Some(store);
-        Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new() })
+        Ok(Service { inner: Arc::new(Mutex::new(inner)), forges: Vec::new(), updater: None })
+    }
+
+    /// Looks for newer releases of akshually, and installs them, with `updater`.
+    pub fn with_updater(mut self, updater: Updater) -> Self {
+        self.updater = Some(updater);
+        self
     }
 
     /// Shows a desktop notification through `notifier` whenever a Session becomes the human's

@@ -58,6 +58,20 @@ xattr -dr com.apple.quarantine ~/Applications/akshually.app
 
 Alternatively, try to open it once, then choose **Open Anyway** in System Settings > Privacy & Security.
 
+## Updating
+
+The app looks for a newer release at launch and then once a day. When there is one, it shows a notice: **Update** installs it in place, after checking it against the release's `SHA256SUMS`, then **Restart** relaunches the app into it. Your Sessions are kept; an agent waiting in `akshually review` during the restart gets an error and must run it again, which the app warns about first. A stable install is offered stable releases only; a pre-release install is offered the newest release of either kind.
+
+From a terminal, `akshually update` does the same install, and tells a running app, whose notice then offers **Restart**. Agents' commands never look for updates.
+
+To turn the check off, add this to `config.toml` (`~/.config/akshually/` on Linux, `~/Library/Application Support/akshually/` on macOS):
+
+```toml
+check_for_updates = false
+```
+
+Self-update replaces the install the running `akshually` belongs to, so it needs to be able to write there. An install it can't write to, such as an old copy in `/Applications`, is refused: reinstall with the install script instead.
+
 ## Teach your agent
 
 `akshually agent-help` prints a guide for agents: the review loop, the commands and the exit codes. It is also an agent skill ([`skills/akshually/SKILL.md`](skills/akshually/SKILL.md)), so you can install it where your agent looks for skills, for example:

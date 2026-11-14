@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{InboxView, Inner, Service, SessionId, SessionView};
+use super::{InboxView, Inner, Service, SessionId, SessionView, UpdateView};
 use crate::Error;
 
 /// Everything the Window shows, as one snapshot: what the UI renders, whole, after each change.
@@ -14,6 +14,8 @@ pub struct WindowView {
     pub displayed: Displayed,
     pub inbox: InboxView,
     pub diff_layout: DiffLayout,
+    /// The update notice; `None` while there's no newer release, or it was dismissed.
+    pub update: Option<UpdateView>,
 }
 
 /// What the Window displays. It always displays something: the Inbox at startup, and whenever
@@ -78,6 +80,7 @@ impl Inner {
             displayed: self.window.displayed.clone(),
             inbox: self.inbox.view(&self.sessions),
             diff_layout: self.window.diff_layout,
+            update: self.update_view(),
         }
     }
 

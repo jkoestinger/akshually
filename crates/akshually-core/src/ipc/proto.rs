@@ -71,6 +71,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_token: Option<String>,
     },
+    /// `akshually update` installed `version` over the running app's install: its update notice
+    /// offers Restart. Replies `{}` at once.
+    UpdateInstalled { version: String },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]
     TestState,
@@ -83,8 +86,14 @@ pub enum Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanCommand {
-    Approve { session: SessionId },
-    Abandon { session: SessionId },
+    Approve {
+        session: SessionId,
+    },
+    Abandon {
+        session: SessionId,
+    },
+    /// Restart the app, as the update notice's Restart does. No reply: the app execs itself.
+    Restart,
 }
 
 /// The Session an agent request names: the Pull Request `pr` if given, else the local work in

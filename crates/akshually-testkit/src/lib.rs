@@ -1,12 +1,13 @@
 //! Fixtures for akshually's tests, shared by seam A (the core review service), seam B (the CLI
-//! contract) and seam C (the Forge adapters). Nothing here knows about akshually itself, so every
-//! seam can use it.
+//! contract) and seam C (the Forge adapters, self-update). Nothing here knows about akshually
+//! itself, so every seam can use it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// A real, throwaway git repository on disk (the spec rules out git mocks). Git runs with no
@@ -207,4 +208,110 @@ pub fn threaded_http_server(answer: impl Fn(&str) -> String + Send + Sync + 'sta
         }
     });
     url
+}
+
+/// A release a [`FakeReleases`] serves: its tag and its assets, with a `SHA256SUMS` listing them.
+pub struct FakeRelease {
+    tag: String,
+    assets: Vec<(String, Vec<u8>)>,
+    /// The hash `SHA256SUMS` lists for an asset instead of its own, by name.
+    wrong_hashes: Vec<String>,
+}
+
+impl FakeRelease {
+    pub fn new(tag: &str) -> Self {
+        FakeRelease { tag: tag.to_owned(), assets: Vec::new(), wrong_hashes: Vec::new() }
+    }
+
+    /// Attaches the asset `name` holding `contents`.
+    pub fn asset(mut self, name: &str, contents: Vec<u8>) -> Self {
+        self.assets.push((name.to_owned(), contents));
+        self
+    }
+
+    /// Lists a hash in `SHA256SUMS` for the asset `name` that isn't its own.
+    pub fn wrong_hash_for(mut self, name: &str) -> Self {
+        self.wrong_hashes.push(name.to_owned());
+        self
+    }
+}
+
+/// A fake GitHub REST API for one repository, serving its releases list and each release's
+/// assets (`SHA256SUMS` included) from a local `mockito` server.
+pub struct FakeReleases {
+    server: mockito::ServerGuard,
+    /// The releases list's mock, which counts the lookups.
+    list: mockito::Mock,
+}
+
+impl FakeReleases {
+    /// Serves `releases`, listed in the order given (GitHub lists the newest first).
+    pub fn new(releases: Vec<FakeRelease>) -> Self {
+        let mut server = mockito::Server::new();
+        let url = server.url();
+        let mut listed = Vec::new();
+        for release in releases {
+            let mut sums = String::new();
+            let mut assets = Vec::new();
+            for (name, contents) in &release.assets {
+                let hash = if release.wrong_hashes.contains(name) { "f".repeat(64) } else { sha256_hex(contents) };
+                sums.push_str(&format!("{hash}  {name}\n"));
+                assets.push((name.clone(), contents.clone()));
+            }
+            assets.push(("SHA256SUMS".to_owned(), sums.into_bytes()));
+            let mut listed_assets = Vec::new();
+            for (name, contents) in assets {
+                let path = format!("/download/{}/{name}", release.tag);
+                server.mock("GET", path.as_str()).with_body(contents).create();
+                listed_assets.push(serde_json::json!({ "name": name, "browser_download_url": format!("{url}{path}") }));
+            }
+            listed.push(serde_json::json!({ "tag_name": release.tag, "draft": false, "assets": listed_assets }));
+        }
+        let list = server
+            .mock("GET", "/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_body(serde_json::Value::Array(listed).to_string())
+            // So `matched` says whether anything looked the releases up.
+            .expect_at_least(1)
+            .create();
+        FakeReleases { server, list }
+    }
+
+    /// The fake repository's REST API base, to pass as `AKSHUALLY_RELEASES_API`.
+    pub fn api(&self) -> String {
+        self.server.url()
+    }
+
+    /// Whether anything asked for the releases list.
+    pub fn looked_up(&self) -> bool {
+        self.list.matched()
+    }
+}
+
+/// The SHA-256 of `bytes`, in lower-case hex, as `sha256sum` prints it.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Packs `entry`, a file or directory in `dir`, into a `.tar.gz`, with `tar`.
+pub fn tar_gz(dir: &Path, entry: &str) -> Vec<u8> {
+    let archive = dir.join(".packed.tar.gz");
+    archiver(Command::new("tar").arg("-C").arg(dir).arg("-czf").arg(&archive).arg(entry));
+    let packed = fs::read(&archive).expect("read the packed archive");
+    fs::remove_file(archive).expect("remove the packed archive");
+    packed
+}
+
+/// Packs `entry`, a file or directory in `dir`, into a `.zip`, with `zip`.
+pub fn zip(dir: &Path, entry: &str) -> Vec<u8> {
+    let archive = dir.join(".packed.zip");
+    archiver(Command::new("zip").arg("-qry").arg(&archive).arg(entry).current_dir(dir));
+    let packed = fs::read(&archive).expect("read the packed archive");
+    fs::remove_file(archive).expect("remove the packed archive");
+    packed
+}
+
+fn archiver(cmd: &mut Command) {
+    let out = cmd.output().expect("run the archiver");
+    assert!(out.status.success(), "{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr));
 }
