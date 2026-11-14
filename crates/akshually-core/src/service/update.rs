@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use super::{Inner, Service};
 use crate::Error;
-use crate::update::Release;
+use crate::update::{Release, Version};
 
 /// What the Window's update notice shows: `None` in [`super::WindowView`] while there is no
 /// newer release, or the human dismissed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateView {
-    /// The release's version, such as `0.1.0`.
-    pub version: String,
+    /// The Release's version.
+    pub version: Version,
+    /// How far the Update has got, which says what the notice offers.
     pub stage: UpdateStage,
     /// The titles of the Sessions whose agent's `review` call is waiting: restarting ends
     /// those calls with an error, and the agents must run `review` again.
@@ -47,7 +48,7 @@ pub(super) struct Update {
 }
 
 struct Offer {
-    version: String,
+    version: Version,
     /// What to install; `None` once `akshually update` installed it instead.
     release: Option<Release>,
     stage: UpdateStage,
@@ -81,15 +82,15 @@ impl Service {
                 return;
             }
         };
-        let version = release.version.to_string();
         let mut inner = self.lock();
-        // An update installing or installed, or this one failing, stays as it is.
-        if inner.update.offer.as_ref().is_some_and(|o| o.version == version || o.release.is_none()) {
+        // An Update installing or installed, or this one already offered (perhaps failed), stays.
+        let keep = inner.update.offer.as_ref().is_some_and(|o| {
+            o.version == release.version || matches!(o.stage, UpdateStage::Installing | UpdateStage::Installed)
+        });
+        if keep {
             return;
         }
-        if matches!(inner.update.offer, Some(Offer { stage: UpdateStage::Installing | UpdateStage::Installed, .. })) {
-            return;
-        }
+        let version = release.version.clone();
         inner.update.offer = Some(Offer { version, release: Some(release), stage: UpdateStage::Available });
         inner.tell_window_subscribers();
     }
@@ -139,9 +140,9 @@ impl Service {
 
     /// `akshually update` installed `version` over this app's install: the notice offers
     /// Restart, even if the human dismissed it before.
-    pub fn update_installed(&self, version: &str) {
+    pub fn update_installed(&self, version: Version) {
         let mut inner = self.lock();
-        inner.update.offer = Some(Offer { version: version.to_owned(), release: None, stage: UpdateStage::Installed });
+        inner.update.offer = Some(Offer { version, release: None, stage: UpdateStage::Installed });
         inner.update.dismissed = false;
         inner.tell_window_subscribers();
     }

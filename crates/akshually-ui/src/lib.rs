@@ -796,7 +796,8 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
             vec![button("Update", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
         ),
         UpdateStage::Installing => (format!("Installing akshually {version}…"), Vec::new()),
-        UpdateStage::Installed if s.confirming_restart => (
+        // The agents may have stopped waiting since Restart was pressed.
+        UpdateStage::Installed if s.confirming_restart && !update.waiting.is_empty() => (
             format!(
                 "Restart now? The agents waiting in {} lose their call, which ends with an error: they must run \
                  `akshually review` again. Your Sessions are kept.",
@@ -2085,7 +2086,11 @@ fn scene_threads(s: &mut State) {
 fn scene_update(s: &mut State) {
     scene_session(s);
     s.open_inbox();
-    s.update = Some(UpdateView { version: "99.0.0".into(), stage: UpdateStage::Available, waiting: Vec::new() });
+    s.update = Some(UpdateView {
+        version: "99.0.0".parse().expect("a version"),
+        stage: UpdateStage::Available,
+        waiting: Vec::new(),
+    });
 }
 
 /// `--scene update-installed`: a Session whose agent waits, under the notice offering Restart
@@ -2093,7 +2098,8 @@ fn scene_update(s: &mut State) {
 fn scene_update_installed(s: &mut State) {
     scene_session(s);
     let waiting = s.tabs.iter().filter(|t| t.session.agent_waiting).map(|t| t.session.title()).take(1).collect();
-    s.update = Some(UpdateView { version: "99.0.0".into(), stage: UpdateStage::Installed, waiting });
+    s.update =
+        Some(UpdateView { version: "99.0.0".parse().expect("a version"), stage: UpdateStage::Installed, waiting });
 }
 
 /// A scene's Window of `sessions`, displaying the Session `displayed`, else the Inbox. The

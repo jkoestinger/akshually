@@ -103,3 +103,13 @@ _Avoid_: Stale, orphaned
 **Resolved**:
 The state of a Thread that either party has marked as dealt with; it can be reopened.
 _Avoid_: Closed, done
+
+## The app
+
+**Release**:
+A published version of akshually on GitHub Releases, with an asset per platform and a `SHA256SUMS`. A Release whose version has a pre-release part (`0.1.0-rc.1`) is a pre-release.
+_Avoid_: Version (a Release has one), build
+
+**Update**:
+Replacing akshually's own install with a newer Release, from the app's update notice or `akshually update`. The app then offers Restart, which relaunches it into the Update; Sessions survive it, a waiting agent's `review` call doesn't.
+_Avoid_: Upgrade, self-install

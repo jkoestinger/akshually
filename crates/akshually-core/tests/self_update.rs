@@ -5,8 +5,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use akshually_core::update::{Archive, Asset, Release, Releases, Target, UpdateError, Updater, Version, offered};
-use akshually_testkit::{FakeRelease, FakeReleases, tar_gz, zip};
+use akshually_core::update::{
+    Archive, Asset, Release, Releases, Target, UpdateError, Updater, Version, release_offered,
+};
+use akshually_testkit::{FakeRelease, FakeReleases, TestDirs, tar_gz, write_executable, zip};
 
 fn release(tag: &str) -> Release {
     Release { tag: tag.into(), version: tag.parse().unwrap(), assets: Vec::new() }
@@ -14,7 +16,7 @@ fn release(tag: &str) -> Release {
 
 fn offered_tag(running: &str, tags: &[&str]) -> Option<String> {
     let releases: Vec<Release> = tags.iter().map(|t| release(t)).collect();
-    offered(&running.parse().unwrap(), &releases).map(|r| r.tag.clone())
+    release_offered(&running.parse().unwrap(), &releases).map(|r| r.tag.clone())
 }
 
 #[test]
@@ -125,19 +127,15 @@ fn release_and_updater(github: &FakeReleases, target: Target, exe: &Path) -> (Re
 /// `.tar.gz`, the binary holding `binary`.
 fn linux_asset(binary: &str) -> (String, Vec<u8>) {
     let stem = format!("akshually-{TAG}-{LINUX}");
-    let work = tempfile::tempdir().unwrap();
-    fs::create_dir(work.path().join(&stem)).unwrap();
-    fs::write(work.path().join(&stem).join("akshually"), binary).unwrap();
-    fs::write(work.path().join(&stem).join("akshually.desktop"), "[Desktop Entry]\n").unwrap();
-    (format!("{stem}.tar.gz"), tar_gz(work.path(), &stem))
+    let archive = tar_gz(&stem, &[("akshually", binary), ("akshually.desktop", "[Desktop Entry]\n")]);
+    (format!("{stem}.tar.gz"), archive)
 }
 
 /// A macOS release asset, as `packaging/package.sh macos` makes it: `akshually.app` in a `.zip`,
-/// its binary holding `binary`.
+/// its binary and `Info.plist` holding `binary`.
 fn macos_asset(binary: &str) -> (String, Vec<u8>) {
-    let work = tempfile::tempdir().unwrap();
-    write_bundle(&work.path().join("akshually.app"), binary);
-    (format!("akshually-{TAG}-{MACOS}.zip"), zip(work.path(), "akshually.app"))
+    let archive = zip("akshually.app", &[("Contents/MacOS/akshually", binary), ("Contents/Info.plist", binary)]);
+    (format!("akshually-{TAG}-{MACOS}.zip"), archive)
 }
 
 /// Writes an `akshually.app` bundle at `app` whose binary holds `binary`; returns the binary.
@@ -145,16 +143,15 @@ fn write_bundle(app: &Path, binary: &str) -> PathBuf {
     let exe = app.join("Contents/MacOS/akshually");
     fs::create_dir_all(exe.parent().unwrap()).unwrap();
     fs::write(app.join("Contents/Info.plist"), binary).unwrap();
-    fs::write(&exe, binary).unwrap();
+    write_executable(&exe, binary);
     exe
 }
 
 /// An installed Linux binary holding `contents`, in a dir of its own.
-fn linux_install(contents: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+fn linux_install(contents: &str) -> (TestDirs, PathBuf) {
+    let dir = TestDirs::new();
     let exe = dir.path().join("akshually");
-    fs::write(&exe, contents).unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&exe, contents);
     (dir, exe)
 }
 
@@ -177,7 +174,7 @@ fn installing_a_release_replaces_a_linux_binary_in_place() {
 fn installing_a_release_replaces_a_macos_bundle_as_a_whole() {
     let (name, archive) = macos_asset("new binary");
     let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
-    let apps = tempfile::tempdir().unwrap();
+    let apps = TestDirs::new();
     let app = apps.path().join("akshually.app");
     let exe = write_bundle(&app, "old binary");
     fs::write(app.join("Contents/stale"), "only in the old bundle").unwrap();
@@ -231,5 +228,22 @@ fn a_release_without_this_platforms_asset_is_refused() {
     let error = updater.install(&release).unwrap_err();
 
     assert!(matches!(error, UpdateError::NoAsset { .. }), "{error:?}");
+    assert_eq!(fs::read_to_string(&exe).unwrap(), "old binary");
+}
+
+#[test]
+fn a_bundle_that_cannot_be_moved_is_refused_with_a_pointer_to_the_install_script() {
+    let (name, archive) = macos_asset("new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let apps = TestDirs::new();
+    let app = apps.path().join("akshually.app");
+    let exe = write_bundle(&app, "old binary");
+    let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let error = updater.install(&release).unwrap_err();
+
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(error, UpdateError::NotWritable { .. }), "{error:?}");
     assert_eq!(fs::read_to_string(&exe).unwrap(), "old binary");
 }

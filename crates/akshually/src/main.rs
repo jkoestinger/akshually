@@ -6,6 +6,7 @@ mod launch;
 mod render;
 
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,9 +15,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use akshually_core::ipc::{self, BindError, ClientError, Connection, ErrorCode, Server};
-use akshually_core::update::{Releases, Updater};
-use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
+use akshually_core::{
+    Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge,
+    ipc::{self, BindError, ClientError, Connection, ErrorCode, Server},
+    update::{Releases, Updater},
+};
 
 /// The agent skill `agent-help` prints.
 const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
@@ -355,12 +358,12 @@ fn update() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     updater.install(&release).with_context(|| format!("can't update akshually to {}", release.version))?;
-    let version = release.version.to_string();
+    let version = &release.version;
     // Never launches the app: only one already running needs telling.
     match ipc::connect(&Paths::from_env()) {
         Ok(app) => {
             // Best-effort: an app too old to understand still runs the old binary until restarted.
-            let _ = app.update_installed(&version);
+            let _ = app.update_installed(version);
             println!("updated akshually {running} → {version}; restart the app to use it");
         }
         Err(_) => println!("updated akshually {running} → {version}"),
@@ -372,7 +375,6 @@ fn update() -> Result<ExitCode> {
 /// the single-instance lock and the socket close with the old image, so the new one takes
 /// them, and Sessions come back from disk. Returns only if it couldn't.
 fn relaunch(exe: &Path, headless: bool) -> io::Error {
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("app");
     if headless {

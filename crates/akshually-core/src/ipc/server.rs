@@ -186,10 +186,13 @@ impl Server {
                 .draft(source(cwd, pr), anchor, NewComment { body, suggestion })
                 .map(|thread| serde_json::json!({ "thread": thread }))
                 .map_err(failed),
-            Request::UpdateInstalled { version } => {
-                self.service.update_installed(&version);
-                Ok(serde_json::json!({}))
-            }
+            Request::UpdateInstalled { version } => match version.parse() {
+                Ok(version) => {
+                    self.service.update_installed(version);
+                    Ok(serde_json::json!({}))
+                }
+                Err(error) => Err(ErrorReply::new(ErrorCode::BadRequest, error.to_string())),
+            },
             Request::TestState | Request::TestHuman { .. } if !self.test_control => {
                 Err(ErrorReply::new(ErrorCode::Forbidden, "this app was not started for tests"))
             }

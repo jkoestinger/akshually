@@ -9,11 +9,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use super::{Release, Releases, UpdateError, Version, offered};
-
-/// The install script, which installs where self-update can write (ADR 0003).
-const INSTALL_SCRIPT: &str =
-    "curl -fsSL https://raw.githubusercontent.com/jkoestinger/akshually/main/install.sh | bash";
+use super::{Release, Releases, UpdateError, Version, release_offered};
 
 /// The platform a release asset is built for: its target triple, and how it is packed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +63,7 @@ enum Install {
 impl Install {
     /// The install `exe` (a real path, symlinks resolved) belongs to: the `.app` bundle when it
     /// is a bundle's `Contents/MacOS` binary, else the binary.
-    fn of(exe: &Path) -> Install {
+    fn containing(exe: &Path) -> Install {
         let bundle = exe
             .parent()
             .filter(|d| d.ends_with("Contents/MacOS"))
@@ -79,15 +75,30 @@ impl Install {
         }
     }
 
-    fn path(&self) -> &Path {
-        match self {
-            Install::Binary(path) | Install::Bundle(path) => path,
-        }
+    /// The directory the install is in, which the Update writes to.
+    fn dir(&self) -> &Path {
+        let (Install::Binary(path) | Install::Bundle(path)) = self;
+        path.parent().unwrap_or(Path::new("/"))
     }
 
-    /// The directory the install is in, which the update writes to.
-    fn dir(&self) -> &Path {
-        self.path().parent().unwrap_or(Path::new("/"))
+    /// Where the Update must be able to write, besides `dir`: a bundle moves out of `dir` as a
+    /// whole, which needs write access to the bundle itself.
+    fn also_written(&self) -> Option<&Path> {
+        match self {
+            Install::Binary(_) => None,
+            Install::Bundle(app) => Some(app),
+        }
+    }
+}
+
+/// Turns an error writing into the install at `path` into `NotWritable` when the user may not
+/// write there, and into `Io` when something else went wrong (a full disk).
+fn unwritable(path: &Path) -> impl Fn(io::Error) -> UpdateError + '_ {
+    move |error| match error.kind() {
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => {
+            UpdateError::NotWritable { path: path.to_owned() }
+        }
+        _ => UpdateError::Io { path: path.to_owned(), source: error },
     }
 }
 
@@ -124,20 +135,20 @@ impl Updater {
     /// The release this install is offered (see [`offered`]); `None` when it is current.
     pub fn newer(&self) -> Result<Option<Release>, UpdateError> {
         let releases = self.releases.list()?;
-        Ok(offered(&self.running, &releases).cloned())
+        Ok(release_offered(&self.running, &releases).cloned())
     }
 
     /// Replaces the install with `release`'s asset for this platform, once its hash matches
     /// `SHA256SUMS`. On any failure the install is left as it was. Refuses an install in a
     /// directory the user can't write to, pointing to the install script.
     pub fn install(&self, release: &Release) -> Result<(), UpdateError> {
-        let install = Install::of(&self.exe);
+        let install = Install::containing(&self.exe);
         let dir = install.dir();
         // Unpacked beside the install, so it moves in by a rename on the same file system.
-        let work = tempfile::Builder::new()
-            .prefix(".akshually-update")
-            .tempdir_in(dir)
-            .map_err(|_| UpdateError::NotWritable { path: dir.to_owned(), script: INSTALL_SCRIPT })?;
+        let staging = tempfile::Builder::new().prefix(".akshually-update").tempdir_in(dir).map_err(unwritable(dir))?;
+        if let Some(path) = install.also_written() {
+            tempfile::tempfile_in(path).map_err(unwritable(path))?;
+        }
         let target = self.target.as_ref().ok_or(UpdateError::NoPlatform)?;
         let name = target.asset(&release.tag);
         let url = |name: &str| release.assets.iter().find(|a| a.name == name).map(|a| a.url.clone());
@@ -152,9 +163,9 @@ impl Updater {
             return Err(UpdateError::HashMismatch(name));
         }
 
-        let packed = work.path().join(&name);
+        let packed = staging.path().join(&name);
         fs::write(&packed, &archive).map_err(io_at(&packed))?;
-        let unpacked = work.path().join("unpacked");
+        let unpacked = staging.path().join("unpacked");
         fs::create_dir(&unpacked).map_err(io_at(&unpacked))?;
         unpack(target.archive, &packed, &unpacked)
             .map_err(|message| UpdateError::Unpack { name: name.clone(), message })?;
@@ -173,7 +184,7 @@ impl Updater {
                 if !new.join("Contents/MacOS/akshually").is_file() {
                     return Err(UpdateError::Unpack { name, message: "it holds no akshually.app".into() });
                 }
-                swap_bundle(app, &new, &work.path().join("old.app"))
+                swap_bundle(app, &new, &staging.path().join("old.app"))
             }
         }
     }
@@ -230,10 +241,12 @@ fn listed_hash<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// `bytes` in lower-case hex, as `SHA256SUMS` lists hashes.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Turns an error writing the Update at `path` into an [`UpdateError`].
 fn io_at(path: &Path) -> impl Fn(io::Error) -> UpdateError + '_ {
     move |source| UpdateError::Io { path: path.to_owned(), source }
 }

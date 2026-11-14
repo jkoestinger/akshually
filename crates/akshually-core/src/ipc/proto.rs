@@ -71,8 +71,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_token: Option<String>,
     },
-    /// `akshually update` installed `version` over the running app's install: its update notice
-    /// offers Restart. Replies `{}` at once.
+    /// `akshually update` installed `version` (such as `0.1.0`) over the running app's install:
+    /// its update notice offers Restart. Replies `{}` at once.
     UpdateInstalled { version: String },
     /// Test control: the app's pid and Sessions, as `AppState`.
     #[serde(rename = "test.state")]

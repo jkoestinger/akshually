@@ -2,12 +2,11 @@
 //! it, and what Restart has to warn about, against a fake GitHub.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use akshually_core::update::{Archive, Releases, Target, Updater, Version};
 use akshually_core::{ReviewRequest, Service, Settings, UpdateStage, UpdateView};
-use akshually_testkit::{FakeRelease, FakeReleases, TestRepo, tar_gz};
+use akshually_testkit::{FakeRelease, FakeReleases, TestDirs, TestRepo, tar_gz, write_executable};
 
 /// A tag newer than any version akshually will be built as.
 const NEWER: &str = "v99.0.0";
@@ -17,18 +16,14 @@ const TARGET: &str = "x86_64-unknown-linux-gnu";
 /// `TARGET`'s release asset of `NEWER`, holding `binary`.
 fn asset(binary: &str) -> (String, Vec<u8>) {
     let stem = format!("akshually-{NEWER}-{TARGET}");
-    let work = tempfile::tempdir().unwrap();
-    fs::create_dir(work.path().join(&stem)).unwrap();
-    fs::write(work.path().join(&stem).join("akshually"), binary).unwrap();
-    (format!("{stem}.tar.gz"), tar_gz(work.path(), &stem))
+    (format!("{stem}.tar.gz"), tar_gz(&stem, &[("akshually", binary)]))
 }
 
 /// An installed binary, in a dir of its own.
-fn install() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+fn install() -> (TestDirs, PathBuf) {
+    let dir = TestDirs::new();
     let exe = dir.path().join("akshually");
-    fs::write(&exe, "old binary").unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&exe, "old binary");
     (dir, exe)
 }
 
@@ -59,7 +54,8 @@ fn a_newer_release_shows_the_update_notice_naming_it() {
     svc.check_for_updates();
 
     let update = svc.window().update.expect("no update notice");
-    assert_eq!(update, UpdateView { version: "99.0.0".into(), stage: UpdateStage::Available, waiting: Vec::new() });
+    let version = "99.0.0".parse().unwrap();
+    assert_eq!(update, UpdateView { version, stage: UpdateStage::Available, waiting: Vec::new() });
 }
 
 #[test]
@@ -148,10 +144,10 @@ fn an_update_installed_from_the_cli_offers_restart_even_after_a_dismissal() {
     svc.check_for_updates();
     svc.dismiss_update();
 
-    svc.update_installed("99.0.0");
+    svc.update_installed("99.0.0".parse().unwrap());
 
     let update = svc.window().update.expect("no update notice");
-    assert_eq!((update.version.as_str(), update.stage), ("99.0.0", UpdateStage::Installed));
+    assert_eq!((update.version.to_string(), update.stage), ("99.0.0".to_owned(), UpdateStage::Installed));
 }
 
 #[test]
@@ -163,7 +159,7 @@ fn the_notice_names_the_sessions_whose_agents_wait_so_restart_can_warn_about_the
     let _waiting = svc.review(ReviewRequest::new(repo.path())).unwrap();
     let title = svc.sessions()[0].title();
 
-    svc.update_installed("99.0.0");
+    svc.update_installed("99.0.0".parse().unwrap());
 
     assert_eq!(svc.window().update.expect("no update notice").waiting, [title]);
 }

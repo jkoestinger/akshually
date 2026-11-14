@@ -22,11 +22,8 @@ const RUNNING: &str = env!("CARGO_PKG_VERSION");
 /// holds `binary`.
 fn linux_asset(binary: &str) -> (String, Vec<u8>) {
     let stem = format!("akshually-{NEWER}-x86_64-unknown-linux-gnu");
-    let work = TestDirs::new();
-    fs::create_dir(work.path().join(&stem)).unwrap();
-    fs::write(work.path().join(&stem).join("akshually"), binary).unwrap();
-    fs::write(work.path().join(&stem).join("akshually.desktop"), "[Desktop Entry]\n").unwrap();
-    (format!("{stem}.tar.gz"), tar_gz(work.path(), &stem))
+    let archive = tar_gz(&stem, &[("akshually", binary), ("akshually.desktop", "[Desktop Entry]\n")]);
+    (format!("{stem}.tar.gz"), archive)
 }
 
 /// A copy of akshually installed in a dir of its own, so updating it leaves the build alone.
@@ -87,7 +84,7 @@ fn update_replaces_the_install_and_tells_the_running_app_to_offer_restart() {
     );
     assert_eq!(fs::read_to_string(&exe).unwrap(), "new binary");
     let notice = app.service.window().update.expect("the app shows no update notice");
-    assert_eq!((notice.version.as_str(), notice.stage), ("99.0.0", UpdateStage::Installed));
+    assert_eq!((notice.version.to_string(), notice.stage), ("99.0.0".to_owned(), UpdateStage::Installed));
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -173,4 +170,24 @@ fn a_review_waiting_when_the_app_restarts_says_so_and_the_session_comes_back() {
     assert_eq!(after.pid, before.pid, "the app didn't restart in place");
     assert_eq!(after.sessions[0].id, before.sessions[0].id);
     assert!(!after.sessions[0].agent_waiting, "the restored Session still has an agent waiting");
+}
+
+#[test]
+fn a_review_that_cannot_print_its_outcome_does_not_blame_a_restart() {
+    let app = HostedApp::start();
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "fn a() {}\n").commit_all("base");
+    repo.branch("agent").write("lib.rs", "fn a() {}\nfn b() {}\n");
+    let mut review = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let session = app.wait_for_session(repo.path());
+    // The agent stops reading: printing the outcome fails with a broken pipe.
+    drop(review.stdout.take());
+
+    app.service.approve(&session.id).unwrap();
+
+    let out = finish(review);
+    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("can't print the outcome"), "{stderr}");
+    assert!(!stderr.contains("restarted"), "a failed print blamed a restart: {stderr}");
 }

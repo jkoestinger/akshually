@@ -293,22 +293,41 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Packs `entry`, a file or directory in `dir`, into a `.tar.gz`, with `tar`.
-pub fn tar_gz(dir: &Path, entry: &str) -> Vec<u8> {
-    let archive = dir.join(".packed.tar.gz");
-    archiver(Command::new("tar").arg("-C").arg(dir).arg("-czf").arg(&archive).arg(entry));
-    let packed = fs::read(&archive).expect("read the packed archive");
-    fs::remove_file(archive).expect("remove the packed archive");
-    packed
+/// A `.tar.gz` of the directory `root` holding `files` (paths relative to it, and contents),
+/// as `tar` packs it.
+pub fn tar_gz(root: &str, files: &[(&str, &str)]) -> Vec<u8> {
+    pack(root, files, |dir, archive| {
+        archiver(Command::new("tar").arg("-C").arg(dir).arg("-czf").arg(archive).arg(root));
+    })
 }
 
-/// Packs `entry`, a file or directory in `dir`, into a `.zip`, with `zip`.
-pub fn zip(dir: &Path, entry: &str) -> Vec<u8> {
-    let archive = dir.join(".packed.zip");
-    archiver(Command::new("zip").arg("-qry").arg(&archive).arg(entry).current_dir(dir));
-    let packed = fs::read(&archive).expect("read the packed archive");
-    fs::remove_file(archive).expect("remove the packed archive");
-    packed
+/// A `.zip` of the directory `root` holding `files` (paths relative to it, and contents), as
+/// `zip` packs it.
+pub fn zip(root: &str, files: &[(&str, &str)]) -> Vec<u8> {
+    pack(root, files, |dir, archive| {
+        archiver(Command::new("zip").arg("-qry").arg(archive).arg(root).current_dir(dir));
+    })
+}
+
+/// Writes `files` under `root` in a scratch dir, then has `archive_to` pack `root` from it.
+fn pack(root: &str, files: &[(&str, &str)], archive_to: impl FnOnce(&Path, &Path)) -> Vec<u8> {
+    let dir = TestDirs::new();
+    for (path, contents) in files {
+        let path = dir.path().join(root).join(path);
+        fs::create_dir_all(path.parent().expect("a file has a parent dir")).expect("create parent dirs");
+        fs::write(path, contents).expect("write a file to pack");
+    }
+    // With an extension, so `zip` doesn't add `.zip` to it.
+    let archive = dir.path().join("packed.archive");
+    archive_to(dir.path(), &archive);
+    fs::read(&archive).expect("read the packed archive")
+}
+
+/// Writes an executable file holding `contents` at `path`.
+pub fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, contents).expect("write the executable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make it executable");
 }
 
 fn archiver(cmd: &mut Command) {

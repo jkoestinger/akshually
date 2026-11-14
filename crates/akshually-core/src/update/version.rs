@@ -113,7 +113,7 @@ impl fmt::Display for Version {
 /// The release an install at `running` is offered among `releases`: the newest one newer than
 /// it, counting pre-releases only when `running` is a pre-release itself. `None` when it is
 /// current.
-pub fn offered<'a>(running: &Version, releases: &'a [Release]) -> Option<&'a Release> {
+pub fn release_offered<'a>(running: &Version, releases: &'a [Release]) -> Option<&'a Release> {
     releases
         .iter()
         .filter(|r| r.version > *running && (running.is_prerelease() || !r.version.is_prerelease()))

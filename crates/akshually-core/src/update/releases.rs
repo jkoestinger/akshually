@@ -7,11 +7,15 @@ use serde::Deserialize;
 use super::{Asset, Release, UpdateError};
 
 /// akshually's repository on the GitHub REST API, where its releases are listed.
-pub const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/jkoestinger/akshually";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/jkoestinger/akshually";
 
-/// How long one request about releases may take, download included: an asset is tens of
-/// megabytes, which a slow connection takes minutes over.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long a download may take: an asset is tens of megabytes, which a slow connection takes
+/// minutes over.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How long looking the releases up may take: one small JSON answer, so a stalled one doesn't
+/// hold the app's daily check for as long as a download.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most read of a downloaded asset: far above any release's size, so a bad answer can't
 /// fill the memory.
@@ -35,7 +39,7 @@ impl Releases {
         let agent = ureq::Agent::config_builder()
             // Read 4xx/5xx bodies for GitHub's error messages.
             .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_TIMEOUT))
+            .timeout_global(Some(DOWNLOAD_TIMEOUT))
             .user_agent(concat!("akshually/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
@@ -68,7 +72,10 @@ impl Releases {
             .agent
             .get(&url)
             .query("per_page", RELEASES_PER_PAGE.to_string())
-            .header("Accept", "application/vnd.github+json");
+            .header("Accept", "application/vnd.github+json")
+            .config()
+            .timeout_global(Some(LOOKUP_TIMEOUT))
+            .build();
         let body = self.read(request.call(), &url)?;
         let listed: Vec<Listed> = serde_json::from_slice(&body).map_err(|e| UpdateError::Unexpected(e.to_string()))?;
         let releases = listed.into_iter().filter(|r| !r.draft).filter_map(|r| {
