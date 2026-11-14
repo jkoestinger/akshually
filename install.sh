@@ -10,13 +10,16 @@
 #   macOS:  ~/Applications/akshually.app, and a ~/.local/bin/akshually symlink to the binary inside it
 #
 # These locations are a contract: self-update replaces installs found there (docs/adr/0003).
-# `AKSHUALLY_RELEASES_URL` points it at another copy of the Releases tree; the tests use a `file://` one.
+# `AKSHUALLY_RELEASES_URL` points it at another copy of the Releases tree, for the tests' `file://` one.
 #
 # Written for bash 3.2, which macOS still ships. Everything runs from `main`, called on the last line,
 # so a download cut short by `curl | bash` runs nothing.
 set -euo pipefail
 
 releases_page=https://github.com/jkoestinger/akshually/releases
+# How often curl retries a download that fails for a transient reason (a timeout, a 5xx), since
+# GitHub's release CDN sometimes drops a connection. A 404 isn't retried.
+download_retries=3
 
 say() { echo "akshually: $*"; }
 
@@ -34,9 +37,9 @@ sha256() {
     fi
 }
 
-# Downloads `$1` to `$2`.
+# Downloads `$1` to `$2`. Returns non-zero when it can't, for the caller to explain.
 fetch() {
-    curl -fsSL --retry 3 -o "$2" "$1" || die "can't download $1"
+    curl -fsSL --retry "$download_retries" -o "$2" "$1"
 }
 
 # Prints the version the binary at `$1` reports (`akshually 1.2.3`), or nothing when there's no
@@ -47,20 +50,15 @@ installed_version() {
 }
 
 main() {
-    local releases=${AKSHUALLY_RELEASES_URL:-$releases_page}
+    local releases_url=${AKSHUALLY_RELEASES_URL:-$releases_page}
     local version=${AKSHUALLY_VERSION:-}
     local bin_dir="$HOME/.local/bin"
-    local os arch target ext
-    command -v curl >/dev/null || die "curl is needed to download akshually"
+    local platform target ext
+    command -v curl >/dev/null || die "curl is needed to download akshually; install it and run this again"
 
-    os=$(uname -s)
-    arch=$(uname -m)
-    case "$os/$arch" in
-    Linux/x86_64) target=x86_64-unknown-linux-gnu ext=tar.gz ;;
-    Darwin/arm64) target=aarch64-apple-darwin ext=zip ;;
-    Darwin/x86_64) target=x86_64-apple-darwin ext=zip ;;
-    *) die "there's no akshually release for $os $arch; see $releases_page for the platforms there are" ;;
-    esac
+    # Assigned on its own line so that `set -e` stops here when `release_target` dies.
+    platform=$(release_target)
+    read -r target ext <<<"$platform"
 
     # Global, for the `EXIT` trap.
     work=$(mktemp -d)
@@ -68,24 +66,30 @@ main() {
 
     # `SHA256SUMS` names every asset, so it also gives the latest stable release's tag without the
     # GitHub API: `releases/latest/download/` serves the newest release that isn't a pre-release.
-    local sums_url
+    local sums_url release
     if [[ -n $version ]]; then
-        sums_url="$releases/download/$version/SHA256SUMS"
+        sums_url="$releases_url/download/$version/SHA256SUMS" release="release $version"
     else
-        sums_url="$releases/latest/download/SHA256SUMS"
+        sums_url="$releases_url/latest/download/SHA256SUMS" release="the latest release"
     fi
-    fetch "$sums_url" "$work/SHA256SUMS"
+    fetch "$sums_url" "$work/SHA256SUMS" ||
+        die "can't download SHA256SUMS for $release from $sums_url; releases from before the install script have none, so set AKSHUALLY_VERSION to a newer tag from $releases_page"
     local asset expected tag
     asset=$(awk -v suffix="-$target.$ext" \
         'length($2) > length(suffix) && substr($2, length($2) - length(suffix) + 1) == suffix { print $2; exit }' \
         "$work/SHA256SUMS")
-    [[ -n $asset ]] || die "the release has no asset for $target; see $releases_page"
+    [[ -n $asset ]] || die "$release has no asset for $target; pick another from $releases_page"
     expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$work/SHA256SUMS")
-    tag=${asset#akshually-}
-    tag=${tag%-"$target.$ext"}
+    if [[ -n $version ]]; then
+        tag=$version
+    else
+        tag=${asset#akshually-}
+        tag=${tag%-"$target.$ext"}
+    fi
 
     say "downloading $asset"
-    fetch "$releases/download/$tag/$asset" "$work/$asset"
+    fetch "$releases_url/download/$tag/$asset" "$work/$asset" ||
+        die "can't download $asset from $releases_url/download/$tag; check your connection and run this again"
     [[ $(sha256 "$work/$asset") == "$expected" ]] ||
         die "$asset doesn't match its hash in SHA256SUMS, so nothing was installed; try again, or report it at $releases_page"
 
@@ -96,20 +100,44 @@ main() {
         tar -C "$work/unpacked" -xzf "$work/$asset"
         local dir="$work/unpacked/${asset%.tar.gz}"
         [[ -f $dir/akshually && -f $dir/akshually.desktop ]] ||
-            die "$asset doesn't hold akshually and its launcher entry"
+            die "$asset doesn't hold akshually and its launcher entry, so nothing was installed; report it at $releases_page"
         install_linux "$dir" "$bin_dir"
     else
         unzip -q "$work/$asset" -d "$work/unpacked"
-        [[ -f $work/unpacked/akshually.app/Contents/MacOS/akshually ]] || die "$asset doesn't hold akshually.app"
+        [[ -f $work/unpacked/akshually.app/Contents/MacOS/akshually ]] ||
+            die "$asset doesn't hold akshually.app, so nothing was installed; report it at $releases_page"
         install_macos "$work/unpacked/akshually.app" "$bin_dir"
     fi
-    new=$("$bin_dir/akshually" --version) || die "the installed $bin_dir/akshually doesn't run"
+    new=$("$bin_dir/akshually" --version) ||
+        die "the installed $bin_dir/akshually doesn't run; report it at $releases_page with your OS version"
 
     if [[ -n $old ]]; then
         say "replaced $old with $new"
     else
         say "installed $new"
     fi
+    path_hint "$bin_dir"
+}
+
+# Prints the target triple and archive extension of this machine's release asset, or dies when
+# there's no release for it.
+release_target() {
+    local os arch
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "$os/$arch" in
+    Linux/x86_64) echo x86_64-unknown-linux-gnu tar.gz ;;
+    Darwin/arm64) echo aarch64-apple-darwin zip ;;
+    Darwin/x86_64) echo x86_64-apple-darwin zip ;;
+    *) die "there's no akshually release for $os $arch; see $releases_page for the platforms there are" ;;
+    esac
+}
+
+# Tells the user how to reach the install at `$1/akshually` when their `PATH` doesn't: the line to
+# add when `$1` isn't on it, or a warning when another `akshually` comes first, such as a
+# `/usr/local/bin` link left by the README's old macOS steps.
+path_hint() {
+    local bin_dir=$1 found
     case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *)
@@ -117,21 +145,31 @@ main() {
         # Printed for the user to paste, so `$HOME` and `$PATH` stay unexpanded.
         # shellcheck disable=SC2016
         echo '  export PATH="$HOME/.local/bin:$PATH"'
+        return
         ;;
     esac
+    found=$(command -v akshually || true)
+    if [[ -n $found && $found != "$bin_dir/akshually" ]]; then
+        say "\`akshually\` runs $found, not this install; remove it, or put $bin_dir before $(dirname "$found") on your PATH"
+    fi
 }
 
 # Installs the binary and the launcher entry from the unpacked tarball dir `$1` into bin dir `$2`.
-# Each file is written beside its target and renamed over it, so a running akshually keeps its
-# binary and a failed copy leaves the old file whole.
 install_linux() {
     local dir=$1 bin_dir=$2
-    local apps="$HOME/.local/share/applications"
-    mkdir -p "$bin_dir" "$apps"
-    install -m 755 "$dir/akshually" "$bin_dir/.akshually.new"
-    mv -f "$bin_dir/.akshually.new" "$bin_dir/akshually"
-    install -m 644 "$dir/akshually.desktop" "$apps/.akshually.desktop.new"
-    mv -f "$apps/.akshually.desktop.new" "$apps/akshually.desktop"
+    replace_file 755 "$dir/akshually" "$bin_dir/akshually"
+    replace_file 644 "$dir/akshually.desktop" "$HOME/.local/share/applications/akshually.desktop"
+}
+
+# Copies `$2` to `$3` with mode `$1`. It writes beside `$3` and renames over it, so a running
+# akshually keeps its binary and a failed copy leaves the old file whole.
+replace_file() {
+    local mode=$1 src=$2 dest=$3
+    local tmp
+    tmp="$(dirname "$dest")/.$(basename "$dest").new"
+    mkdir -p "$(dirname "$dest")"
+    install -m "$mode" "$src" "$tmp"
+    mv -f "$tmp" "$dest"
 }
 
 # Installs the unpacked bundle `$1` as `~/Applications/akshually.app` and links `$2/akshually` to the
@@ -139,17 +177,17 @@ install_linux() {
 install_macos() {
     local app=$1 bin_dir=$2
     local apps="$HOME/Applications"
-    # curl sets no quarantine flag, but a proxy or a copied download could: clear it so Gatekeeper
-    # doesn't call the unsigned app damaged.
-    if command -v xattr >/dev/null; then
-        xattr -dr com.apple.quarantine "$app" 2>/dev/null || true
-    fi
     mkdir -p "$apps" "$bin_dir"
     # Copy beside the old bundle first (the temp dir may be on another volume), then swap it in.
     rm -rf "$apps/.akshually.app.new"
     cp -R "$app" "$apps/.akshually.app.new"
     rm -rf "$apps/akshually.app"
     mv "$apps/.akshually.app.new" "$apps/akshually.app"
+    # curl sets no quarantine flag, but a proxy or a copied download could: clear it so Gatekeeper
+    # doesn't call the unsigned app damaged.
+    if command -v xattr >/dev/null; then
+        xattr -dr com.apple.quarantine "$apps/akshually.app" 2>/dev/null || true
+    fi
     ln -sfn "$apps/akshually.app/Contents/MacOS/akshually" "$bin_dir/akshually"
 }
 

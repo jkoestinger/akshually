@@ -44,6 +44,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # Packages this build as a release and installs it with install.sh into a throwaway HOME, so a
+      # broken install shows before a release does.
+      - name: Install a real build
+        run: |
+          cargo build --locked -p akshually
+          AKSHUALLY_BINARY="$PWD/target/debug/akshually" packaging/install_test.sh installs_a_real_build
+
   install-script:
     name: Install script (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
