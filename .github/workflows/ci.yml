@@ -43,3 +43,29 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # Packages this build as a release and installs it with install.sh into a throwaway HOME, so a
+      # broken install shows before a release does.
+      - name: Install a real build
+        run: |
+          cargo build --locked -p akshually
+          AKSHUALLY_BINARY="$PWD/target/debug/akshually" packaging/install_test.sh installs_a_real_build
+
+  install-script:
+    name: Install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+
+      # shellcheck comes with the Ubuntu runner image; one run covers both platforms.
+      - name: Shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh packaging/install_test.sh packaging/package.sh
+
+      # Installs fake releases into a throwaway HOME, through a `file://` copy of the Releases tree.
+      - name: Test
+        run: packaging/install_test.sh
