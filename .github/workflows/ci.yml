@@ -43,3 +43,22 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  install-script:
+    name: Install script (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+
+      # shellcheck comes with the Ubuntu runner image; one run covers both platforms.
+      - name: Shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh packaging/install_test.sh packaging/package.sh
+
+      # Installs fake releases into a throwaway HOME, through a `file://` copy of the Releases tree.
+      - name: Test
+        run: packaging/install_test.sh

@@ -70,6 +70,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The install script and self-update check every asset against this file (docs/adr/0003).
+      - name: Checksum the assets
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,3 +86,24 @@ jobs:
           prerelease=()
           if [[ $TAG == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes "${prerelease[@]}"
+
+  # Installs the release just published with the install script, as a user would, into a throwaway HOME.
+  install:
+    name: Install the release (${{ matrix.os }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install with install.sh
+        env:
+          AKSHUALLY_VERSION: ${{ github.ref_name }}
+        run: |
+          export HOME="$(mktemp -d)"
+          bash install.sh
+          "$HOME/.local/bin/akshually" --version | tee version.txt
+          test "$(cat version.txt)" = "akshually ${AKSHUALLY_VERSION#v}"
