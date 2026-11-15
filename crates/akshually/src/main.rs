@@ -64,13 +64,13 @@ enum Command {
     Start,
     /// Ask the human to review your local work: this branch against its merge-base with the
     /// default branch, plus uncommitted changes and untracked files. Blocks until the human
-    /// answers. Exits 0 when they approve, 4 when they hand over a Round (printed as markdown,
-    /// or JSON with `--format json`: address it, reply to or resolve its Threads, then run
-    /// `review` again), 3 when they abandon the Session (stop working on it), 1 on error.
-    /// After `draft` on this branch, it hands your Drafts to the human instead: exits 4 when
-    /// they question them, 6 when they close the co-review. With `--pr <url>`, hand your Drafts
-    /// on that Pull Request to the human: exits 5 when they Publish (printing the Verdict and
-    /// the review's link), 4 when they question your Drafts, 3 when they abandon it.
+    /// answers, prints what they did (markdown, or JSON with `--format json`) and exits 0; the
+    /// first line says which outcome it was: `# Round N` (address it, reply to or resolve its
+    /// Threads, then run `review` again), `Approved.`, or `Abandoned: …` (stop working on it).
+    /// Exits 1 on error. After `draft` on this branch, it hands your Drafts to the human
+    /// instead: a Round holds their questions, and `Closed: …` ends the co-review. With
+    /// `--pr <url>`, hand your Drafts on that Pull Request to the human: `Published with the
+    /// Verdict …` gives the Verdict and the review's link.
     Review(ReviewArgs),
     /// Reply to a Thread of this branch's Session (or with `--pr`, of that Pull Request's),
     /// e.g. `akshually reply T3 "Done: …"`. The human sees it at once; returns immediately.

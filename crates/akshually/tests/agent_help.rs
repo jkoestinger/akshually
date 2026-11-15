@@ -93,15 +93,15 @@ fn review_answered(args: &[&str], human: impl FnOnce(&Service, &SessionId)) -> O
     finish(child)
 }
 
-fn approved(args: &[&str]) -> Output {
+fn review_approved(args: &[&str]) -> Output {
     review_answered(args, |service, id| service.approve(id).unwrap())
 }
 
-fn abandoned(args: &[&str]) -> Output {
+fn review_abandoned(args: &[&str]) -> Output {
     review_answered(args, |service, id| service.abandon(id).unwrap())
 }
 
-fn round_handed_over(args: &[&str]) -> Output {
+fn review_round_handed_over(args: &[&str]) -> Output {
     review_answered(args, |service, id| {
         service.comment(id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
         service.hand_over_round(id).unwrap();
@@ -135,7 +135,7 @@ fn exit_code_reached_for(code: i32) -> Option<i32> {
     let outside_a_repo =
         |args: &[&str]| HostedApp::start().akshually(&std::env::temp_dir(), args).output().unwrap().status.code();
     match code {
-        0 => approved(&[]).status.code(),
+        0 => review_approved(&[]).status.code(),
         1 => outside_a_repo(&["review"]),
         2 => outside_a_repo(&["review", "--bogus"]),
         _ => None,
@@ -162,12 +162,14 @@ struct DocumentedOutcome {
 impl DocumentedOutcome {
     fn matches(&self, line: &str) -> bool {
         let mut numbered = String::new();
+        let mut in_number = false;
         for c in line.chars() {
-            match c.is_ascii_digit() {
-                true if numbered.ends_with('N') => {}
-                true => numbered.push('N'),
-                false => numbered.push(c),
+            match (c.is_ascii_digit(), in_number) {
+                (true, true) => {}
+                (true, false) => numbered.push('N'),
+                (false, _) => numbered.push(c),
             }
+            in_number = c.is_ascii_digit();
         }
         match self.first_line.strip_suffix('…') {
             Some(start) => numbered.starts_with(start),
@@ -192,22 +194,42 @@ fn documented_outcomes() -> Vec<DocumentedOutcome> {
 
 #[test]
 fn every_outcome_the_skill_lists_is_a_first_line_and_json_outcome_the_cli_prints() {
-    let reached: [fn(&[&str]) -> Output; 5] =
-        [round_handed_over, approved, abandoned, co_review_published, local_co_review_closed];
     let documented = documented_outcomes();
-    assert_eq!(documented.len(), reached.len(), "the skill lists every outcome once");
+    let reach_outcome: [fn(&[&str]) -> Output; 5] =
+        [review_round_handed_over, review_approved, review_abandoned, co_review_published, local_co_review_closed];
 
-    for reach in reached {
-        let markdown = reach(&[]);
-        let json = reach(&["--format", "json"]);
+    let printed: Vec<(Output, Output)> =
+        reach_outcome.iter().map(|reach| (reach(&[]), reach(&["--format", "json"]))).collect();
 
+    let mut listed = BTreeSet::new();
+    for (markdown, json) in printed {
         let stdout = String::from_utf8(markdown.stdout).expect("UTF-8");
         let first_line = stdout.lines().next().expect("a first line");
-        let printed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("stdout is JSON");
+        let outcome: serde_json::Value = serde_json::from_slice(&json.stdout).expect("stdout is JSON");
         assert_eq!((markdown.status.code(), json.status.code()), (Some(0), Some(0)), "{first_line}");
-        let listed: Vec<_> = documented.iter().filter(|o| o.matches(first_line)).collect();
-        assert_eq!(listed.len(), 1, "the skill lists `{first_line}` once");
-        assert_eq!(printed["outcome"], listed[0].json.as_str(), "the JSON outcome of `{first_line}`");
+        let rows: Vec<_> = (0..documented.len()).filter(|&i| documented[i].matches(first_line)).collect();
+        assert_eq!(rows.len(), 1, "the skill lists `{first_line}` once");
+        assert_eq!(outcome["outcome"], documented[rows[0]].json.as_str(), "the JSON outcome of `{first_line}`");
+        listed.insert(rows[0]);
+    }
+    assert_eq!(listed.len(), documented.len(), "a row the CLI never prints");
+}
+
+/// The first lines that "The loop" and "Co-reviewing" branch on, items like
+/// ``   - `# Round N`, a Round …``.
+fn first_lines_the_steps_branch_on() -> Vec<String> {
+    SKILL.lines().filter_map(|line| Some(line.strip_prefix("   - `")?.split_once('`')?.0.to_owned())).collect()
+}
+
+#[test]
+fn the_steps_branch_only_on_first_lines_the_skill_lists() {
+    let listed: BTreeSet<String> = documented_outcomes().into_iter().map(|o| o.first_line).collect();
+
+    let branched = first_lines_the_steps_branch_on();
+
+    assert_eq!(branched.len(), 7, "the loop's 3 outcomes and co-reviewing's 4: {branched:?}");
+    for line in branched {
+        assert!(listed.contains(&line), "a step branches on `{line}`, which What `review` prints doesn't list");
     }
 }
 
