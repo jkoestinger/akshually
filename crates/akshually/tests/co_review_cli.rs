@@ -3,12 +3,11 @@
 
 mod support;
 
-use std::io::Write;
-use std::process::{Output, Stdio};
+use std::process::Output;
 
 use akshually_core::{Anchor, Outcome, Party, Side, ThreadId, ThreadRef, Verdict};
 use akshually_testkit::{TestRepo, wait_until};
-use support::{HostedApp, PR_URL, TIMEOUT, finish, still_running};
+use support::{HostedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
 fn run(app: &HostedApp, args: &[&str]) -> Output {
     app.akshually(&std::env::temp_dir(), args).output().unwrap()
@@ -53,17 +52,35 @@ fn draft_adds_agent_drafts_with_each_anchor_kind_and_prints_their_threads() {
 #[test]
 fn draft_reads_its_body_from_stdin_when_given_a_dash() {
     let app = HostedApp::with_pull_request();
-    let mut child = app
-        .akshually(&std::env::temp_dir(), &["draft", "--pr", PR_URL, "--review", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"Line one.\n\nLine `two`.\n").unwrap();
 
-    stdout(&finish(child));
+    let out = finish_with_stdin(
+        app.akshually(&std::env::temp_dir(), &["draft", "--pr", PR_URL, "--review", "-"]),
+        b"Line one.\n\nLine `two`.\n",
+    );
 
+    stdout(&out);
     let session = app.service.sessions().pop().unwrap();
     assert_eq!(session.threads[0].comments[0].body, "Line one.\n\nLine `two`.\n");
+}
+
+#[test]
+fn reply_pr_reads_its_body_from_stdin_when_given_a_dash() {
+    let app = HostedApp::with_pull_request();
+    stdout(&run(&app, &["draft", "--pr", PR_URL, "--file", "README.md", "Link the docs."]));
+    let review = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
+    let session = app.wait_for_co_reviewer();
+    app.service.reply_in_thread(&ThreadRef::new(&session.id, &session.threads[0].id), "Which docs?").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    finish(review);
+
+    let out = finish_with_stdin(
+        app.akshually(&std::env::temp_dir(), &["reply", "--pr", PR_URL, "T1", "-"]),
+        b"The SSO setup guide:\n\n- `docs/sso.md`\n",
+    );
+
+    stdout(&out);
+    let answer = app.service.session(&session.id).unwrap().threads[0].comments.last().unwrap().clone();
+    assert_eq!((answer.author, answer.body.as_str()), (Party::Agent, "The SSO setup guide:\n\n- `docs/sso.md`\n"));
 }
 
 #[test]

@@ -141,3 +141,17 @@ fn every_exit_code_the_skill_documents_is_one_the_cli_exits_with() {
         assert_eq!(exit_code_reached_for(code), Some(code), "exit code {code}");
     }
 }
+
+#[test]
+fn reply_help_and_the_skill_say_a_dash_reads_the_body_from_stdin() {
+    let app = HostedApp::start();
+
+    let out = app.akshually(&std::env::temp_dir(), &["reply", "--help"]).output().unwrap();
+
+    let help = String::from_utf8(out.stdout).expect("UTF-8");
+    let body_help = help.lines().find(|line| line.trim_start().starts_with("<BODY>")).expect("a <BODY> argument");
+    let skill_reply = SKILL.lines().find(|line| line.starts_with("- `akshually reply ")).expect("a `reply` entry");
+    for (doc, text) in [("`reply --help`", body_help), ("the skill's `reply` entry", skill_reply)] {
+        assert!(text.contains("`-`") && text.contains("stdin"), "{doc} doesn't say `-` reads stdin: {text}");
+    }
+}

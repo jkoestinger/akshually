@@ -85,7 +85,7 @@ enum Command {
         pr: Option<String>,
         /// The Thread ID from the Round, e.g. `T3`.
         thread: String,
-        /// Markdown.
+        /// Markdown, `-` to read it from stdin.
         body: String,
     },
     /// Mark a Thread of this branch's Session (or with `--pr`, of that Pull Request's)
@@ -235,9 +235,9 @@ fn main() -> ExitCode {
             }
         }
         Some(Command::Draft(args)) => draft(args),
-        Some(Command::Reply { pr, thread, body }) => {
+        Some(Command::Reply { pr, thread, body }) => read_body(body).and_then(|body| {
             agent_call(|conn, cwd| conn.reply(cwd, pr.as_deref(), &ThreadId::new(thread), &body).map_err(Into::into))
-        }
+        }),
         Some(Command::Resolve { pr, thread }) => {
             agent_call(|conn, cwd| conn.resolve(cwd, pr.as_deref(), &ThreadId::new(thread)).map_err(Into::into))
         }
@@ -301,15 +301,20 @@ fn co_review(url: &str, format: Format) -> Result<ExitCode> {
 
 fn draft(args: DraftArgs) -> Result<ExitCode> {
     let anchor = args.anchor();
-    let body = match args.body.as_str() {
-        "-" => io::read_to_string(io::stdin()).context("can't read the Draft from stdin")?,
-        _ => args.body,
-    };
+    let body = read_body(args.body)?;
     let comment = NewComment::from_markdown(&body);
     let cwd = std::env::current_dir().context("can't read the current directory")?;
     let thread = launch::connect_or_launch(&Paths::from_env())?.draft(&cwd, args.pr.as_deref(), anchor, comment)?;
     println!("{thread}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The markdown body of a `reply` or `draft`: `body` as given, or all of stdin when it is `-`.
+fn read_body(body: String) -> Result<String> {
+    match body.as_str() {
+        "-" => io::read_to_string(io::stdin()).context("can't read the Comment from stdin"),
+        _ => Ok(body),
+    }
 }
 
 /// Prints what `review` received; `pr` is the Pull Request co-reviewed, if any.

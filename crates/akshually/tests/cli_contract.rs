@@ -11,7 +11,7 @@ use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Party, Side, ThreadId, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
-use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, still_running};
+use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
 const EXIT_APPROVED: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -221,6 +221,36 @@ fn reply_and_resolve_act_on_the_session_for_this_branch_and_return_at_once() {
         Some((Party::Agent, "Dropped it."))
     );
     assert_eq!(thread.resolved, Some(Party::Agent));
+}
+
+#[test]
+fn reply_reads_its_body_from_stdin_when_given_a_dash() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+
+    let out =
+        finish_with_stdin(app.akshually(repo.path(), &["reply", "T1", "-"]), b"Dropped it.\n\n- `c` was unused.\n");
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let thread = &app.service.session(&session).unwrap().threads[0];
+    assert_eq!(thread.comments.last().map(|c| c.body.as_str()), Some("Dropped it.\n\n- `c` was unused.\n"));
+}
+
+#[test]
+fn reply_exits_1_when_it_cannot_read_its_body_from_stdin() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    round_1_handed_over(&app, &repo);
+
+    let out = finish_with_stdin(app.akshually(repo.path(), &["reply", "T1", "-"]), b"not UTF-8: \xff\n");
+
+    assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("akshually: can't read the Comment from stdin"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
