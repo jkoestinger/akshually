@@ -81,6 +81,8 @@ mkdir -p ~/.claude/skills/akshually
 akshually agent-help > ~/.claude/skills/akshually/SKILL.md
 ```
 
+Run it again after each update: the guide changes with the CLI, and an installed copy doesn't follow on its own.
+
 Agents without skills can run `akshually agent-help` themselves: tell them to, in your project's agent instructions.
 
 ## License
