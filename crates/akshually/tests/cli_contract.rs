@@ -3,8 +3,9 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::process::Stdio;
 use std::sync::mpsc;
 
 use akshually_core::Settings;
@@ -221,6 +222,21 @@ fn reply_and_resolve_act_on_the_session_for_this_branch_and_return_at_once() {
         Some((Party::Agent, "Dropped it."))
     );
     assert_eq!(thread.resolved, Some(Party::Agent));
+}
+
+#[test]
+fn reply_reads_its_body_from_stdin_when_given_a_dash() {
+    let app = HostedApp::start();
+    let repo = repo_with_work();
+    let session = round_1_handed_over(&app, &repo);
+    let mut child = app.akshually(repo.path(), &["reply", "T1", "-"]).stdin(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"Dropped it.\n\n- `c` was unused.\n").unwrap();
+
+    let out = finish(child);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let thread = &app.service.session(&session).unwrap().threads[0];
+    assert_eq!(thread.comments.last().map(|c| c.body.as_str()), Some("Dropped it.\n\n- `c` was unused.\n"));
 }
 
 #[test]

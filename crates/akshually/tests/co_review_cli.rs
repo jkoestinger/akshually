@@ -67,6 +67,31 @@ fn draft_reads_its_body_from_stdin_when_given_a_dash() {
 }
 
 #[test]
+fn reply_pr_reads_its_body_from_stdin_when_given_a_dash() {
+    let app = HostedApp::with_pull_request();
+    stdout(&run(&app, &["draft", "--pr", PR_URL, "--file", "README.md", "Link the docs."]));
+    let review = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
+    let session = app.wait_for_co_reviewer();
+    app.service.reply_in_thread(&ThreadRef::new(&session.id, &session.threads[0].id), "Which docs?").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(review).status.code(), Some(4), "the human's questions weren't handed over");
+    let mut child = app
+        .akshually(&std::env::temp_dir(), &["reply", "--pr", PR_URL, "T1", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"The SSO setup guide:\n\n- `docs/sso.md`\n").unwrap();
+
+    stdout(&finish(child));
+
+    let answer = app.service.session(&session.id).unwrap().threads[0].comments.last().unwrap().clone();
+    assert_eq!(
+        (answer.author.clone(), answer.body.as_str()),
+        (Party::Agent, "The SSO setup guide:\n\n- `docs/sso.md`\n")
+    );
+}
+
+#[test]
 fn a_draft_the_service_refuses_exits_1_with_the_reason() {
     let app = HostedApp::with_pull_request();
 
