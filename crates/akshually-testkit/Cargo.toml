@@ -1,6 +1,6 @@
 [package]
 name = "akshually-testkit"
-description = "Fixtures shared by akshually's seam A and seam B tests: throwaway git repositories and short temp dirs"
+description = "Fixtures shared by akshually's tests: throwaway git repositories, short temp dirs, fake CLIs and a fake GitHub serving releases"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,4 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+mockito.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true

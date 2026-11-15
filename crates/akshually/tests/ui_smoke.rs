@@ -1,5 +1,5 @@
 //! UI: a headless render smoke check (Rune's `--snap`, and `--tree` for the text a scene shows),
-//! and the Session header's Changeset view dropdown and diff layout control, read from the
+//! the update notice, and the Session header's Changeset view dropdown and diff layout control, read from the
 //! `--tree` accessibility tree after a `--script` of input. Needs a Vulkan or Metal adapter, but no display; on a GPU-less
 //! Linux CI runner, install lavapipe (`mesa-vulkan-drivers`).
 
@@ -133,6 +133,39 @@ fn the_publish_dialog_names_a_github_pull_request_with_its_sigil() {
     );
 }
 
+#[test]
+fn the_update_notice_names_the_newer_release_and_offers_update() {
+    let tree = scene_tree("update", &[]);
+
+    assert!(tree.0.to_string().contains("akshually 99.0.0 is available."), "no update notice naming the release");
+    assert!(tree.button("Update").is_some(), "the notice offers no Update");
+}
+
+#[test]
+fn dismissing_the_update_notice_hides_it() {
+    let tree = scene_tree("update", &[json!({ "t": 0.2, "type": "click", "key": "update-dismiss" })]);
+
+    assert!(!tree.0.to_string().contains("is available"), "the dismissed notice still shows");
+}
+
+#[test]
+fn an_installed_update_offers_restart() {
+    let tree = scene_tree("update-installed", &[]);
+
+    assert!(tree.0.to_string().contains("akshually 99.0.0 is installed."), "the notice doesn't say it's installed");
+    assert!(tree.button("Restart").is_some(), "the notice offers no Restart");
+}
+
+#[test]
+fn restart_with_an_agent_waiting_asks_first_naming_its_session() {
+    let tree = scene_tree("update-installed", &[json!({ "t": 0.2, "type": "click", "key": "update-restart" })]);
+
+    let text = tree.0.to_string();
+    assert!(text.contains("akshually · feat/round-snapshots"), "the confirmation doesn't name the Session: {text}");
+    assert!(text.contains("run `akshually review` again"), "the confirmation doesn't say what the agents must do");
+    assert!(tree.button("Restart now").is_some(), "no button to confirm the restart");
+}
+
 fn render_session(theme: &str) -> Snapshot {
     let args = ["--scene", "session", "--theme", theme, "--size", "1280x800"];
     render("session.png", "--snap", &args, Snapshot::read)
@@ -169,11 +202,16 @@ fn render<T>(name: &str, output: &str, args: &[&str], read: impl FnOnce(&Path) -
 /// The accessibility tree of the `session` scene once `script`, a list of Rune `--script`
 /// events, has played.
 fn session_tree(script: &[Value]) -> Tree {
+    scene_tree("session", script)
+}
+
+/// The accessibility tree of `scene` once `script`, a list of Rune `--script` events, has played.
+fn scene_tree(scene: &str, script: &[Value]) -> Tree {
     let dirs = TestDirs::new();
     let script_path = dirs.path().join("script.json");
     std::fs::write(&script_path, json!(script).to_string()).unwrap();
 
-    let args = ["--scene", "session", "--size", "1280x800", "--script", script_path.to_str().unwrap(), "--at", "2"];
+    let args = ["--scene", scene, "--size", "1280x800", "--script", script_path.to_str().unwrap(), "--at", "2"];
     let tree = render("tree.json", "--tree", &args, |path| std::fs::read_to_string(path).unwrap());
 
     Tree(serde_json::from_str::<Value>(&tree).unwrap()["accessibility"].clone())
@@ -210,6 +248,11 @@ impl Tree {
         let mut found = Vec::new();
         walk(&self.0, role, &mut found);
         found
+    }
+
+    /// The button named `name`, if the tree has one.
+    fn button(&self, name: &str) -> Option<&Value> {
+        self.with_role("button").into_iter().find(|b| b["name"] == name)
     }
 
     /// How the shown diff is laid out: side by side when a removed line sits level with an

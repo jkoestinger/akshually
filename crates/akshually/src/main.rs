@@ -6,6 +6,7 @@ mod launch;
 mod render;
 
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -14,8 +15,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use akshually_core::ipc::{self, BindError, ClientError, Connection, ErrorCode, Server};
-use akshually_core::{Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge};
+use akshually_core::{
+    Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge,
+    ipc::{self, BindError, ClientError, Connection, ErrorCode, Server},
+    update::{Releases, Updater},
+};
 
 /// The agent skill `agent-help` prints.
 const SKILL: &str = include_str!("../../../skills/akshually/SKILL.md");
@@ -29,6 +33,9 @@ const PUSH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the app refreshes the Inbox: 2 search requests per GitHub host each time, well
 /// within GitHub's 30 searches a minute.
 const INBOX_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
+
+/// How often the running app looks for a newer release, after the look at launch (ADR 0003).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a second app waits for the running one to listen: it may have only just taken the
 /// lock, and listens moments later.
@@ -98,6 +105,10 @@ enum Command {
     /// Print the guide for agents: the review loop, the commands and the exit codes. It is
     /// also a `SKILL.md` you can install as an agent skill.
     AgentHelp,
+    /// Update akshually to the newest release, in place: the newest stable one, or with a
+    /// pre-release installed, the newest of any. Tells a running app, which then offers to
+    /// restart into it. Exits 0 when it updated or was already up to date, 1 on error.
+    Update,
     /// Run the app (launched by the first CLI call). Arguments after the options go to Rune,
     /// e.g. `--snap out.png --scene session` for a headless render.
     #[command(hide = true)]
@@ -118,7 +129,7 @@ impl Command {
             | Command::Draft(DraftArgs { pr, .. })
             | Command::Reply { pr, .. }
             | Command::Resolve { pr, .. } => pr.as_deref(),
-            Command::Start | Command::AgentHelp | Command::App { .. } => None,
+            Command::Start | Command::AgentHelp | Command::Update | Command::App { .. } => None,
         }
     }
 }
@@ -234,6 +245,7 @@ fn main() -> ExitCode {
             print!("{SKILL}");
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Update) => update(),
         Some(Command::App { headless, rune_args }) => app(headless, rune_args),
         None => app(false, Vec::new()),
     };
@@ -329,6 +341,48 @@ fn agent_call(f: impl FnOnce(Connection, &Path) -> Result<()>) -> Result<ExitCod
     Ok(ExitCode::SUCCESS)
 }
 
+/// The running executable's real path, symlinks resolved: the install an update replaces, and
+/// the binary a restart runs. Resolve it before any update, as Linux then names the replaced
+/// binary "(deleted)".
+fn install_path() -> Result<std::path::PathBuf> {
+    std::env::current_exe().and_then(|p| p.canonicalize()).context("can't find the akshually binary")
+}
+
+/// `update`: installs the newest release this install is offered, then tells the running app,
+/// if any. This binary is the old one, so it speaks the running app's protocol.
+fn update() -> Result<ExitCode> {
+    let updater = Updater::new(Releases::from_env(), install_path()?);
+    let running = updater.running().clone();
+    let Some(release) = updater.newer().context("can't look for a newer release of akshually")? else {
+        println!("akshually {running} is up to date");
+        return Ok(ExitCode::SUCCESS);
+    };
+    updater.install(&release).with_context(|| format!("can't update akshually to {}", release.version))?;
+    let version = &release.version;
+    // Never launches the app: only one already running needs telling.
+    match ipc::connect(&Paths::from_env()) {
+        Ok(app) => {
+            // Best-effort: an app too old to understand still runs the old binary until restarted.
+            let _ = app.update_installed(version);
+            println!("updated akshually {running} → {version}; restart the app to use it");
+        }
+        Err(_) => println!("updated akshually {running} → {version}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Replaces this process with `akshually app` from `exe`, as the update notice's Restart does:
+/// the single-instance lock and the socket close with the old image, so the new one takes
+/// them, and Sessions come back from disk. Returns only if it couldn't.
+fn relaunch(exe: &Path, headless: bool) -> io::Error {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("app");
+    if headless {
+        cmd.arg("--headless");
+    }
+    cmd.exec()
+}
+
 /// The app already running on this state dir. It may have only just taken the lock (two
 /// launches racing), so give it a moment to listen. One that never answers here listens
 /// elsewhere: it was started with another runtime dir.
@@ -359,15 +413,18 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let paths = Paths::from_env();
+    let exe = install_path()?;
     // Only reads the saved Sessions: it writes nothing until a Session changes, which a
     // second instance never sees, since it quits below.
     let forges = forge::adapters(&settings.hosts, &forge::CredentialSources::from_env());
     let service = Service::open(&paths.state)
         .with_context(|| format!("can't open the saved Sessions in {}", paths.state.display()))?
-        .with_forges(forges);
+        .with_forges(forges)
+        .with_updater(Updater::new(Releases::from_env(), exe.clone()));
     // No window means nothing to notify about, and tests never show real notifications.
     let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);
+    service.on_restart(move || relaunch(&exe, headless));
     let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
         // Another instance serves the CLI already; leave it to that one, and bring its window
@@ -402,6 +459,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
         service.watch_inbox(INBOX_REFRESH_INTERVAL);
         // Offers pushes to open Pull Requests as reloads (the banner).
         service.watch_pull_requests(PUSH_CHECK_INTERVAL);
+        // At launch, then daily; the headless app (tests) never looks.
+        service.watch_updates(UPDATE_CHECK_INTERVAL);
         akshually_ui::run(service, rune_args).map_err(anyhow::Error::msg)?;
     }
     Ok(ExitCode::SUCCESS)

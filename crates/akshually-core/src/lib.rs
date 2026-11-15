@@ -16,6 +16,7 @@ mod service;
 mod settings;
 mod store;
 mod thread;
+pub mod update;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, Hunk, LocalOptions};
 pub use notifier::{Notification, Notifier};
@@ -24,8 +25,8 @@ pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
     InboxView, Outcome, PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions,
-    SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, Verdict, VerdictAction,
-    WindowView,
+    SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView,
+    Verdict, VerdictAction, WindowView,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
@@ -86,4 +87,8 @@ pub enum Error {
          the Forge takes line comments; comment on the whole file instead"
     )]
     OutsideDiff { path: String, side: Side, start: u32, end: u32 },
+    #[error(transparent)]
+    Update(#[from] update::UpdateError),
+    #[error("there's no update to install")]
+    NoUpdate,
 }

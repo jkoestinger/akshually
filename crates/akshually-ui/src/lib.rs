@@ -19,8 +19,8 @@ use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
     HandOver, InboxRow, InboxRowState, InboxView, NewComment, Party, PublishPlan, Role, Service, SessionActions,
-    SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, Verdict,
-    VerdictAction, WindowView, fence_for,
+    SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage,
+    UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -56,6 +56,8 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("publish", scene_publish),
             ("publish-gitlab", scene_publish_gitlab),
             ("co-review", scene_co_review),
+            ("update", scene_update),
+            ("update-installed", scene_update_installed),
         ],
         // The system monospace font. A family whose oblique face lacks the italic/oblique bit
         // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
@@ -102,6 +104,10 @@ pub struct State {
     /// service took it, ahead of its update saying the same; one it refused changes nothing.
     displayed: Displayed,
     inbox: InboxView,
+    /// The update notice, as the service has it.
+    update: Option<UpdateView>,
+    /// The human pressed Restart while agents wait, until they confirm or cancel.
+    confirming_restart: bool,
     /// How every tab lays out its diff: the service's, or the one the human just picked.
     diff_layout: DiffLayout,
     /// A headless render (`run`): the service sends it no updates and holds none of its scene's
@@ -281,6 +287,8 @@ impl State {
             displayed: Displayed::Inbox,
             headless: false,
             inbox: InboxView::default(),
+            update: None,
+            confirming_restart: false,
             diff_layout: DiffLayout::default(),
             refreshing: false,
             composer: None,
@@ -311,7 +319,7 @@ impl State {
     /// Mirrors the service's Window, keeping each Session's view state (scroll, folds) and
     /// rebuilding its diff only when the Changeset it shows moved on (`changeset_rev`).
     pub fn apply(&mut self, window: WindowView) {
-        let WindowView { sessions, displayed, inbox, diff_layout } = window;
+        let WindowView { sessions, displayed, inbox, diff_layout, update } = window;
         self.lay_out_tabs(diff_layout);
         let mut old = std::mem::take(&mut self.tabs);
         let layout = self.diff_layout;
@@ -349,6 +357,7 @@ impl State {
         self.annotate();
         self.displayed = displayed;
         self.inbox = inbox;
+        self.update = update;
     }
 
     /// Opens the Pull Request in the URL field off the UI thread (the Forge may be slow); the
@@ -463,6 +472,31 @@ impl State {
                 }
             },
         );
+    }
+
+    /// Installs the update off the UI thread (the download may take minutes); the service's
+    /// updates show how it goes.
+    fn install_update(&mut self) {
+        self.off_ui(Service::install_update, |_, installed| report(installed));
+    }
+
+    /// Hides the update notice until the next launch.
+    fn dismiss_update(&mut self) {
+        self.service.dismiss_update();
+        // A headless render's service sends no update saying so.
+        self.update = None;
+    }
+
+    /// Restarts into the installed update, asking first while agents' `review` calls wait,
+    /// since restarting ends them.
+    fn restart(&mut self) {
+        let waiting = self.update.as_ref().is_some_and(|u| !u.waiting.is_empty());
+        if waiting && !self.confirming_restart {
+            self.confirming_restart = true;
+            return;
+        }
+        self.confirming_restart = false;
+        report(self.service.restart());
     }
 
     /// Shows the Session's tab and tells the service, which clears its attention.
@@ -723,6 +757,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .h_full()
             .min_h(0.0)
             .child(tab_bar.child(pull_request_opener(k, s)))
+            .children(update_notice(k, s))
             .child(session_header(k, tab, &mut layer))
             .children(end_confirm(k, s, &tab.session))
             .children(turn_banner(k, &tab.session))
@@ -733,11 +768,67 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab, agent))),
         None => {
             let draft = theme::tokens(cx.system_dark()).color("state-draft");
-            col().w_full().h_full().min_h(0.0).child(tab_bar).child(inbox_view(k, s, draft))
+            col()
+                .w_full()
+                .h_full()
+                .min_h(0.0)
+                .child(tab_bar)
+                .children(update_notice(k, s))
+                .child(inbox_view(k, s, draft))
         }
     };
     publish_dialog(k, s, &mut layer);
     rune_kit::root(body.fill(k.c.bg_base), layer)
+}
+
+/// The update notice above whatever the Window shows: a newer release to install, then Restart
+/// into it, which asks first while agents wait (ADR 0003).
+fn update_notice(k: &Kit, s: &State) -> Option<El> {
+    let update = s.update.as_ref()?;
+    let version = &update.version;
+    let button = |label: &str, key: &str, variant, press: fn(&mut State)| {
+        Button::new(label).variant(variant).on_press(press).build(k).key(key)
+    };
+    let dismiss = || button("Dismiss", "update-dismiss", ButtonVariant::Ghost, State::dismiss_update);
+    let (note, buttons) = match &update.stage {
+        UpdateStage::Available => (
+            format!("akshually {version} is available."),
+            vec![button("Update", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
+        ),
+        UpdateStage::Installing => (format!("Installing akshually {version}…"), Vec::new()),
+        // The agents may have stopped waiting since Restart was pressed.
+        UpdateStage::Installed if s.confirming_restart && !update.waiting.is_empty() => (
+            format!(
+                "Restart now? The agents waiting in {} lose their call, which ends with an error: they must run \
+                 `akshually review` again. Your Sessions are kept.",
+                update.waiting.join(", ")
+            ),
+            vec![
+                button("Cancel", "update-cancel", ButtonVariant::Ghost, |s| s.confirming_restart = false),
+                button("Restart now", "update-restart-now", ButtonVariant::Danger, State::restart),
+            ],
+        ),
+        UpdateStage::Installed => (
+            format!("akshually {version} is installed. Restart akshually to use it."),
+            vec![button("Restart", "update-restart", ButtonVariant::Outline, State::restart), dismiss()],
+        ),
+        UpdateStage::Failed(why) => (
+            format!("Couldn't update to akshually {version}: {why}"),
+            vec![button("Try again", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
+        ),
+    };
+    Some(
+        row()
+            .key("update-notice")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .gap(12.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(note).font(k.ty.ui).color(k.c.text_base).wrap().grow(1.0).min_w(0.0))
+            .children(buttons),
+    )
 }
 
 /// The Inbox tab: open Pull Requests where the human is a requested reviewer or assignee, on
@@ -1989,6 +2080,26 @@ fn scene_threads(s: &mut State) {
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
     s.apply(scene_window(vec![session], Some("sample")));
+}
+
+/// `--scene update`: the Inbox under the notice offering a newer release.
+fn scene_update(s: &mut State) {
+    scene_session(s);
+    s.open_inbox();
+    s.update = Some(UpdateView {
+        version: "99.0.0".parse().expect("a version"),
+        stage: UpdateStage::Available,
+        waiting: Vec::new(),
+    });
+}
+
+/// `--scene update-installed`: a Session whose agent waits, under the notice offering Restart
+/// into the update just installed.
+fn scene_update_installed(s: &mut State) {
+    scene_session(s);
+    let waiting = s.tabs.iter().filter(|t| t.session.agent_waiting).map(|t| t.session.title()).take(1).collect();
+    s.update =
+        Some(UpdateView { version: "99.0.0".parse().expect("a version"), stage: UpdateStage::Installed, waiting });
 }
 
 /// A scene's Window of `sessions`, displaying the Session `displayed`, else the Inbox. The

@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION};
+use crate::update::Version;
 use crate::{Anchor, LocalOptions, NewComment, Outcome, Paths, ThreadId};
 
 /// Why a request to the running app failed.
@@ -14,10 +15,26 @@ use crate::{Anchor, LocalOptions, NewComment, Outcome, Paths, ThreadId};
 pub enum ClientError {
     #[error("lost the connection to akshually: {0}")]
     Io(#[from] io::Error),
+    /// The CLI couldn't print what it received; the app keeps it for the next `review`.
+    #[error("can't print the outcome, so the next `review` receives it again: {0}")]
+    Print(io::Error),
+    /// The app closed the connection before answering: it restarted, for an update, or quit.
+    #[error("the akshually app restarted (or quit) before it answered; run the command again")]
+    AppGone,
     #[error("akshually sent a reply this CLI doesn't understand: {0}")]
     Protocol(String),
     #[error(transparent)]
     App(#[from] ErrorReply),
+}
+
+/// An error on the connection to the app: the app closing it is [`ClientError::AppGone`].
+fn on_socket(error: io::Error) -> ClientError {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe => {
+            ClientError::AppGone
+        }
+        _ => ClientError::Io(error),
+    }
 }
 
 /// Connects to the running app. `NotFound` or `ConnectionRefused` mean no app is running.
@@ -81,7 +98,7 @@ impl Connection {
         self.send(request)?;
         let mut reader = BufReader::new(self.stream.try_clone()?);
         let outcome: Outcome = read_reply(&mut reader)?;
-        deliver(&outcome)?;
+        deliver(&outcome).map_err(ClientError::Print)?;
         self.send(Request::Ack)?;
         read_reply::<IgnoredAny>(&mut reader)?;
         Ok(outcome)
@@ -111,6 +128,11 @@ impl Connection {
         self.call::<IgnoredAny>(Request::Show { activation_token }).map(drop)
     }
 
+    /// Tells the running app that `akshually update` installed `version` over its install.
+    pub fn update_installed(self, version: &Version) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Request::UpdateInstalled { version: version.to_string() }).map(drop)
+    }
+
     /// Test control: the app's pid and Sessions.
     pub fn test_state(self) -> Result<AppState, ClientError> {
         self.call(Request::TestState)
@@ -126,19 +148,19 @@ impl Connection {
         read_reply(&mut BufReader::new(&self.stream))
     }
 
-    fn send(&mut self, request: Request) -> io::Result<()> {
+    fn send(&mut self, request: Request) -> Result<(), ClientError> {
         let mut line = serde_json::to_string(&Envelope::new(request)).expect("requests serialise");
         line.push('\n');
-        self.stream.write_all(line.as_bytes())
+        self.stream.write_all(line.as_bytes()).map_err(on_socket)
     }
 }
 
 /// Reads one reply line, for a request whose `ok` carries a `T`.
 fn read_reply<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<T, ClientError> {
     let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    reader.read_line(&mut reply).map_err(on_socket)?;
     if reply.is_empty() {
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        return Err(ClientError::AppGone);
     }
     let reply: Envelope<Reply> = serde_json::from_str(&reply).map_err(|e| ClientError::Protocol(e.to_string()))?;
     if reply.v != VERSION {

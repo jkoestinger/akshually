@@ -18,11 +18,14 @@ pub struct Settings {
     /// Whether a Session that becomes the human's Turn while the window is unfocused shows an
     /// OS desktop notification.
     pub notifications: bool,
+    /// Whether the app looks for a newer release of akshually, at launch and then daily, and
+    /// offers it (ADR 0003). CLI calls never look.
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { untracked: true, notifications: true, hosts: Vec::new() }
+        Settings { untracked: true, notifications: true, check_for_updates: true, hosts: Vec::new() }
     }
 }
 
