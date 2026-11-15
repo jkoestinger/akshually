@@ -8,7 +8,8 @@ use akshually_core::{Anchor, NewComment, SessionId, Side, ThreadId, ThreadRef, T
 use akshually_testkit::{TestRepo, wait_until};
 use support::{HostedApp, TIMEOUT, finish};
 
-const EXIT_ROUND: i32 = 4;
+/// What `review` exits with when it prints a Round, as for every other outcome.
+const EXIT_OK: i32 = 0;
 
 fn repo_with_work() -> TestRepo {
     let repo = TestRepo::new();
@@ -28,7 +29,7 @@ fn a_file_thread_is_headed_by_its_file_without_code() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "# Round 1\n\
@@ -54,7 +55,7 @@ fn a_suggestion_follows_its_comment_as_the_replacement_for_the_anchored_lines() 
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.ends_with(
@@ -88,7 +89,7 @@ fn a_review_thread_is_headed_as_the_whole_review() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.ends_with("\n## T1 · whole Review\n\nAdd a changelog entry.\n"), "{stdout}");
 }
@@ -112,7 +113,7 @@ fn an_outdated_thread_is_marked_and_shows_the_code_it_was_written_against() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(second);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.ends_with(
@@ -139,7 +140,7 @@ fn after_the_agent_resolved_t1(app: &HostedApp, repo: &TestRepo, args: &[&str]) 
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Rename b").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
-    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+    assert_eq!(finish(first).status.code(), Some(EXIT_OK));
     app.service.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
     let second = app.akshually(repo.path(), args).spawn().unwrap();
     wait_until(TIMEOUT, "the next review call", || app.service.session(&session.id).filter(|s| s.turn == Turn::Human));
@@ -157,7 +158,7 @@ fn a_reopened_thread_and_a_reply_in_a_thread_go_out_under_their_threads() {
     app.service.hand_over_round(&session).unwrap();
 
     let out = finish(second);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.ends_with(
@@ -191,7 +192,7 @@ fn a_reopened_thread_is_flagged_in_json() {
     app.service.hand_over_round(&session).unwrap();
 
     let out = finish(second);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let round: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert_eq!(round["threads"][0]["id"], "T1");
     assert_eq!(round["threads"][0]["reopened"], true);

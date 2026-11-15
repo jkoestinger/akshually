@@ -13,11 +13,11 @@ When you are asked to review a Pull Request or someone's local changes instead, 
 
 1. Before changing anything, run `akshually start`. It snapshots the working tree as the Session base, so the human can see only your changes rather than uncommitted work that was already there. It returns at once.
 2. Do the work.
-3. Run `akshually review`. It opens the app, or reuses the one already running, and **blocks** until the human answers. Branch on its exit code:
-   - `4`, a Round: stdout holds the Threads. Address every one, answer each with `reply` or `resolve`, then go back to 3.
-   - `0`, approved: the Review is over. Stop.
-   - `3`, Abandoned: the human closed the Session without a Verdict. Stop working on this change.
-   - `1`: an error, explained on stderr.
+3. Run `akshually review`. It opens the app, or reuses the one already running, and **blocks** until the human answers. It exits 0 whatever the human did: branch on the first line of its stdout (see [What `review` prints](#what-review-prints)):
+   - `# Round N`: stdout holds the Threads. Address every one, answer each with `reply` or `resolve`, then go back to 3.
+   - `Approved.`: the Review is over. Stop.
+   - `Abandoned: …`: the human closed the Session without a Verdict. Stop working on this change.
+   - A non-zero exit is an error, explained on stderr.
 
 The human can take minutes or hours. Run `review` without a timeout if your shell tool allows it. If the call is killed anyway (a tool timeout, a restart), run `akshually review` again: a Round or Verdict the human gave meanwhile is kept for the next call, and nothing is lost. The human can still close a Session whose Verdict no call collected: your next `review` then starts a new Session, with a fresh Round 1. Run only one `review` per branch at a time; a second one fails with "another agent's `review` call is already waiting on this Session".
 
@@ -63,23 +63,29 @@ Thread IDs stay the same across Rounds, so `T3` in Round 2 is the Thread `T3` fr
 You review someone else's code alongside the human: a Pull Request (`--pr <url>` on every command), or the local work on this branch (no `--pr`; run the commands inside that repository, on that branch). The roles are reversed: the human decides, and you answer their questions about your Drafts.
 
 1. Read the code, then add one `akshually draft` per finding. Keep each to one point, anchored as narrowly as you can.
-2. Run `akshually review --pr <url>`, or `akshually review` for local work. It hands your Drafts to the human and **blocks** until they act. Branch on its exit code:
-   - `4`, a Round of questions: stdout holds the Threads of the Drafts the human questioned, with their questions. Answer each with `reply` (with the same `--pr`). To revise a Draft, add a new one with `draft` and say so in your reply; the human discards the old one. Then go back to 2.
-   - `5`, Published (Pull Request only): the human published their Review; stdout has the Verdict and the review's link (`{"outcome":"published","verdict":"approve","url":"…"}` with `--format json`). Report it back. Stop.
-   - `6`, Closed (local work only): the human finished with your co-review. A co-review of local work has no Verdict, so this is its normal end. Stop.
-   - `3`, Abandoned (Pull Request only): the human closed it without publishing. Stop.
-   - `1`: an error, explained on stderr.
+2. Run `akshually review --pr <url>`, or `akshually review` for local work. It hands your Drafts to the human and **blocks** until they act. It exits 0 whatever the human did: branch on the first line of its stdout (see [What `review` prints](#what-review-prints)):
+   - `# Round N`, a Round of questions: stdout holds the Threads of the Drafts the human questioned, with their questions. Answer each with `reply` (with the same `--pr`). To revise a Draft, add a new one with `draft` and say so in your reply; the human discards the old one. Then go back to 2.
+   - `Published with the Verdict …` (Pull Request only): the human published their Review; the line has the Verdict and the review's link (`{"outcome":"published","verdict":"approve","url":"…"}` with `--format json`). Report it back. Stop.
+   - `Closed: …` (local work only): the human finished with your co-review. A co-review of local work has no Verdict, so this is its normal end. Stop.
+   - `Abandoned: …` (Pull Request only): the human closed it without publishing. Stop.
+   - A non-zero exit is an error, explained on stderr.
 
 Run `draft` before `review` on local work: the first `draft` is what makes you this branch's co-Reviewer. A branch whose Author is another agent refuses your Drafts.
+
+## What `review` prints
+
+`review` and `review --pr` exit 0 whatever the human did, and the first line of stdout says what that was. With `--format json`, the `outcome` field says the same:
+
+- `# Round N` (JSON `round`): a Round was handed over. Address it and run `review` again. As co-Reviewer, it holds the human's questions on your Drafts.
+- `Approved.` (JSON `approved`): the Review is over. Stop.
+- `Abandoned: …` (JSON `abandoned`): the human closed the Session without a Verdict. Stop working on this change. For `review --pr`, the human closed the Pull Request's Session without publishing.
+- `Published with the Verdict …` (JSON `published`, `review --pr` only): the human published their Review of the Pull Request; the line has the Verdict and the link. Report it back. Stop.
+- `Closed: …` (JSON `closed`, co-review of local work only): the human finished with your co-review, a normal end. Stop.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Approved: the Review is over. Any command that returns at once also exits 0 on success. |
+| `0` | The call succeeded. For `review`, the first line of stdout says what the human did: see [What `review` prints](#what-review-prints). |
 | `1` | Error, explained on stderr after `akshually:`. |
 | `2` | Usage error: a wrong subcommand, flag or combination. |
-| `3` | Abandoned: stop working on this change. For `review --pr`, the human closed the Pull Request without publishing. |
-| `4` | A Round was handed over: address it and run `review` again. As co-Reviewer, it holds the human's questions on your Drafts. |
-| `5` | Published (`review --pr` only): the human published their Review of the Pull Request; stdout has the Verdict and the link. |
-| `6` | Closed (co-review of local work only): the human finished with your co-review, a normal end. Stop. |

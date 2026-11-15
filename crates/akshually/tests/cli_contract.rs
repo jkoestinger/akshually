@@ -13,10 +13,9 @@ use akshually_core::{Anchor, Party, Side, ThreadId, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
-const EXIT_APPROVED: i32 = 0;
+/// What `review` exits with whatever the outcome; stdout tells the outcomes apart.
+const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
-const EXIT_ABANDONED: i32 = 3;
-const EXIT_ROUND: i32 = 4;
 
 fn repo_with_work() -> TestRepo {
     let repo = TestRepo::new();
@@ -37,12 +36,12 @@ fn review_blocks_until_the_human_approves_then_exits_0() {
     app.service.approve(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Approved.\n");
 }
 
 #[test]
-fn review_exits_with_the_abandoned_code_when_the_human_abandons() {
+fn review_exits_0_and_says_abandoned_when_the_human_abandons() {
     let app = HostedApp::start();
     let repo = repo_with_work();
     let child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
@@ -51,7 +50,7 @@ fn review_exits_with_the_abandoned_code_when_the_human_abandons() {
     app.service.abandon(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ABANDONED));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n"
@@ -59,7 +58,7 @@ fn review_exits_with_the_abandoned_code_when_the_human_abandons() {
 }
 
 #[test]
-fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code() {
+fn review_prints_the_handed_over_round_as_markdown_and_exits_0() {
     let app = HostedApp::start();
     let repo = repo_with_work();
     let mut child = app.akshually(repo.path(), &["review"]).spawn().unwrap();
@@ -71,7 +70,7 @@ fn review_prints_the_handed_over_round_as_markdown_and_exits_with_the_round_code
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "# Round 1\n\
@@ -111,7 +110,7 @@ fn review_format_json_prints_the_round_as_json() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert_eq!(
         printed,
@@ -141,7 +140,7 @@ fn review_format_json_prints_the_verdict_as_json() {
     app.service.approve(&session.id).unwrap();
 
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"outcome\":\"approved\"}\n");
 }
 
@@ -153,7 +152,7 @@ fn review_format_json_prints_who_resolved_a_thread_in_the_round() {
     let session = app.wait_for_session(repo.path());
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 2..=3), "Why two?").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
-    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+    assert_eq!(finish(first).status.code(), Some(EXIT_OK));
     let second = app.akshually(repo.path(), &["review", "--format", "json"]).spawn().unwrap();
     app.wait_for_review(&session.id);
     let t1 = ThreadRef::new(&session.id, &akshually_core::ThreadId::new("T1"));
@@ -163,7 +162,7 @@ fn review_format_json_prints_who_resolved_a_thread_in_the_round() {
     app.service.hand_over_round(&session.id).unwrap();
 
     let out = finish(second);
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let printed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert_eq!(printed["threads"][0]["id"], "T1");
     assert_eq!(printed["threads"][0]["resolved"], "human", "{printed:#}");
@@ -177,7 +176,7 @@ fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
     let session = app.wait_for_session(repo.path());
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
-    assert_eq!(finish(first).status.code(), Some(EXIT_ROUND));
+    assert_eq!(finish(first).status.code(), Some(EXIT_OK));
 
     repo.write("lib.rs", "fn a() {}\nfn b() {}\n");
     let mut second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
@@ -191,7 +190,7 @@ fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
     assert_eq!(sessions[0].threads.len(), 1);
     assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
     app.service.approve(&session.id).unwrap();
-    assert_eq!(finish(second).status.code(), Some(EXIT_APPROVED));
+    assert_eq!(finish(second).status.code(), Some(EXIT_OK));
 }
 
 /// Hands the `review` call in `repo` a Round with Thread T1, on new line 3.
@@ -200,7 +199,7 @@ fn round_1_handed_over(app: &HostedApp, repo: &TestRepo) -> akshually_core::Sess
     let session = app.wait_for_session(repo.path());
     app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
-    assert_eq!(finish(call).status.code(), Some(EXIT_ROUND));
+    assert_eq!(finish(call).status.code(), Some(EXIT_OK));
     session.id
 }
 
@@ -351,8 +350,8 @@ fn first_review_launches_the_app_and_a_second_attaches_to_it() {
     for session in &attached.sessions {
         app.human(HumanCommand::Approve { session: session.id.clone() });
     }
-    assert_eq!(finish(first_call).status.code(), Some(EXIT_APPROVED));
-    assert_eq!(finish(second_call).status.code(), Some(EXIT_APPROVED));
+    assert_eq!(finish(first_call).status.code(), Some(EXIT_OK));
+    assert_eq!(finish(second_call).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -367,7 +366,7 @@ fn a_second_app_exits_and_leaves_the_running_one_serving() {
     assert!(second_app.status.success(), "stderr: {}", String::from_utf8_lossy(&second_app.stderr));
     assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
     app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
-    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+    assert_eq!(finish(call).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -388,7 +387,7 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
     assert!(!elsewhere.runtime().join("akshually.sock").exists(), "a second app serves the same Sessions");
     assert_eq!(app.state().map(|s| s.pid), Some(running.pid));
     app.human(HumanCommand::Abandon { session: running.sessions[0].id.clone() });
-    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+    assert_eq!(finish(call).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -461,7 +460,7 @@ fn reviewed_paths(app: &HostedApp, repo: &TestRepo, args: &[&str]) -> Vec<String
     let call = app.akshually(repo.path(), &[&["review"], args].concat()).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
     app.service.abandon(&session.id).unwrap();
-    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+    assert_eq!(finish(call).status.code(), Some(EXIT_OK));
     session.shown().files.iter().map(|f| f.path.clone()).collect()
 }
 
@@ -521,7 +520,7 @@ fn the_app_reads_the_untracked_setting_from_its_config_file() {
     let paths: Vec<&str> = state.sessions[0].changeset.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, ["agent.txt", "topic.txt"]);
     app.human(HumanCommand::Abandon { session: state.sessions[0].id.clone() });
-    assert_eq!(finish(call).status.code(), Some(EXIT_ABANDONED));
+    assert_eq!(finish(call).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -577,7 +576,7 @@ fn a_second_review_while_one_waits_exits_1_with_a_clear_message() {
     );
     assert!(still_running(&mut first), "the first call stopped waiting");
     app.service.approve(&session.id).unwrap();
-    assert_eq!(finish(first).status.code(), Some(EXIT_APPROVED));
+    assert_eq!(finish(first).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -595,14 +594,14 @@ fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
 
     let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
 
-    assert_eq!(out.status.code(), Some(EXIT_ROUND));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("# Round 1\n"), "{stdout}");
     let mut third = app.akshually(repo.path(), &["review"]).spawn().unwrap();
     assert!(still_running(&mut third), "the Round was delivered twice");
     app.wait_for_review(&session.id);
     app.service.approve(&session.id).unwrap();
-    assert_eq!(finish(third).status.code(), Some(EXIT_APPROVED));
+    assert_eq!(finish(third).status.code(), Some(EXIT_OK));
 }
 
 #[test]
@@ -618,7 +617,7 @@ fn a_verdict_given_while_no_review_waits_goes_to_the_next_review() {
     app.service.approve(&session.id).unwrap();
 
     let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
-    assert_eq!(out.status.code(), Some(EXIT_APPROVED));
+    assert_eq!(out.status.code(), Some(EXIT_OK));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Approved.\n");
     assert!(app.service.sessions().is_empty(), "collected, the Session ends");
 }

@@ -43,15 +43,10 @@ const RUNNING_APP_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often a second app tries to reach the running one meanwhile.
 const RUNNING_APP_RETRY: Duration = Duration::from_millis(50);
 
-/// Exit codes of the blocking calls. 2 is left to usage errors, which clap reports with it.
-mod exit {
-    pub(crate) const APPROVED: u8 = 0;
-    pub(crate) const ERROR: u8 = 1;
-    pub(crate) const ABANDONED: u8 = 3;
-    pub(crate) const ROUND: u8 = 4;
-    pub(crate) const PUBLISHED: u8 = 5;
-    pub(crate) const CLOSED: u8 = 6;
-}
+/// What a call that fails exits with, its error explained on stderr. 2 is left to usage errors,
+/// which clap reports with it. Every outcome of `review` exits 0: agent shells show any other
+/// code as a failed command, so stdout tells the outcomes apart (ADR 0002).
+const EXIT_ERROR: u8 = 1;
 
 #[derive(Parser)]
 #[command(version, about = "Human-in-the-loop code review for agents")]
@@ -251,7 +246,7 @@ fn main() -> ExitCode {
     };
     result.unwrap_or_else(|error| {
         eprintln!("akshually: {error:#}{}", hint(&error, pr.as_deref(), reviewing));
-        ExitCode::from(exit::ERROR)
+        ExitCode::from(EXIT_ERROR)
     })
 }
 
@@ -288,15 +283,14 @@ fn review(local: LocalOptions, format: Format) -> Result<ExitCode> {
     // Printed and flushed before the app hears back, so the outcome is acknowledged only once
     // the agent can see it.
     let print = |o: &Outcome| print_outcome(o, None, format);
-    let outcome = launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, print)?;
-    Ok(exit_code(&outcome))
+    launch::connect_or_launch(&Paths::from_env())?.review(&cwd, local, print)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `review --pr`: the co-Reviewer hands its Drafts to the human and waits for the outcome.
 fn co_review(url: &str, format: Format) -> Result<ExitCode> {
-    let outcome =
-        launch::connect_or_launch(&Paths::from_env())?.co_review(url, |o| print_outcome(o, Some(url), format))?;
-    Ok(exit_code(&outcome))
+    launch::connect_or_launch(&Paths::from_env())?.co_review(url, |o| print_outcome(o, Some(url), format))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn draft(args: DraftArgs) -> Result<ExitCode> {
@@ -326,17 +320,6 @@ fn print_outcome(outcome: &Outcome, pr: Option<&str>, format: Format) -> io::Res
     let mut stdout = io::stdout().lock();
     stdout.write_all(text.as_bytes())?;
     stdout.flush()
-}
-
-fn exit_code(outcome: &Outcome) -> ExitCode {
-    let code = match outcome {
-        Outcome::Round(_) => exit::ROUND,
-        Outcome::Approved => exit::APPROVED,
-        Outcome::Abandoned => exit::ABANDONED,
-        Outcome::Published { .. } => exit::PUBLISHED,
-        Outcome::Closed => exit::CLOSED,
-    };
-    ExitCode::from(code)
 }
 
 /// A call that acts on this branch's Session and returns at once, exiting 0 when it succeeds.

@@ -94,7 +94,7 @@ fn a_draft_the_service_refuses_exits_1_with_the_reason() {
 }
 
 #[test]
-fn review_pr_blocks_until_the_human_publishes_then_exits_5_with_the_verdict_and_link() {
+fn review_pr_blocks_until_the_human_publishes_then_exits_0_with_the_verdict_and_link() {
     let app = HostedApp::with_pull_request();
     stdout(&run(&app, &["draft", "--pr", PR_URL, "--file", "README.md", "Link the docs."]));
     let mut child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
@@ -105,7 +105,7 @@ fn review_pr_blocks_until_the_human_publishes_then_exits_5_with_the_verdict_and_
     app.service.publish(&session.id, Verdict::RequestChanges, "").unwrap();
     let out = finish(child);
 
-    assert_eq!(out.status.code(), Some(5), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         format!("Published with the Verdict request changes: {PR_URL}#pullrequestreview-1\n")
@@ -121,7 +121,7 @@ fn review_pr_prints_the_published_outcome_as_json() {
     app.service.publish(&session.id, Verdict::Approve, "").unwrap();
     let out = finish(child);
 
-    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(out.status.code(), Some(0));
     let outcome: Outcome = serde_json::from_slice(&out.stdout).unwrap();
     let url = format!("{PR_URL}#pullrequestreview-1");
     assert_eq!(outcome, Outcome::Published { verdict: Verdict::Approve, url });
@@ -140,7 +140,7 @@ fn review_pr_on_a_pull_request_the_human_published_alone_says_it_has_ended_witho
 }
 
 #[test]
-fn review_pr_exits_3_when_the_human_abandons_the_co_review() {
+fn review_pr_exits_0_and_says_abandoned_when_the_human_abandons_the_co_review() {
     let app = HostedApp::with_pull_request();
     let child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
     let session = app.wait_for_co_reviewer();
@@ -148,7 +148,9 @@ fn review_pr_exits_3_when_the_human_abandons_the_co_review() {
     app.service.close(&session.id).unwrap();
     let out = finish(child);
 
-    assert_eq!(out.status.code(), Some(3), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert!(printed.starts_with("Abandoned: "), "stdout: {printed}");
 }
 
 #[test]
@@ -167,7 +169,7 @@ fn a_second_review_pr_while_one_waits_fails_as_busy() {
 }
 
 #[test]
-fn review_pr_exits_4_with_the_humans_questions_and_reply_pr_answers_them() {
+fn review_pr_exits_0_with_the_humans_questions_and_reply_pr_answers_them() {
     let app = HostedApp::with_pull_request();
     stdout(&run(&app, &["draft", "--pr", PR_URL, "--file", "README.md", "Link the docs."]));
     let child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
@@ -178,7 +180,7 @@ fn review_pr_exits_4_with_the_humans_questions_and_reply_pr_answers_them() {
     app.service.hand_over_round(&session.id).unwrap();
     let out = finish(child);
 
-    assert_eq!(out.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         format!(
@@ -207,7 +209,7 @@ fn local_work() -> TestRepo {
 }
 
 #[test]
-fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_it() {
+fn a_local_co_review_drafts_answers_questions_and_exits_0_when_the_human_closes_it() {
     let app = HostedApp::start();
     let repo = local_work();
 
@@ -220,7 +222,7 @@ fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_
     app.service.reply_in_thread(&ThreadRef::new(&session.id, &ThreadId::new("T1")), "Name it what?").unwrap();
     app.service.hand_over_round(&session.id).unwrap();
     let round = finish(child);
-    assert_eq!(round.status.code(), Some(4), "stderr: {}", String::from_utf8_lossy(&round.stderr));
+    assert_eq!(round.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&round.stderr));
     let round_stdout = String::from_utf8_lossy(&round.stdout);
     assert!(round_stdout.ends_with("Name it what?\n"), "{round_stdout}");
 
@@ -230,7 +232,7 @@ fn a_local_co_review_drafts_answers_questions_and_exits_6_when_the_human_closes_
     app.service.close(&session.id).unwrap();
     let out = finish(child);
 
-    assert_eq!(out.status.code(), Some(6), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         "Closed: the human finished with your co-review. There is nothing left to do.\n"
@@ -248,6 +250,6 @@ fn a_closed_local_co_review_prints_closed_as_json() {
     app.service.close(&session.id).unwrap();
     let out = app.akshually(repo.path(), &["review", "--format", "json"]).output().unwrap();
 
-    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(out.status.code(), Some(0));
     assert_eq!(serde_json::from_slice::<Outcome>(&out.stdout).unwrap(), Outcome::Closed);
 }
