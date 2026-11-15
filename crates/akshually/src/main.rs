@@ -312,7 +312,7 @@ fn draft(args: DraftArgs) -> Result<ExitCode> {
 /// The markdown body of a `reply` or `draft`: `body` as given, or all of stdin when it is `-`.
 fn read_body(body: String) -> Result<String> {
     match body.as_str() {
-        "-" => io::read_to_string(io::stdin()).context("can't read the body from stdin"),
+        "-" => io::read_to_string(io::stdin()).context("can't read the Comment from stdin"),
         _ => Ok(body),
     }
 }

@@ -8,6 +8,7 @@
 
 #![allow(dead_code)] // Each test binary uses part of the harness.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -237,6 +238,13 @@ impl Drop for AppProcess {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Runs `command` with `input` piped on its stdin and waits for it, as [`finish`] does.
+pub(crate) fn finish_with_stdin(mut command: Command, input: &[u8]) -> Output {
+    let mut child = command.stdin(Stdio::piped()).spawn().expect("spawn akshually");
+    child.stdin.take().expect("stdin is piped").write_all(input).expect("write akshually's stdin");
+    finish(child)
 }
 
 /// Waits for a spawned CLI call to finish, failing the test if it takes too long.
