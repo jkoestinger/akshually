@@ -339,9 +339,7 @@ impl State {
                     tab.actions = session.actions();
                     // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
                     // resolved again (#69).
-                    tab.expanded.retain(|id| {
-                        session.threads.iter().any(|t| &t.id == id && (t.outdated || t.resolved.is_some()))
-                    });
+                    tab.expanded.retain(|id| session.threads.iter().any(|t| &t.id == id && collapses(t)));
                     tab.session = session;
                     tab
                 }
@@ -716,6 +714,12 @@ fn report(result: Result<(), akshually_core::Error>) {
     if let Err(error) = result {
         eprintln!("akshually: {error}");
     }
+}
+
+/// Whether `thread` shows as one collapsed line until the human expands it: it's Outdated or
+/// Resolved.
+fn collapses(thread: &Thread) -> bool {
+    thread.outdated || thread.resolved.is_some()
 }
 
 /// The first line of a Thread's first Comment, which names it in one-line summaries.
@@ -1558,8 +1562,8 @@ fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
 }
 
 /// A Thread of `tab`'s Session: its card, or one line while it's Resolved unless the human
-/// expanded it, with the actions the
-/// Session offers in it. A co-Reviewer's Draft the human hasn't kept shows in the `agent` colour.
+/// expanded it, with the actions the Session offers in it. A co-Reviewer's Draft the human
+/// hasn't kept shows in the `agent` colour.
 fn thread_view(k: &Kit, s: &State, thread: &Thread, tab: &SessionTab, agent: Color) -> El {
     let session = &tab.session.id;
     // `actions` is worked out from the same Session, so it has every Thread.
@@ -1918,7 +1922,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
                         .child(text(thread.excerpt.trim_end().to_owned()).font(k.ty.mono).color(k.c.text_muted)),
                 );
             }
-            card = card.child(thread_card(k, thread, None));
+            card = card.child(thread_card(k, thread, None).key(format!("outdated-comments-{}", thread.id)));
         }
         list = list.child(card).pb(8.0);
     }

@@ -38,6 +38,12 @@ fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
     });
 }
 
+/// Hands the service's Window to the window and builds the next frame from it.
+fn deliver_window_and_rebuild(rt: &mut Runtime<State>, service: &Service) {
+    deliver_window(rt, service);
+    rt.frame(0.0);
+}
+
 /// Opens the comment box on the first line the shown Changeset offers a Comment on.
 fn open_comment_box(rt: &mut Runtime<State>) {
     let (x, y) = rt.find("plus").expect("the Session's Changeset offers a Comment on its lines");
@@ -108,6 +114,19 @@ fn hiding_an_expanded_resolved_thread_collapses_it_to_one_line_again() {
 }
 
 #[test]
+fn reopening_a_resolved_thread_offers_a_reply_again() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let _id = resolved_by_the_agent(&repo, &service);
+    let mut rt = window(&service);
+
+    press(&mut rt, "reopen-T1");
+    deliver_window_and_rebuild(&mut rt, &service);
+
+    assert!(rt.find("reply-T1").is_some(), "the reopened Thread doesn't offer a Reply");
+}
+
+#[test]
 fn an_expanded_thread_reopened_and_resolved_again_comes_back_collapsed() {
     let repo = repo_with_one_edit();
     let service = Arc::new(Service::new());
@@ -116,15 +135,30 @@ fn an_expanded_thread_reopened_and_resolved_again_comes_back_collapsed() {
     press(&mut rt, "toggle-T1");
 
     press(&mut rt, "reopen-T1");
-    deliver_window(&mut rt, &service);
-    rt.frame(0.0);
-    assert!(rt.find("reply-T1").is_some(), "the reopened Thread doesn't offer a Reply");
+    deliver_window_and_rebuild(&mut rt, &service);
     service.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
-    deliver_window(&mut rt, &service);
-    rt.frame(0.0);
+    deliver_window_and_rebuild(&mut rt, &service);
 
     assert!(rt.find("resolved-T1").is_some(), "the Thread resolved again doesn't show as one line");
     assert!(rt.find("resolved-comments-T1").is_none(), "the Thread resolved again came back expanded");
+}
+
+#[test]
+fn an_expanded_outdated_thread_stays_expanded_through_an_update() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    service.comment(pending.session(), Anchor::lines(Side::New, "a.txt", 1..=1), "Why two?").unwrap();
+    repo.write("a.txt", "three\n");
+    service.reload(pending.session()).unwrap();
+    let mut rt = window(&service);
+    press(&mut rt, "toggle-T1");
+    assert!(rt.find("outdated-comments-T1").is_some(), "Show didn't expand the Outdated Thread");
+
+    service.mark_viewed(pending.session(), "a.txt", true).unwrap();
+    deliver_window_and_rebuild(&mut rt, &service);
+
+    assert!(rt.find("outdated-comments-T1").is_some(), "the update collapsed the expanded Outdated Thread");
 }
 
 #[test]
