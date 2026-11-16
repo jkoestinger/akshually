@@ -16,6 +16,7 @@ rune.workspace = true
 rune-kit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+fontique.workspace = true
 notify-rust.workspace = true
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

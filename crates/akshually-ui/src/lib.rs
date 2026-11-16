@@ -33,9 +33,11 @@ const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 
+mod mono_font;
 mod notifier;
 mod theme;
 
+pub use mono_font::{MonoFace, MonoFonts, SYSTEM_MONO, upright_mono};
 pub use notifier::DesktopNotifier;
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
@@ -48,6 +50,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let headless = is_headless_run(&rune_args);
+    let (fonts, mono) = mono_font::window_fonts();
     let spec = AppSpec {
         scenes: &[
             ("session", scene_session),
@@ -59,10 +62,16 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("update", scene_update),
             ("update-installed", scene_update_installed),
         ],
-        // The system monospace font. A family whose oblique face lacks the italic/oblique bit
-        // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
-        // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
-        families: ("Inter", "ui-monospace, Inter"),
+        // The system monospace font, by name over its upright files on Linux (#71). For
+        // `ui-monospace`, Rune loads every file of fontconfig's `monospace` family and picks a
+        // face by its OS/2 table: an oblique face that lacks the italic/oblique bit there (some
+        // Berkeley Mono builds) passes for Regular, and all code renders slanted. fontconfig
+        // goes by the italic angle and labels it right, so akshually asks fontconfig for the
+        // upright files and registers those alone, with Inter, which they replace in Rune.
+        // Without fontconfig, a match or a readable file, and on other platforms, the slot
+        // stays `ui-monospace, Inter`.
+        fonts,
+        families: ("Inter", mono),
         on_key: Some(on_key),
         ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
     };
