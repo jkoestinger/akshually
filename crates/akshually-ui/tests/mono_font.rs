@@ -1,9 +1,9 @@
-//! UI: the monospace font the window asks for, chosen from the family fontconfig matches for
+//! UI: the monospace font the Window asks for, chosen from the family fontconfig matches for
 //! `monospace` and its faces' slants, so code never renders in a mislabelled oblique face (#71).
 
 use std::path::PathBuf;
 
-use akshually_ui::{MonoFace, SYSTEM_MONO, upright_mono};
+use akshually_ui::{MonoFace, upright_mono};
 
 fn face(path: &str, upright: bool) -> MonoFace {
     MonoFace { path: PathBuf::from(path), upright }
@@ -20,7 +20,10 @@ fn a_family_with_an_oblique_file_labelled_regular_registers_only_its_upright_fil
 
     let mono = upright_mono(Some("Berkeley Mono"), &faces);
 
-    assert_eq!(mono.slot, "\"Berkeley Mono\", Inter");
+    assert_eq!(
+        mono.slot,
+        "\"Berkeley Mono\", \"DejaVu Sans Mono\", \"Liberation Mono\", \"Noto Sans Mono\", \"Ubuntu Mono\", Inter"
+    );
     assert_eq!(
         mono.files,
         [PathBuf::from("/fonts/BerkeleyMono-Regular.otf"), PathBuf::from("/fonts/BerkeleyMono-Bold.otf")],
@@ -34,7 +37,7 @@ fn a_family_with_no_upright_file_falls_back_to_the_system_monospace() {
 
     let mono = upright_mono(Some("Slanted"), &faces);
 
-    assert_eq!(mono.slot, SYSTEM_MONO);
+    assert_eq!(mono.slot, "ui-monospace, Inter");
     assert!(mono.files.is_empty(), "nothing to register for the fallback, got {:?}", mono.files);
 }
 
@@ -44,7 +47,10 @@ fn a_family_with_only_upright_faces_registers_all_of_them() {
 
     let mono = upright_mono(Some("Plain"), &faces);
 
-    assert_eq!(mono.slot, "\"Plain\", Inter");
+    assert_eq!(
+        mono.slot,
+        "\"Plain\", \"DejaVu Sans Mono\", \"Liberation Mono\", \"Noto Sans Mono\", \"Ubuntu Mono\", Inter"
+    );
     assert_eq!(mono.files, [PathBuf::from("/fonts/Plain-Regular.ttf"), PathBuf::from("/fonts/Plain-Bold.ttf")]);
 }
 
@@ -80,7 +86,7 @@ fn a_family_name_with_double_quotes_is_quoted_with_single_ones() {
 
     let mono = upright_mono(Some("Odd \"Mono\""), &faces);
 
-    assert_eq!(mono.slot, "'Odd \"Mono\"', Inter");
+    assert!(mono.slot.starts_with("'Odd \"Mono\"', "), "the family's name goes first, single-quoted: {}", mono.slot);
 }
 
 #[test]
@@ -89,6 +95,6 @@ fn a_family_name_with_both_quotes_falls_back_to_the_system_monospace() {
 
     let mono = upright_mono(Some("Odd's \"Mono\""), &faces);
 
-    assert_eq!(mono.slot, SYSTEM_MONO, "a CSS family list can't name it: there are no escapes");
+    assert_eq!(mono.slot, "ui-monospace, Inter", "a CSS family list can't name it: there are no escapes");
     assert!(mono.files.is_empty(), "nothing to register for the fallback, got {:?}", mono.files);
 }
