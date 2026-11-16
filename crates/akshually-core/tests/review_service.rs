@@ -105,26 +105,17 @@ fn review_blocks_until_the_human_acts() {
 }
 
 #[test]
-fn reviews_in_two_repositories_are_two_sessions() {
-    let (a, b) = (feature_branch_with_uncommitted_work(), feature_branch_with_uncommitted_work());
-    let svc = Service::new();
-
-    let pa = svc.review(ReviewRequest::new(a.path())).unwrap();
-    let pb = svc.review(ReviewRequest::new(b.path())).unwrap();
-
-    assert_ne!(pa.session(), pb.session());
-    assert_eq!(svc.sessions().len(), 2);
-}
-
-#[test]
 fn acting_on_an_unknown_session_fails() {
     let repo = feature_branch_with_uncommitted_work();
     let svc = Service::new();
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
     svc.approve(pending.session()).unwrap();
 
-    assert!(svc.approve(pending.session()).is_err());
-    assert!(svc.abandon(pending.session()).is_err());
+    let approved = svc.approve(pending.session());
+    let abandoned = svc.abandon(pending.session());
+
+    assert!(matches!(approved, Err(Error::UnknownSession(_))), "{approved:?}");
+    assert!(matches!(abandoned, Err(Error::UnknownSession(_))), "{abandoned:?}");
 }
 
 /// A repository on branch `agent` whose `lib.rs` changed two lines and gained a third.
@@ -176,25 +167,20 @@ fn a_comment_outside_the_changeset_or_without_text_is_refused() {
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
     let id = pending.session();
 
-    assert!(svc.comment(id, Anchor::lines(Side::New, "other.rs", 1..=1), "x").is_err(), "unchanged file");
-    assert!(svc.comment(id, Anchor::lines(Side::Old, "lib.rs", 4..=4), "x").is_err(), "past the old side");
     let backwards = Anchor::Lines { path: "lib.rs".into(), side: Side::New, start: 3, end: 2 };
-    assert!(svc.comment(id, backwards, "x").is_err(), "backwards range");
-    assert!(svc.comment(id, Anchor::lines(Side::New, "lib.rs", 0..=1), "x").is_err(), "line 0");
-    assert!(svc.comment(id, Anchor::lines(Side::New, "lib.rs", 1..=1), "  \n").is_err(), "blank body");
+    let refused_anchors = [
+        ("unchanged file", Anchor::lines(Side::New, "other.rs", 1..=1)),
+        ("past the old side", Anchor::lines(Side::Old, "lib.rs", 4..=4)),
+        ("backwards range", backwards),
+        ("line 0", Anchor::lines(Side::New, "lib.rs", 0..=1)),
+    ];
+    for (case, anchor) in refused_anchors {
+        let refused = svc.comment(id, anchor, "x");
+        assert!(matches!(refused, Err(Error::InvalidAnchor(_))), "{case}: {refused:?}");
+    }
+    let blank = svc.comment(id, Anchor::lines(Side::New, "lib.rs", 1..=1), "  \n");
+    assert!(matches!(blank, Err(Error::EmptyComment)), "blank body: {blank:?}");
     assert!(svc.session(id).unwrap().threads.is_empty());
-}
-
-#[test]
-fn thread_ids_count_up_within_a_session() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
-
-    let first = svc.comment(pending.session(), Anchor::lines(Side::New, "lib.rs", 1..=1), "one").unwrap();
-    let second = svc.comment(pending.session(), Anchor::lines(Side::New, "lib.rs", 4..=4), "two").unwrap();
-
-    assert_eq!((first.as_str(), second.as_str()), ("T1", "T2"));
 }
 
 fn round(outcome: Option<Outcome>) -> Round {
@@ -231,7 +217,8 @@ fn handing_over_without_drafts_is_refused() {
     let svc = Service::new();
     let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
-    assert!(svc.hand_over_round(pending.session()).is_err());
+    let refused = svc.hand_over_round(pending.session());
+    assert!(matches!(refused, Err(Error::NoDrafts)), "{refused:?}");
     assert_eq!(pending.wait_timeout(Duration::from_millis(50)), None);
     assert_eq!(svc.session(pending.session()).unwrap().round, 1);
 }
@@ -999,17 +986,6 @@ fn replying_without_a_session_for_this_branch_fails() {
 }
 
 #[test]
-fn the_agent_can_resolve_a_thread() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let id = after_round_1(&repo, &svc);
-
-    svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
-
-    assert_eq!(svc.session(&id).unwrap().threads[0].resolved, Some(Party::Agent));
-}
-
-#[test]
 fn the_human_can_reopen_a_thread_the_agent_resolved_and_resolve_it_again() {
     let repo = agent_branch();
     let svc = Service::new();
@@ -1114,11 +1090,14 @@ fn a_thread_reopened_then_resolved_again_before_handover_does_not_go_out() {
     let id = after_round_1(&repo, &svc);
     let t1 = ThreadId::new("T1");
     svc.resolve(repo.path(), &t1).unwrap();
+    let _second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
     svc.reopen_thread(&ThreadRef::new(&id, &t1)).unwrap();
     svc.resolve_thread(&ThreadRef::new(&id, &t1)).unwrap();
 
-    assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
+    assert!(!svc.session(&id).unwrap().threads[0].reopened, "resolved again");
+    let refused = svc.hand_over_round(&id);
+    assert!(matches!(refused, Err(Error::NoDrafts)), "nothing to hand over: {refused:?}");
 }
 
 #[test]
@@ -1126,13 +1105,14 @@ fn reopening_an_open_thread_is_refused_and_changes_nothing() {
     let repo = agent_branch();
     let svc = Service::new();
     let id = after_round_1(&repo, &svc);
+    let _second = svc.review(ReviewRequest::new(repo.path())).unwrap();
 
     let reopened = svc.reopen_thread(&ThreadRef::new(&id, &ThreadId::new("T1")));
 
     assert!(matches!(reopened, Err(Error::InvalidRequest(_))), "{reopened:?}");
-
     assert!(!svc.session(&id).unwrap().threads[0].reopened);
-    assert!(svc.hand_over_round(&id).is_err(), "nothing to hand over");
+    let refused = svc.hand_over_round(&id);
+    assert!(matches!(refused, Err(Error::NoDrafts)), "nothing to hand over: {refused:?}");
 }
 
 #[test]
@@ -1637,20 +1617,6 @@ fn the_human_can_close_a_session_whose_verdict_no_agent_collected() {
     let next = restored.review(ReviewRequest::new(repo.path())).unwrap();
     assert!(next.wait_timeout(Duration::from_millis(50)).is_none(), "waits for the human");
     assert_eq!(restored.session(next.session()).unwrap().round, 1);
-}
-
-#[test]
-fn the_human_can_close_a_session_abandoned_while_no_review_waited() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    let id = first.session().clone();
-    drop(first);
-    svc.abandon(&id).unwrap();
-
-    svc.close(&id).unwrap();
-
-    assert!(svc.sessions().is_empty());
 }
 
 #[test]

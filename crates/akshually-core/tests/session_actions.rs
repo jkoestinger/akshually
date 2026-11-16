@@ -300,7 +300,7 @@ fn replying_in_a_thread_the_agent_has_not_received_is_refused() {
     let reply = svc.reply_in_thread(&ThreadRef::new(pending.session(), &draft), "And clear.");
 
     assert!(matches!(reply, Err(Error::NotSent)), "{reply:?}");
-    assert_eq!(svc.session(pending.session()).unwrap().threads[0].comments.len(), 1, "the reply went in");
+    assert_eq!(svc.session(pending.session()).unwrap().threads[0].comments.len(), 1, "the refused reply was added");
 }
 
 #[test]

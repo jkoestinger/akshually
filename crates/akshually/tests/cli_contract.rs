@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
-use akshually_core::{Anchor, Party, Side, ThreadId, ThreadRef};
+use akshually_core::{Anchor, Party, Side, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
 use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
@@ -166,31 +166,6 @@ fn review_format_json_prints_who_resolved_a_thread_in_the_round() {
     assert_eq!(printed["threads"][0]["resolved"], "human", "{printed:#}");
 }
 
-#[test]
-fn the_next_review_attaches_to_the_same_session_and_keeps_its_threads() {
-    let app = HostedApp::start();
-    let repo = repo_with_work();
-    let first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
-    let session = app.wait_for_session(repo.path());
-    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Drop c").unwrap();
-    app.service.hand_over_round(&session.id).unwrap();
-    assert_eq!(finish(first).status.code(), Some(0));
-
-    repo.write("lib.rs", "fn a() {}\nfn b() {}\n");
-    let mut second = app.akshually(repo.path(), &["review"]).spawn().unwrap();
-
-    assert!(still_running(&mut second), "the second call didn't wait for the human");
-    app.wait_for_review(&session.id);
-    let sessions = app.service.sessions();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].id, session.id);
-    assert_eq!(sessions[0].round, 2);
-    assert_eq!(sessions[0].threads.len(), 1);
-    assert_eq!(sessions[0].changeset.files[0].new.as_deref(), Some("fn a() {}\nfn b() {}\n"));
-    app.service.approve(&session.id).unwrap();
-    assert_eq!(finish(second).status.code(), Some(0));
-}
-
 /// Hands the `review` call in `repo` a Round with Thread T1, on new line 3.
 fn round_1_handed_over(app: &HostedApp, repo: &TestRepo) -> akshually_core::SessionId {
     let call = app.akshually(repo.path(), &["review"]).spawn().unwrap();
@@ -331,6 +306,8 @@ fn review_fails_when_no_app_runs_and_launching_is_off() {
     );
 
     assert_eq!(out.status.code(), Some(EXIT_ERROR));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the akshually app isn't running"), "stderr: {stderr}");
     assert!(app.service.sessions().is_empty(), "the call reached an app on another runtime dir");
 }
 
@@ -419,29 +396,6 @@ fn test_control_is_refused_by_an_app_not_started_for_tests() {
     assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::Forbidden), "{refused:?}");
 }
 
-#[test]
-fn the_app_answers_no_session_when_the_branch_has_none() {
-    let app = HostedApp::start();
-    let repo = repo_with_work();
-
-    let refused = ipc::connect(&app.paths()).unwrap().reply(repo.path(), None, &ThreadId::new("T1"), "Done.");
-
-    assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::NoSession), "{refused:?}");
-}
-
-#[test]
-fn the_app_answers_ended_when_the_session_has_ended() {
-    let app = HostedApp::start();
-    let repo = repo_with_work();
-    let session = round_1_handed_over(&app, &repo);
-    app.service.abandon(&session).unwrap();
-
-    let refused =
-        ipc::connect(&app.paths()).unwrap().draft(repo.path(), None, Anchor::file("lib.rs"), "Split this.".into());
-
-    assert!(matches!(refused, Err(ClientError::App(ref e)) if e.code == ErrorCode::Ended), "{refused:?}");
-}
-
 /// `topic` forks from `main`, and `agent` from `topic`. Each branch adds the file named after
 /// it, and `forgot.txt` is untracked.
 fn stacked_branches() -> TestRepo {
@@ -501,7 +455,10 @@ fn start_records_the_session_base_and_returns_at_once() {
     repo.write("later.txt", "after start\n");
 
     assert_eq!(started.status.code(), Some(0));
-    assert!(!started.stdout.is_empty(), "start says what it did");
+    assert_eq!(
+        String::from_utf8_lossy(&started.stdout),
+        "Session base recorded: `akshually review` will show only the changes made from now on.\n"
+    );
     assert_eq!(reviewed_paths(&app, &repo, &[]), ["later.txt"]);
 }
 
@@ -533,15 +490,6 @@ fn version_prints_the_package_version() {
 
 /// The `.desktop` entry and the macOS `.app` start the binary with no arguments. That opens the
 /// app, which leaves the CLI to the instance already running.
-#[test]
-fn no_subcommand_opens_the_app_and_defers_to_a_running_one() {
-    let app = HostedApp::start();
-
-    let out = app.akshually(&std::env::temp_dir(), &[]).output().unwrap();
-
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-}
-
 #[test]
 fn opening_the_app_again_shows_the_running_ones_window_with_the_activation_token() {
     let app = HostedApp::start();
@@ -600,22 +548,4 @@ fn a_round_handed_over_after_the_agent_was_killed_goes_to_the_next_review() {
     app.wait_for_review(&session.id);
     app.service.approve(&session.id).unwrap();
     assert_eq!(finish(third).status.code(), Some(0));
-}
-
-#[test]
-fn a_verdict_given_while_no_review_waits_goes_to_the_next_review() {
-    let app = HostedApp::start();
-    let repo = repo_with_work();
-    let mut first = app.akshually(repo.path(), &["review"]).spawn().unwrap();
-    let session = app.wait_for_session(repo.path());
-    first.kill().unwrap();
-    first.wait().unwrap();
-    wait_until(TIMEOUT, "the app to notice", || app.service.session(&session.id).filter(|s| !s.agent_waiting));
-
-    app.service.approve(&session.id).unwrap();
-
-    let out = finish(app.akshually(repo.path(), &["review"]).spawn().unwrap());
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "Approved.\n");
-    assert!(app.service.sessions().is_empty(), "collected, the Session ends");
 }

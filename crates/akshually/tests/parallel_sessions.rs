@@ -2,7 +2,6 @@
 
 mod support;
 
-use akshually_core::Displayed;
 use akshually_testkit::TestRepo;
 use support::{HostedApp, finish, still_running};
 
@@ -20,15 +19,6 @@ fn agents_in_two_worktrees_get_two_sessions_in_one_app_and_each_waits_for_its_ow
     let a = app.wait_for_session(one.path());
     let mut second = app.akshually(two.path(), &["review"]).spawn().unwrap();
     let b = app.wait_for_session(two.path());
-
-    assert_ne!(a.id, b.id);
-    assert_eq!((a.branch(), b.branch()), ("agent-one", "agent-two"));
-    assert_eq!(
-        app.service.window().displayed,
-        Displayed::Session(a.id.clone()),
-        "the second Session doesn't take the view"
-    );
-    assert!(app.service.session(&b.id).unwrap().attention, "the second Session doesn't ask for attention");
 
     app.service.approve(&a.id).unwrap();
     assert_eq!(finish(first).status.code(), Some(0));

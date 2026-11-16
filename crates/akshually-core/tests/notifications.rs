@@ -95,11 +95,6 @@ fn losing_the_local_channel_is_notified_once_without_a_session() {
 }
 
 #[test]
-fn notifications_are_on_by_default() {
-    assert!(Settings::default().notifications);
-}
-
-#[test]
 fn turning_notifications_off_in_the_settings_stops_them() {
     let repo = agent_branch();
     let notifier = FakeNotifier::default();

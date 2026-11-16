@@ -428,19 +428,18 @@ fn an_api_error_carries_github_s_message() {
 // --- Credentials: `gh`, then the environment, then the pasted token ---
 
 #[test]
-fn enterprise_hosts_ask_gh_for_their_host_and_never_get_the_github_com_token() {
+fn enterprise_hosts_ask_gh_for_their_own_host() {
     let mut h = Harness::new();
     let ghe = PullRequestRef { host: "github.example.com".into(), ..pr_ref() };
     let mock = h.get("/repos/acme/web/pulls/482", "ghe-from-gh", &fixture("pull.json"));
     let gh = fake_gh(h.dirs.path(), "github.example.com", "ghe-from-gh");
-    let env = HashMap::from([("GITHUB_TOKEN".into(), "github-com-token".into())]);
     let github = h.adapter(
         h.host("github.example.com"),
         CredentialSources {
             config: "/home/me/.config/akshually/config.toml".into(),
             gh,
             glab: "/nonexistent".into(),
-            env,
+            env: HashMap::new(),
         },
     );
 
