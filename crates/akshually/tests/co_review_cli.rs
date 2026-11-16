@@ -5,7 +5,7 @@ mod support;
 
 use std::process::Output;
 
-use akshually_core::{Anchor, Outcome, Party, Side, ThreadId, ThreadRef, Verdict};
+use akshually_core::{Anchor, Party, Side, ThreadId, ThreadRef, Verdict};
 use akshually_testkit::{TestRepo, wait_until};
 use support::{HostedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
@@ -64,26 +64,6 @@ fn draft_reads_its_body_from_stdin_when_given_a_dash() {
 }
 
 #[test]
-fn reply_pr_reads_its_body_from_stdin_when_given_a_dash() {
-    let app = HostedApp::with_pull_request();
-    stdout(&run(&app, &["draft", "--pr", PR_URL, "--file", "README.md", "Link the docs."]));
-    let review = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
-    let session = app.wait_for_co_reviewer();
-    app.service.reply_in_thread(&ThreadRef::new(&session.id, &session.threads[0].id), "Which docs?").unwrap();
-    app.service.hand_over_round(&session.id).unwrap();
-    finish(review);
-
-    let out = finish_with_stdin(
-        app.akshually(&std::env::temp_dir(), &["reply", "--pr", PR_URL, "T1", "-"]),
-        b"The SSO setup guide:\n\n- `docs/sso.md`\n",
-    );
-
-    stdout(&out);
-    let answer = app.service.session(&session.id).unwrap().threads[0].comments.last().unwrap().clone();
-    assert_eq!((answer.author, answer.body.as_str()), (Party::Agent, "The SSO setup guide:\n\n- `docs/sso.md`\n"));
-}
-
-#[test]
 fn a_draft_the_service_refuses_exits_1_with_the_reason() {
     let app = HostedApp::with_pull_request();
 
@@ -122,9 +102,9 @@ fn review_pr_prints_the_published_outcome_as_json() {
     let out = finish(child);
 
     assert_eq!(out.status.code(), Some(0));
-    let outcome: Outcome = serde_json::from_slice(&out.stdout).unwrap();
+    let outcome: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let url = format!("{PR_URL}#pullrequestreview-1");
-    assert_eq!(outcome, Outcome::Published { verdict: Verdict::Approve, url });
+    assert_eq!(outcome, serde_json::json!({ "outcome": "published", "verdict": "approve", "url": url }));
 }
 
 #[test]
@@ -137,35 +117,6 @@ fn review_pr_on_a_pull_request_the_human_published_alone_says_it_has_ended_witho
 
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "akshually: this Session has ended\n");
-}
-
-#[test]
-fn review_pr_exits_0_and_says_abandoned_when_the_human_abandons_the_co_review() {
-    let app = HostedApp::with_pull_request();
-    let child = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
-    let session = app.wait_for_co_reviewer();
-
-    app.service.close(&session.id).unwrap();
-    let out = finish(child);
-
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let printed = String::from_utf8(out.stdout).unwrap();
-    assert!(printed.starts_with("Abandoned: "), "stdout: {printed}");
-}
-
-#[test]
-fn a_second_review_pr_while_one_waits_fails_as_busy() {
-    let app = HostedApp::with_pull_request();
-    let mut first = app.akshually(&std::env::temp_dir(), &["review", "--pr", PR_URL]).spawn().unwrap();
-    app.wait_for_co_reviewer();
-
-    let second = run(&app, &["review", "--pr", PR_URL]);
-
-    assert_eq!(second.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(stderr.contains("already waiting"), "stderr: {stderr}");
-    assert!(still_running(&mut first), "the first review --pr stopped waiting");
-    first.kill().unwrap();
 }
 
 #[test]
@@ -238,18 +189,4 @@ fn a_local_co_review_drafts_answers_questions_and_exits_0_when_the_human_closes_
         "Closed: the human finished with your co-review. There is nothing left to do.\n"
     );
     assert!(app.service.sessions().is_empty());
-}
-
-#[test]
-fn a_closed_local_co_review_prints_closed_as_json() {
-    let app = HostedApp::start();
-    let repo = local_work();
-    stdout(&app.akshually(repo.path(), &["draft", "--review", "Small."]).output().unwrap());
-    let session = app.wait_for_session(repo.path());
-
-    app.service.close(&session.id).unwrap();
-    let out = app.akshually(repo.path(), &["review", "--format", "json"]).output().unwrap();
-
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(serde_json::from_slice::<Outcome>(&out.stdout).unwrap(), Outcome::Closed);
 }

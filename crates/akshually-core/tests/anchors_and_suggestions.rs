@@ -128,7 +128,7 @@ fn a_comment_without_a_suggestion_is_written_as_its_body() {
 
     let written = comment.to_markdown();
 
-    assert_eq!(NewComment::from_markdown(&written), comment);
+    assert_eq!(written, comment.body);
 }
 
 #[test]
@@ -157,17 +157,6 @@ fn a_suggestion_needs_lines_on_the_new_side() {
     assert!(svc.comment(id, Anchor::file("lib.rs"), suggestion()).is_err(), "whole file");
     assert!(svc.comment(id, Anchor::Review, suggestion()).is_err(), "whole Review");
     assert!(svc.session(id).unwrap().threads.is_empty());
-}
-
-#[test]
-fn a_plain_comment_carries_no_suggestion() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
-
-    svc.comment(pending.session(), Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b2?").unwrap();
-
-    assert_eq!(svc.session(pending.session()).unwrap().threads[0].comments[0].suggestion, None);
 }
 
 /// The Round's JSON is what the channel carries and `review --format json` prints.

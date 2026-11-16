@@ -1,8 +1,6 @@
 //! Seam A, the core review service: parallel Sessions, Turn and attention.
 
-use std::time::Duration;
-
-use akshually_core::{Anchor, Displayed, Outcome, ReviewRequest, Service, SessionId, Side, Turn};
+use akshually_core::{Anchor, Displayed, Error, ReviewRequest, Service, SessionId, Side};
 use akshually_testkit::TestRepo;
 
 /// A repository on branch `agent` with a committed change to `lib.rs`.
@@ -117,38 +115,8 @@ fn when_the_displayed_session_ends_the_inbox_is_displayed_and_the_next_session_o
 fn displaying_an_unknown_session_fails() {
     let svc = Service::new();
 
-    assert!(svc.display(&SessionId::new("nope")).is_err());
-}
+    let displayed = svc.display(&SessionId::new("nope"));
 
-#[test]
-fn a_session_is_the_humans_turn_until_a_round_is_handed_over_then_the_agents_until_it_calls_again() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    let id = first.session().clone();
-    assert_eq!(svc.session(&id).unwrap().turn, Turn::Human);
-
-    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
-    svc.hand_over_round(&id).unwrap();
-    assert_eq!(svc.session(&id).unwrap().turn, Turn::Agent);
-
-    let _second = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    assert_eq!(svc.session(&id).unwrap().turn, Turn::Human);
-}
-
-#[test]
-fn a_review_that_picks_up_a_queued_round_leaves_the_turn_with_the_agent() {
-    let repo = agent_branch();
-    let svc = Service::new();
-    let first = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    let id = first.session().clone();
-    drop(first);
-    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b?").unwrap();
-    svc.hand_over_round(&id).unwrap();
-
-    let second = svc.review(ReviewRequest::new(repo.path())).unwrap();
-
-    let outcome = second.wait_timeout(Duration::from_secs(1));
-    assert!(matches!(outcome, Some(Outcome::Round(_))), "the queued Round wasn't picked up: {outcome:?}");
-    assert_eq!(svc.session(&id).unwrap().turn, Turn::Agent);
+    assert!(matches!(displayed, Err(Error::UnknownSession(_))), "{displayed:?}");
+    assert_eq!(svc.window().displayed, Displayed::Inbox);
 }

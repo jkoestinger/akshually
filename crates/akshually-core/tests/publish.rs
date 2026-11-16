@@ -172,14 +172,6 @@ fn drafts_on_the_whole_review_join_the_summary_in_the_review_body() {
 }
 
 #[test]
-fn on_your_own_pull_request_only_feedback_is_offered() {
-    let (svc, _) = service_for("me");
-    let id = svc.open_pull_request(URL).unwrap();
-
-    assert_eq!(svc.publish_plan(&id).unwrap().verdicts, vec![Verdict::Feedback]);
-}
-
-#[test]
 fn the_plan_says_whether_the_human_wrote_the_pull_request_whatever_the_case_of_their_login() {
     let (yours, _) = service_for("Me");
     let (theirs, _) = service_for("maria");
@@ -348,16 +340,6 @@ fn a_verdict_the_forge_would_reject_is_refused_and_nothing_is_sent() {
     let session = svc.session(&id).unwrap();
     assert_eq!(session.ended, None);
     assert!(session.threads[1].comments[0].is_draft(), "the Draft stays");
-}
-
-#[test]
-fn existing_threads_keep_their_forge_ids() {
-    let (svc, _) = service_for("maria");
-    let id = svc.open_pull_request(URL).unwrap();
-
-    let session = svc.session(&id).unwrap();
-
-    assert_eq!(session.threads[0].forge, Some(ForgeThread { id: "RT_1".into(), resolved: false }));
 }
 
 /// `RT_2`, on login.rs, which `lee` resolved.

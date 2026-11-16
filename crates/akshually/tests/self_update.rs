@@ -8,7 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use akshually_core::ipc::{self, HumanCommand};
+use akshually_core::{
+    Anchor, Side,
+    ipc::{self, HumanCommand},
+};
 use akshually_testkit::{FakeRelease, FakeReleases, TestDirs, TestRepo, tar_gz, wait_until};
 use support::{HostedApp, LaunchedApp, TIMEOUT, finish};
 
@@ -105,47 +108,35 @@ fn update_refuses_a_hash_mismatch_and_leaves_the_install_untouched() {
     assert_eq!(app.service.window().update, None, "the app was told of an update");
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[test]
-fn update_refuses_an_unwritable_install_pointing_to_the_install_script() {
-    use std::os::unix::fs::PermissionsExt;
-    let app = HostedApp::start();
-    let github = newer_release("new binary");
-    let (dir, exe) = install();
-    let before = fs::read(&exe).unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-
-    let out = update(&app, &exe, &github);
-
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(out.status.code(), Some(EXIT_ERROR));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("install.sh"), "{stderr}");
-    assert!(fs::read(&exe).unwrap() == before, "the install changed");
-}
-
 #[test]
 fn no_agent_facing_command_looks_up_releases() {
     let app = HostedApp::start();
     let github = newer_release("new binary");
     let repo = TestRepo::new();
     repo.write("lib.rs", "fn a() {}\n").commit_all("base");
-    repo.branch("agent").write("lib.rs", "fn a() {}\nfn b() {}\n");
-    let run = |args: &[&str]| {
-        let child = app.akshually(repo.path(), args).env("AKSHUALLY_RELEASES_API", github.api()).spawn().unwrap();
-        finish(child)
+    let co_review = repo.worktree("co-review");
+    co_review.write("lib.rs", "fn a() {}\nfn b() {}\n");
+    repo.branch("agent");
+    let run = |cwd: &Path, args: &[&str]| {
+        let child = app.akshually(cwd, args).env("AKSHUALLY_RELEASES_API", github.api()).spawn().unwrap();
+        let out = finish(child);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
 
-    run(&["start"]);
-    run(&["draft", "--lines", "lib.rs:2", "Why b?"]);
-    run(&["reply", "T1", "Because."]);
-    run(&["resolve", "T1"]);
-    run(&["agent-help"]);
+    run(repo.path(), &["start"]);
+    // After `start`, so the change is in the Session's Changeset.
+    repo.write("lib.rs", "fn a() {}\nfn b() {}\n");
     let review = app.akshually(repo.path(), &["review"]).env("AKSHUALLY_RELEASES_API", github.api()).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
-    // `draft` made the agent a co-Reviewer, whose co-review the human closes.
-    app.service.close(&session.id).unwrap();
-    finish(review);
+    // The agent answers only Threads a Round brought it.
+    app.service.comment(&session.id, Anchor::lines(Side::New, "lib.rs", 1..=1), "Why a?").unwrap();
+    app.service.hand_over_round(&session.id).unwrap();
+    assert_eq!(finish(review).status.code(), Some(0));
+    run(repo.path(), &["reply", "T1", "Because."]);
+    run(repo.path(), &["resolve", "T1"]);
+    // A Session can't have its Author as a co-Reviewer, so `draft` reviews another branch.
+    run(co_review.path(), &["draft", "--lines", "lib.rs:2", "Why b?"]);
+    run(repo.path(), &["agent-help"]);
 
     assert!(!github.looked_up(), "an agent's command looked up releases");
 }

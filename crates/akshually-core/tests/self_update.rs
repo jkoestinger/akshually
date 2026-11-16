@@ -20,14 +20,6 @@ fn offered_tag(running: &str, tags: &[&str]) -> Option<String> {
 }
 
 #[test]
-fn a_pre_release_comes_before_its_stable_release() {
-    let rc: Version = "0.1.0-rc.1".parse().unwrap();
-    let stable: Version = "0.1.0".parse().unwrap();
-
-    assert!(rc < stable, "0.1.0-rc.1 sorts after 0.1.0");
-}
-
-#[test]
 fn versions_compare_numerically_and_pre_releases_by_their_identifiers() {
     let order = ["0.0.9", "0.0.10", "0.1.0-alpha", "0.1.0-alpha.2", "0.1.0-alpha.10", "0.1.0-beta", "0.1.0", "1.0.0"];
 

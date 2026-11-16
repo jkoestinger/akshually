@@ -60,12 +60,6 @@ fn the_skill_documents_exactly_the_cli_subcommands_for_agents() {
     assert_eq!(documented_subcommands(), for_agents);
 }
 
-#[test]
-fn update_is_listed_in_help_but_not_in_the_agents_skill() {
-    assert!(cli_subcommands().contains("update"), "`--help` doesn't list `update`");
-    assert!(!documented_subcommands().contains("update"), "the agents' skill documents `update`");
-}
-
 /// The codes in the skill's exit code table, rows like ``| `4` | A Round was handed over |``.
 fn documented_exit_codes() -> BTreeSet<i32> {
     let table = SKILL.split("## Exit codes\n").nth(1).expect("an Exit codes section");

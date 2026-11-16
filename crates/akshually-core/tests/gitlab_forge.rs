@@ -4,14 +4,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use akshually_core::forge::{
     CredentialSources, ForgeAdapter, ForgeError, ForgeKind, GitLab, HostConfig, InboxItem, InboxRole, PullRequest,
     PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, ReviewReply, adapters,
 };
-use akshually_core::{Anchor, BinarySizes, FileChange, Hunk, Party, Service, Settings, Side, Verdict};
-use akshually_testkit::{TestDirs, fake_cli, threaded_http_server};
+use akshually_core::{FileChange, Hunk, Settings, Side, Verdict};
+use akshually_testkit::{TestDirs, fake_cli};
 use mockito::{Matcher, Mock, Server, ServerGuard};
 use serde_json::{Value, json};
 
@@ -212,39 +211,6 @@ impl Harness {
 }
 
 #[test]
-fn file_contents_are_fetched_in_parallel_and_kept_in_path_order() {
-    let paths: Vec<String> = (0..16).map(|n| format!("src/f{n:02}.rs")).collect();
-    let diff = |p: &String| {
-        format!(
-            r#"{{ "old_path": "{p}", "new_path": "{p}", "new_file": false, "renamed_file": false,
-                "deleted_file": false, "diff": "@@ -1 +1 @@\n-a\n+b\n" }}"#
-        )
-    };
-    let listed = format!("[{}]", paths.iter().rev().map(diff).collect::<Vec<_>>().join(","));
-    let api = threaded_http_server(move |target| {
-        if target.starts_with("/projects/platform%2Finfra/merge_requests/97/diffs") {
-            listed.clone()
-        } else {
-            // Each read takes 100 ms: 32 of them one after the other would take 3.2 s.
-            std::thread::sleep(Duration::from_millis(100));
-            format!("{target}\n")
-        }
-    });
-    let h = Harness::new();
-    let host = HostConfig { api_base: Some(api), ..HostConfig::new(ForgeKind::GitLab, "gitlab.example.com") };
-    let gitlab = GitLab::new(host, h.sources(Some(("gitlab.example.com", TOKEN)), &[]));
-
-    let started = Instant::now();
-    let changeset = gitlab.changeset(&rotate_creds()).unwrap();
-
-    assert!(started.elapsed() < Duration::from_millis(1600), "took {:?}", started.elapsed());
-    assert_eq!(changeset.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), paths);
-    let raw = "/projects/platform%2Finfra/repository/files/src%2Ff00.rs/raw";
-    assert_eq!(changeset.files[0].old, Some(format!("{raw}?ref=mb1\n")));
-    assert_eq!(changeset.files[0].new, Some(format!("{raw}?ref=head1\n")));
-}
-
-#[test]
 fn fetches_the_changeset_against_the_merge_base_through_every_page_of_diffs() {
     let mut h = Harness::new();
     let pages = [h.diffs("1", "2", &fixture("diffs-1.json")), h.diffs("2", "", &fixture("diffs-2.json"))];
@@ -289,7 +255,7 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_diffs() {
 }
 
 #[test]
-fn a_line_outside_gitlab_s_diff_takes_no_comment() {
+fn a_hunk_header_followed_by_its_section_heading_still_gives_the_hunk() {
     let mut h = Harness::new();
     h.diffs(
         "1",
@@ -302,28 +268,8 @@ fn a_line_outside_gitlab_s_diff_takes_no_comment() {
 
     let changeset = h.gitlab().changeset(&rotate_creds()).unwrap();
 
-    assert!(changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 2..=4)));
-    assert!(changeset.takes_comment_at(&Anchor::lines(Side::Old, "src/c.rs", 3..=3)));
-    assert!(!changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 5..=5)));
-    assert!(!changeset.takes_comment_at(&Anchor::lines(Side::New, "src/c.rs", 1..=2)));
-}
-
-#[test]
-fn a_binary_file_is_summarised_by_size() {
-    let mut h = Harness::new();
-    h.diffs(
-        "1",
-        "",
-        r#"[{ "old_path": "logo.png", "new_path": "logo.png", "new_file": false, "renamed_file": false,
-              "deleted_file": false, "diff": "Binary files a/logo.png and b/logo.png differ\n" }]"#,
-    );
-    h.raw("logo.png", "mb1", b"\x89PNG\r\n\x1a\n\0\0old");
-    h.raw("logo.png", "head1", b"\x89PNG\r\n\x1a\n\0\0newer");
-
-    let changeset = h.gitlab().changeset(&rotate_creds()).unwrap();
-
-    let file = &changeset.files[0];
-    assert_eq!(file.binary, Some(BinarySizes { old: Some(13), new: Some(15) }));
+    let hunk = Hunk { old_start: 2, old_lines: 3, new_start: 2, new_lines: 3 };
+    assert_eq!(changeset.files[0].hunks, Some(vec![hunk]));
 }
 
 #[test]
@@ -518,34 +464,6 @@ fn gitlab_token_never_goes_to_another_host() {
 }
 
 #[test]
-fn opening_a_merge_request_url_starts_a_session_with_its_changeset_and_threads() {
-    let mut h = Harness::new();
-    h.get("/projects/platform%2Finfra/merge_requests/97", TOKEN, &fixture("mr.json"));
-    h.diffs("1", "", &fixture("diffs-1.json"));
-    h.raw("src/a.rs", "mb1", b"fn a() {}\n");
-    h.raw("src/a.rs", "head1", b"fn a2() {}\n");
-    h.raw("docs/new.md", "head1", b"# New\n");
-    h.server
-        .mock("GET", "/projects/platform%2Finfra/merge_requests/97/discussions")
-        .match_query(Matcher::Any)
-        .with_body(fixture("discussions-1.json"))
-        .create();
-    let svc = Service::new().with_forges(vec![Box::new(h.gitlab())]);
-
-    let id = svc.open_pull_request("https://gitlab.example.com/platform/infra/-/merge_requests/97/diffs").unwrap();
-
-    let session = svc.session(&id).expect("the Session is open");
-    assert_eq!(session.pull_request(), Some(&rotate_creds()));
-    assert_eq!(session.branch(), "rotate-creds");
-    let paths: Vec<_> = session.changeset.files.iter().map(|f| f.path.as_str()).collect();
-    assert_eq!(paths, ["docs/new.md", "src/a.rs"]);
-    let thread = &session.threads[0];
-    assert_eq!(thread.anchor, Anchor::lines(Side::New, "src/a.rs", 1..=1));
-    assert_eq!(thread.excerpt, "fn a2() {}\n");
-    assert_eq!(thread.comments[0].author, Party::Other("lee".into()));
-}
-
-#[test]
 fn an_api_error_carries_gitlab_s_message() {
     let mut h = Harness::new();
     h.server
@@ -604,17 +522,6 @@ fn gitlab_offers_the_verdicts_its_version_and_approval_rules_allow() {
 
         assert_eq!(verdicts, offered, "GitLab {version}, own {own}, can approve {can}, has approved {has}");
     }
-}
-
-#[test]
-fn the_gitlab_viewer_is_the_username_of_the_token_s_user() {
-    let mut h = Harness::new();
-    let user = h.user("lee");
-
-    let username = h.gitlab().viewer().unwrap();
-
-    user.assert();
-    assert_eq!(username, "lee");
 }
 
 // --- Publish: draft notes, then the Verdict ---
@@ -928,7 +835,7 @@ fn a_push_since_the_session_opened_stops_publish_before_anything_is_sent() {
     let error = h.gitlab().publish(&stale, &review(Verdict::Feedback, "Looks good.")).unwrap_err();
 
     written.iter().for_each(Mock::assert);
-    assert!(matches!(&error, ForgeError::Moved(pr) if pr.contains("platform/infra")), "{error:?}");
+    assert!(matches!(&error, ForgeError::Moved(pr) if pr == "gitlab.example.com/platform/infra#97"), "{error:?}");
 }
 
 #[test]

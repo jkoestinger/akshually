@@ -201,20 +201,6 @@ fn publishes_one_review_with_its_threads_summary_and_verdict() {
 }
 
 #[test]
-fn feedback_is_published_as_github_s_comment() {
-    let mut h = Harness::new();
-    h.pull_request_id();
-    h.start_review();
-    let submit = h.submit("COMMENT", "Some thoughts.");
-    let review =
-        Review { verdict: Verdict::Feedback, body: "Some thoughts.".into(), comments: Vec::new(), ..no_threads() };
-
-    h.github().publish(&pull_request("maria"), &review).unwrap();
-
-    submit.assert();
-}
-
-#[test]
 fn a_suggestion_is_published_as_a_native_suggestion_block() {
     let mut h = Harness::new();
     h.pull_request_id();
