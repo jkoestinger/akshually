@@ -175,7 +175,8 @@ struct SessionTab {
     /// What the human can do in `session`, as the service works it out.
     actions: SessionActions,
     diff: DiffState,
-    /// Outdated Threads the human expanded; the others show as one collapsed line.
+    /// Outdated and Resolved Threads the human expanded; the others show as one collapsed line.
+    /// The UI's own, so it's lost on restart.
     expanded: Vec<ThreadId>,
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
@@ -336,6 +337,11 @@ impl State {
                         }
                     }
                     tab.actions = session.actions();
+                    // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
+                    // resolved again (#69).
+                    tab.expanded.retain(|id| {
+                        session.threads.iter().any(|t| &t.id == id && (t.outdated || t.resolved.is_some()))
+                    });
                     tab.session = session;
                     tab
                 }
@@ -649,8 +655,8 @@ impl State {
         }
     }
 
-    /// Expands or collapses an Outdated Thread.
-    fn toggle_outdated(&mut self, thread: &ThreadRef) {
+    /// Expands or collapses an Outdated or Resolved Thread.
+    fn toggle_expanded(&mut self, thread: &ThreadRef) {
         let Some(tab) = self.tab_mut(&thread.session) else { return };
         match tab.expanded.iter().position(|t| t == &thread.thread) {
             Some(at) => {
@@ -1551,14 +1557,15 @@ fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
     }
 }
 
-/// A Thread of `tab`'s Session: its card, or one line while it's Resolved, with the actions the
+/// A Thread of `tab`'s Session: its card, or one line while it's Resolved unless the human
+/// expanded it, with the actions the
 /// Session offers in it. A co-Reviewer's Draft the human hasn't kept shows in the `agent` colour.
 fn thread_view(k: &Kit, s: &State, thread: &Thread, tab: &SessionTab, agent: Color) -> El {
     let session = &tab.session.id;
     // `actions` is worked out from the same Session, so it has every Thread.
     let Some(offered) = tab.actions.thread(&thread.id) else { return col() };
     if thread.resolved.is_some() {
-        resolved_row(k, thread, session, offered)
+        resolved_row(k, thread, tab, offered)
     } else if thread.comments.first().is_some_and(Comment::is_agent_draft) {
         agent_draft_card(k, s, thread, session, offered, agent)
     } else {
@@ -1675,7 +1682,8 @@ fn resolve_button(k: &Kit, thread: &Thread, session: &SessionId, offered: &Threa
     let at = ThreadRef::new(session, &thread.id);
     if offered.reopen {
         let reopen = move |s: &mut State| s.act_on_thread(&at, Service::reopen_thread);
-        Some(Button::new("Reopen").variant(ButtonVariant::Ghost).on_press(reopen).build(k))
+        let key = format!("reopen-{}", thread.id);
+        Some(Button::new("Reopen").variant(ButtonVariant::Ghost).on_press(reopen).build(k).key(key))
     } else if offered.resolve {
         let resolve = move |s: &mut State| s.act_on_thread(&at, Service::resolve_thread);
         Some(Button::new("Resolve").variant(ButtonVariant::Ghost).on_press(resolve).build(k))
@@ -1694,11 +1702,14 @@ fn resolved_by(thread: &Thread) -> String {
     }
 }
 
-/// A Resolved Thread, collapsed to one line with a way to reopen it.
-fn resolved_row(k: &Kit, thread: &Thread, session: &SessionId, offered: &ThreadActions) -> El {
+/// A Resolved Thread: one line with a way to reopen it, and once the human expands it, its
+/// Comments read-only below. To reply, the human reopens it first.
+fn resolved_row(k: &Kit, thread: &Thread, tab: &SessionTab, offered: &ThreadActions) -> El {
     let first = first_line(thread);
     let count = thread.comments.len();
-    row()
+    let expanded = tab.expanded.contains(&thread.id);
+    let at = ThreadRef::new(&tab.session.id, &thread.id);
+    let summary = row()
         .w_full()
         .max_w(720.0)
         .px(12.0)
@@ -1718,7 +1729,24 @@ fn resolved_row(k: &Kit, thread: &Thread, session: &SessionId, offered: &ThreadA
             .color(k.c.text_faint),
         )
         .child(row().grow(1.0))
-        .children(resolve_button(k, thread, session, offered))
+        .children(resolve_button(k, thread, &tab.session.id, offered))
+        .child(toggle_button(k, &at, expanded));
+    let mut view = col().key(format!("resolved-{}", thread.id)).w_full().max_w(720.0).gap(8.0).child(summary);
+    if expanded {
+        view = view.child(thread_card(k, thread, None).key(format!("resolved-comments-{}", thread.id)));
+    }
+    view
+}
+
+/// Show or Hide, which expands or collapses `thread`.
+fn toggle_button(k: &Kit, thread: &ThreadRef, expanded: bool) -> El {
+    let key = format!("toggle-{}", thread.thread);
+    let thread = thread.clone();
+    Button::new(if expanded { "Hide" } else { "Show" })
+        .variant(ButtonVariant::Ghost)
+        .on_press(move |s: &mut State| s.toggle_expanded(&thread))
+        .build(k)
+        .key(key)
 }
 
 fn card(k: &Kit) -> El {
@@ -1747,10 +1775,12 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId, &T
                     .gap(8.0)
                     .child(row().grow(1.0))
                     .children(offered.reply.then(|| {
+                        let key = format!("reply-{}", thread.id);
                         Button::new("Reply")
                             .variant(ButtonVariant::Ghost)
                             .on_press(move |s: &mut State| s.open_reply(at.clone()))
                             .build(k)
+                            .key(key)
                     }))
                     .children(resolve_button(k, thread, session, offered)),
             )
@@ -1875,12 +1905,7 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
             )
             .child(row().grow(1.0))
             .children(resolve)
-            .child(
-                Button::new(if expanded { "Hide" } else { "Show" })
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(move |s: &mut State| s.toggle_outdated(&at))
-                    .build(k),
-            );
+            .child(toggle_button(k, &at, expanded));
         let mut card = card(k).max_w(f32::INFINITY).child(summary);
         if expanded {
             if !thread.excerpt.is_empty() {

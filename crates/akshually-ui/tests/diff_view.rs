@@ -1,12 +1,15 @@
 //! UI: a Session's Changeset view in Rune's headless `Runtime`, against real Sessions in the
 //! core service, for what the render smoke check can't reach: input that lands between an
-//! update and the next rebuild (#37), and the comment box across updates (#48).
+//! update and the next rebuild (#37), the comment box across updates (#48), and expanding a
+//! Resolved Thread (#69).
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use rune::accesskit::Action;
 use rune::{Env, Runtime};
 
-use akshually_core::{ReviewRequest, Service};
+use akshually_core::{Anchor, ReviewRequest, Service, SessionId, Side, ThreadId, ThreadRef};
 use akshually_testkit::TestRepo;
 use akshually_ui::{State, view};
 
@@ -42,6 +45,86 @@ fn open_comment_box(rt: &mut Runtime<State>) {
     rt.pointer_up(x, y);
     rt.frame(0.0);
     assert!(rt.find("composer").is_some(), "the comment box didn't open");
+}
+
+/// The Session of `repo`'s first Round: the human's Comment `T1` on its one line, which the
+/// agent answered and resolved.
+fn resolved_by_the_agent(repo: &TestRepo, service: &Service) -> SessionId {
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    service.comment(&id, Anchor::lines(Side::New, "a.txt", 1..=1), "Why two?").unwrap();
+    service.hand_over_round(&id).unwrap();
+    assert!(pending.wait_timeout(Duration::from_secs(5)).is_some(), "the Round wasn't handed over");
+    let t1 = ThreadId::new("T1");
+    service.reply(repo.path(), &t1, "Because one was wrong.").unwrap();
+    service.resolve(repo.path(), &t1).unwrap();
+    id
+}
+
+/// Presses the element keyed `key` as an assistive client would.
+fn press(rt: &mut Runtime<State>, key: &str) {
+    assert!(rt.accessibility_action(key, Action::Click, None), "nothing to press at `{key}`");
+    rt.frame(0.0);
+}
+
+#[test]
+fn a_thread_the_agent_resolved_in_a_round_arrives_collapsed() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let _id = resolved_by_the_agent(&repo, &service);
+
+    let rt = window(&service);
+
+    assert!(rt.find("resolved-T1").is_some(), "the Resolved Thread doesn't show as one line");
+    assert!(rt.find("resolved-comments-T1").is_none(), "the Resolved Thread arrived expanded");
+}
+
+#[test]
+fn showing_a_resolved_thread_reveals_its_comments_without_a_reply_box() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let _id = resolved_by_the_agent(&repo, &service);
+    let mut rt = window(&service);
+
+    press(&mut rt, "toggle-T1");
+
+    assert!(rt.find("resolved-comments-T1").is_some(), "Show didn't reveal the Thread's Comments");
+    assert!(rt.find("reply-T1").is_none(), "the expanded Resolved Thread offers a Reply");
+    assert!(rt.find("reopen-T1").is_some(), "Reopen left the summary line");
+}
+
+#[test]
+fn hiding_an_expanded_resolved_thread_collapses_it_to_one_line_again() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let _id = resolved_by_the_agent(&repo, &service);
+    let mut rt = window(&service);
+    press(&mut rt, "toggle-T1");
+
+    press(&mut rt, "toggle-T1");
+
+    assert!(rt.find("resolved-T1").is_some(), "the Resolved Thread's line went");
+    assert!(rt.find("resolved-comments-T1").is_none(), "Hide left the Thread's Comments showing");
+}
+
+#[test]
+fn an_expanded_thread_reopened_and_resolved_again_comes_back_collapsed() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let id = resolved_by_the_agent(&repo, &service);
+    let mut rt = window(&service);
+    press(&mut rt, "toggle-T1");
+
+    press(&mut rt, "reopen-T1");
+    deliver_window(&mut rt, &service);
+    rt.frame(0.0);
+    assert!(rt.find("reply-T1").is_some(), "the reopened Thread doesn't offer a Reply");
+    service.resolve_thread(&ThreadRef::new(&id, &ThreadId::new("T1"))).unwrap();
+    deliver_window(&mut rt, &service);
+    rt.frame(0.0);
+
+    assert!(rt.find("resolved-T1").is_some(), "the Thread resolved again doesn't show as one line");
+    assert!(rt.find("resolved-comments-T1").is_none(), "the Thread resolved again came back expanded");
 }
 
 #[test]
