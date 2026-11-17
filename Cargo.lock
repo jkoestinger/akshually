@@ -155,6 +155,7 @@ version = "0.0.4"
 dependencies = [
  "akshually-core",
  "akshually-testkit",
+ "fontique",
  "notify-rust",
  "rune",
  "rune-kit",

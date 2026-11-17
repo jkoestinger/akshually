@@ -33,9 +33,11 @@ const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 
+mod mono_font;
 mod notifier;
 mod theme;
 
+pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
@@ -48,6 +50,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let headless = is_headless_run(&rune_args);
+    let fonts = mono_font::window_fonts();
     let spec = AppSpec {
         scenes: &[
             ("session", scene_session),
@@ -59,10 +62,10 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("update", scene_update),
             ("update-installed", scene_update_installed),
         ],
-        // The system monospace font. A family whose oblique face lacks the italic/oblique bit
-        // in its OS/2 table (some Berkeley Mono builds) renders slanted: the font's metadata,
-        // not ours; fontconfig goes by the italic angle, Rune's font matching doesn't.
-        families: ("Inter", "ui-monospace, Inter"),
+        // The system monospace font, without the slanted faces Rune can mistake for Regular
+        // (#71, `mono_font`).
+        fonts: fonts.fonts,
+        families: ("Inter", fonts.mono),
         on_key: Some(on_key),
         ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
     };
