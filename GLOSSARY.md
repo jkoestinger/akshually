@@ -16,6 +16,10 @@ _Avoid_: Diff, patch, PR (a PR is one possible Source of a Changeset)
 How the Window shows every Changeset's old and new lines: stacked in one column, or side by side. One for the whole Window, kept across restarts.
 _Avoid_: Diff mode, view (a Changeset view is which Changeset is shown, not how)
 
+**Rendered view**:
+A markdown file of a Changeset shown as rendered text over the diff, its changed lines tinted. For reading only: it has no Threads.
+_Avoid_: Preview
+
 **Window**:
 The one app window: it shows the Inbox or one Session at a time, with one Diff layout for all of them. When the Session it shows goes away, it shows the Inbox.
 _Avoid_: Screen, app
@@ -37,7 +41,7 @@ A Forge's request to merge a branch; GitLab's merge requests are called Pull Req
 _Avoid_: MR, merge request (except when quoting GitLab)
 
 **Inbox**:
-The open Pull Requests, across every configured Forge, where the human is a requested reviewer or assignee.
+The open Pull Requests, across every configured Forge, where the human is a requested reviewer or assignee, leaving out those already approved and those the human gave a Verdict on since their review was last requested. One with an open Session stays.
 _Avoid_: Queue, dashboard
 
 **Verdict**:
