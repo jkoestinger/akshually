@@ -359,6 +359,42 @@ impl Harness {
             .with_body(body)
             .create()
     }
+
+    /// `GET …/reviewers` of `repo!iid`: the human's review state is `mine`, beside Ann, who
+    /// approved.
+    fn reviewers(&mut self, (repo, iid): (&str, u64), mine: &str) -> Mock {
+        let body = json!([
+            { "user": { "id": 2, "username": "ann", "name": "Ann" }, "state": "approved" },
+            { "user": { "id": 1, "username": "me", "name": "Me" }, "state": mine },
+        ]);
+        self.get(&mr_path(repo, iid, "reviewers"), TOKEN, &body.to_string())
+    }
+
+    /// `GET …/approvals` of `repo!iid`: whether it meets its approval requirement (GitLab's
+    /// `approved`), who approved it, and whether the human has.
+    fn mr_approvals(&mut self, (repo, iid): (&str, u64), approved: bool, by: &[&str], has: bool) -> Mock {
+        let by: Vec<_> = by.iter().map(|u| json!({ "user": { "id": 9, "username": u, "name": u } })).collect();
+        let body = json!({
+            "approved": approved,
+            "approved_by": by,
+            "user_has_approved": has,
+            "user_can_approve": !has,
+        });
+        self.get(&mr_path(repo, iid, "approvals"), TOKEN, &body.to_string())
+    }
+
+    /// Each of the fixtures' merge requests awaits the human's review, and none is approved.
+    fn none_reviewed(&mut self) {
+        for mr in [("platform/infra", 97), ("acme/backend/api", 5), ("acme/docs", 12)] {
+            self.reviewers(mr, "unreviewed");
+            self.mr_approvals(mr, false, &[], false);
+        }
+    }
+}
+
+/// The API path of `rest` under the merge request `repo!iid`.
+fn mr_path(repo: &str, iid: u64, rest: &str) -> String {
+    format!("/projects/{}/merge_requests/{iid}/{rest}", repo.replace('/', "%2F"))
 }
 
 fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRole) -> InboxItem {
@@ -371,6 +407,8 @@ fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRol
         created_at: 0,
         updated_at: 0,
         role,
+        approved: false,
+        verdict_given: false,
     }
 }
 
@@ -381,6 +419,7 @@ fn the_inbox_lists_review_requests_then_assignments_once_each() {
     h.user("me");
     let requested = h.merge_requests(("reviewer_username", "me"), &fixture("mrs-reviewer.json"));
     let assigned = h.merge_requests(("assignee_username", "me"), &fixture("mrs-assignee.json"));
+    h.none_reviewed();
 
     let inbox = gitlab.inbox().unwrap();
 
@@ -407,6 +446,7 @@ fn inbox_times_are_seconds_since_the_epoch() {
     h.user("me");
     h.merge_requests(("reviewer_username", "me"), &fixture("mrs-reviewer.json"));
     h.merge_requests(("assignee_username", "me"), "[]");
+    h.none_reviewed();
 
     let inbox = gitlab.inbox().unwrap();
 
@@ -414,6 +454,77 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_387_600, 1_794_471_330));
     // 2026-11-10T11:00:00Z.
     assert_eq!(inbox[1].created_at, 1_794_308_400);
+}
+
+/// The Inbox of a human asked to review `platform/infra!97` alone.
+fn inbox_of_one_review_request(h: &mut Harness) -> Vec<InboxItem> {
+    let gitlab = h.gitlab();
+    h.user("me");
+    let reviewer_mrs: Vec<Value> = serde_json::from_str(&fixture("mrs-reviewer.json")).unwrap();
+    h.merge_requests(("reviewer_username", "me"), &json!([reviewer_mrs[0]]).to_string());
+    h.merge_requests(("assignee_username", "me"), "[]");
+    gitlab.inbox().unwrap()
+}
+
+#[test]
+fn a_review_request_is_done_once_the_human_s_review_state_says_they_reviewed() {
+    // GitLab's own merge request homepage counts the first three as still to review.
+    let cases = [
+        ("unreviewed", false),
+        ("review_started", false),
+        ("unapproved", false),
+        ("reviewed", true),
+        ("requested_changes", true),
+        ("approved", true),
+    ];
+    for (state, done) in cases {
+        let mut h = Harness::new();
+        h.reviewers(("platform/infra", 97), state);
+        h.mr_approvals(("platform/infra", 97), false, &[], state == "approved");
+
+        let inbox = inbox_of_one_review_request(&mut h);
+
+        assert_eq!(inbox.len(), 1, "{state}");
+        assert_eq!(inbox[0].verdict_given, done, "review state {state}");
+    }
+}
+
+#[test]
+fn a_merge_request_is_approved_once_it_meets_its_approval_requirement() {
+    // (GitLab's `approved`, who approved) and whether it's approved.
+    let cases = [
+        (true, vec!["ann", "bob"], true),
+        // Not enough approvals for the project's rules.
+        (false, vec!["ann"], false),
+        // GitLab counts a merge request without approval rules as approved before anyone has.
+        (true, vec![], false),
+        (false, vec![], false),
+    ];
+    for (meets, by, approved) in cases {
+        let mut h = Harness::new();
+        h.reviewers(("platform/infra", 97), "unreviewed");
+        h.mr_approvals(("platform/infra", 97), meets, &by, false);
+
+        let inbox = inbox_of_one_review_request(&mut h);
+
+        assert_eq!(inbox[0].approved, approved, "approved {meets}, by {by:?}");
+        assert!(!inbox[0].verdict_given, "the human's review is still to do");
+    }
+}
+
+#[test]
+fn an_assignment_the_human_approved_is_done() {
+    let mut h = Harness::new();
+    let gitlab = h.gitlab();
+    h.user("me");
+    h.merge_requests(("reviewer_username", "me"), "[]");
+    let assigned: Vec<Value> = serde_json::from_str(&fixture("mrs-assignee.json")).unwrap();
+    h.merge_requests(("assignee_username", "me"), &json!([assigned[0]]).to_string());
+    h.mr_approvals(("acme/docs", 12), false, &["me"], true);
+
+    let inbox = gitlab.inbox().unwrap();
+
+    assert!(inbox[0].verdict_given, "{inbox:?}");
 }
 
 // --- Credentials: `glab`, then the environment, then the pasted token ---

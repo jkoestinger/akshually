@@ -187,12 +187,44 @@ struct Diff {
     diff: String,
 }
 
-/// The human's approval of a merge request.
+/// A merge request's approvals, and the human's.
 #[derive(Deserialize)]
 struct Approvals {
+    /// It meets its approval rules. Also true before anyone approved when it has none.
+    #[serde(default)]
+    approved: bool,
+    /// Counted only.
+    #[serde(default)]
+    approved_by: Vec<serde::de::IgnoredAny>,
     /// GitLab's approval rules let them approve it now (false once they have).
     user_can_approve: bool,
     user_has_approved: bool,
+}
+
+impl Approvals {
+    /// It meets its approval requirement, or has an approval when it has none.
+    fn met(&self) -> bool {
+        self.approved && !self.approved_by.is_empty()
+    }
+}
+
+/// A merge request reviewer, and where their review is.
+#[derive(Deserialize)]
+struct Reviewer {
+    user: User,
+    /// `unreviewed`, `review_started`, `unapproved`, `reviewed`, `requested_changes` or
+    /// `approved`.
+    #[serde(default)]
+    state: String,
+}
+
+impl Reviewer {
+    /// They gave a Verdict since their review was last requested: GitLab resets the state to
+    /// `unreviewed` when it is. Its own merge request homepage counts the other states as still
+    /// to review.
+    fn verdict_given(&self) -> bool {
+        matches!(self.state.as_str(), "reviewed" | "requested_changes" | "approved")
+    }
 }
 
 /// GitLab 19.2 took `reviewer_state` in bulk publish: before, the API can't request changes.
@@ -470,6 +502,18 @@ impl ForgeAdapter for GitLab {
                 items.push(item);
             }
         }
+        // `GET merge_requests` says neither, hence two more requests for each.
+        for item in &mut items {
+            let approvals = self.approvals(&item.id)?;
+            item.approved = approvals.met();
+            // The only Verdict GitLab records from someone it doesn't list as a reviewer.
+            item.verdict_given = approvals.user_has_approved;
+            if item.role == InboxRole::Reviewer {
+                let url = self.merge_request_url(&item.id, &["reviewers"]);
+                let reviewers: Vec<Reviewer> = self.get_json(&url).map_err(|e| not_found_as(e, &item.id))?;
+                item.verdict_given |= reviewers.iter().any(|r| r.user.username == me && r.verdict_given());
+            }
+        }
         Ok(items)
     }
 }
@@ -516,6 +560,8 @@ impl GitLab {
                     created_at: time(&mr.created_at)?,
                     updated_at: time(&mr.updated_at)?,
                     role,
+                    approved: false,
+                    verdict_given: false,
                 })
             })
             .collect()

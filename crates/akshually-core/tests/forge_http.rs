@@ -258,7 +258,10 @@ fn a_refused_token_is_fetched_again_from_the_cli(forge: &Forge) {
 fn a_refused_token_fails_the_inbox(forge: &Forge) {
     let mut h = Harness::new(forge);
     let adapter = h.logged_in("token");
-    h.server.mock("GET", Matcher::Any).with_status(401).with_body(r#"{"message":"401 Unauthorized"}"#).create();
+    // GitHub searches through GraphQL, GitLab through REST.
+    for method in ["GET", "POST"] {
+        h.server.mock(method, Matcher::Any).with_status(401).with_body(r#"{"message":"401 Unauthorized"}"#).create();
+    }
 
     let error = adapter.inbox().unwrap_err();
 

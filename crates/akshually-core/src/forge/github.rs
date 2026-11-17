@@ -379,7 +379,7 @@ impl ForgeAdapter for GitHub {
 
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
         // `review-requested` includes requests to the human's teams. A review removes the
-        // request, so a reviewed Pull Request leaves the Inbox unless assigned.
+        // request, so a reviewed Pull Request is listed again only when assigned.
         let mut items = self.search("review-requested:@me", InboxRole::Reviewer)?;
         for item in self.search("assignee:@me", InboxRole::Assignee)? {
             if !items.iter().any(|i| i.id == item.id) {
@@ -452,46 +452,73 @@ impl GitHub {
     fn search(&self, filter: &str, role: InboxRole) -> Result<Vec<InboxItem>, ForgeError> {
         #[derive(Deserialize)]
         struct Found {
-            items: Vec<Issue>,
+            search: Nodes<Node>,
         }
         #[derive(Deserialize)]
-        struct Issue {
-            repository_url: String,
-            html_url: String,
+        struct Nodes<T> {
+            nodes: Vec<T>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Node {
             number: u64,
             title: String,
-            user: Option<GqlActor>,
+            url: String,
             created_at: String,
             updated_at: String,
+            author: Option<GqlActor>,
+            repository: Repository,
+            /// Null when the project requires no review.
+            review_decision: Option<String>,
+            /// Each reviewer's latest Approve or Request changes.
+            latest_opinionated_reviews: Nodes<ReviewState>,
+            viewer_did_author: bool,
+            viewer_latest_review: Option<ReviewState>,
         }
-        let mut url = self.client.endpoint(&["search", "issues"]);
-        url.query_pairs_mut()
-            .append_pair("q", &format!("is:pr is:open archived:false {filter}"))
-            .append_pair("sort", "updated")
-            .append_pair("per_page", PAGE);
-        let found: Found = self.get_json(url.as_str())?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repository {
+            name_with_owner: String,
+        }
+        #[derive(Deserialize)]
+        struct ReviewState {
+            state: String,
+        }
+        let q = format!("is:pr is:open archived:false sort:updated-desc {filter}");
+        let found: Found = self.graphql(INBOX_QUERY, &json!({ "q": q }))?;
         found
-            .items
+            .search
+            .nodes
             .into_iter()
-            .map(|issue| {
-                // `…/repos/OWNER/REPO`
-                let mut path = issue.repository_url.rsplit('/');
-                let (repo, owner) = (path.next().unwrap_or_default(), path.next().unwrap_or_default());
+            .map(|pr| {
                 let time = |t: &str| epoch_seconds(t).ok_or_else(|| self.client.unexpected(format!("a time of {t:?}")));
+                let approved = match pr.review_decision.as_deref() {
+                    Some(decision) => decision == "APPROVED",
+                    None => pr.latest_opinionated_reviews.nodes.iter().any(|r| r.state == "APPROVED"),
+                };
+                // A review removes the human's review request, and a new request lists the Pull
+                // Request as a review request again: only an assignment can be one they reviewed
+                // since. Their reply to a Thread is a review too. Taken as since the last request
+                // even when that request was withdrawn unanswered: GitHub doesn't say when it was.
+                // Never their own: no one can request the author's review to bring it back.
+                let reviewed = !pr.viewer_did_author
+                    && pr.viewer_latest_review.is_some_and(|r| !matches!(r.state.as_str(), "PENDING" | "DISMISSED"));
                 Ok(InboxItem {
                     id: PullRequestRef {
                         host: self.client.host().to_owned(),
-                        repo: format!("{owner}/{repo}"),
-                        number: issue.number,
+                        repo: pr.repository.name_with_owner,
+                        number: pr.number,
                     },
                     kind: ForgeKind::GitHub,
-                    url: issue.html_url,
-                    title: issue.title,
+                    url: pr.url,
+                    title: pr.title,
                     // GitHub shows a deleted account as "ghost".
-                    author: issue.user.map_or_else(|| "ghost".to_owned(), |u| u.login),
-                    created_at: time(&issue.created_at)?,
-                    updated_at: time(&issue.updated_at)?,
+                    author: pr.author.map_or_else(|| "ghost".to_owned(), |u| u.login),
+                    created_at: time(&pr.created_at)?,
+                    updated_at: time(&pr.updated_at)?,
                     role,
+                    approved,
+                    verdict_given: role == InboxRole::Assignee && reviewed,
                 })
             })
             .collect()
@@ -588,6 +615,21 @@ impl GitHub {
             .ok_or_else(|| self.client.unexpected(format!("GraphQL answered no {pointer}")))
     }
 }
+
+/// The Pull Requests a search `$q` finds, with what the Inbox needs to leave out those already
+/// approved or reviewed. GraphQL rather than REST search: only it says the review decision.
+const INBOX_QUERY: &str = "query($q: String!) {
+  search(query: $q, type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        number title url createdAt updatedAt author { login } repository { nameWithOwner }
+        reviewDecision
+        latestOpinionatedReviews(first: 100) { nodes { state } }
+        viewerDidAuthor viewerLatestReview { state }
+      }
+    }
+  }
+}";
 
 const PULL_REQUEST_ID_QUERY: &str = "query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id headRefOid } }

@@ -61,6 +61,10 @@ pub trait ForgeAdapter: Send + Sync {
 
     /// The human's Inbox on this host: open Pull Requests where they are a requested reviewer
     /// or an assignee, each listed once (as reviewer when both). A host without one has none.
+    ///
+    /// Those already approved, or that the human gave a Verdict on since their review was last
+    /// requested, are listed too, marked `approved` or `verdict_given`: the service leaves them
+    /// out of the Inbox unless the human has a Session open on them.
     fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
         Ok(Vec::new())
     }
@@ -81,6 +85,13 @@ pub struct InboxItem {
     /// Seconds since the Unix epoch. Any activity changes it: pushes, comments, labels.
     pub updated_at: i64,
     pub role: InboxRole,
+    /// It meets its approval requirement, by the Forge's own measure; one approval when the
+    /// project has none.
+    #[serde(default)]
+    pub approved: bool,
+    /// The human gave a Verdict on it since their review was last requested.
+    #[serde(default)]
+    pub verdict_given: bool,
 }
 
 /// Why a Pull Request is in the Inbox.
