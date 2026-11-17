@@ -443,6 +443,16 @@ impl SessionView {
         self.view != ChangesetView::SinceLastRound
     }
 
+    /// How many open Threads are anchored to the file at `path`, on its lines or as a whole:
+    /// those not resolved, Outdated ones included.
+    pub fn open_threads_on(&self, path: &str) -> usize {
+        let on_file = |t: &&Thread| match &t.anchor {
+            Anchor::Lines { path: on, .. } | Anchor::File { path: on } => on == path,
+            Anchor::Review => false,
+        };
+        self.threads.iter().filter(|t| t.resolved.is_none()).filter(on_file).count()
+    }
+
     /// Where each current line Thread sits in the shown Changeset: under its last line. Outdated
     /// Threads, and Threads on lines not shown, have no place.
     pub fn placed_threads(&self) -> Vec<PlacedThread> {

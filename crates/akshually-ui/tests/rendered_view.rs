@@ -1,6 +1,8 @@
 //! UI: the Rendered view of a changed markdown file, in Rune's headless `Runtime` against real
 //! Sessions in the core service: which files offer it, what it shows in each Diff layout, its
-//! line tints, and how it closes and lives on across tabs and reloads.
+//! line tints, and how it closes and lives on across tabs and reloads. The render smoke check
+//! can't reach most of this: its scenes are fixed sample tabs over an empty service, so no
+//! real Changeset is diffed, reloaded or scrolled there.
 
 use std::sync::Arc;
 
@@ -89,10 +91,8 @@ fn a_changed_markdown_file_offers_the_rendered_view_and_other_files_dont() {
     repo.write("README.md", "# One\n").write("lib.rs", "fn one() {}\n").commit_all("base");
     repo.write("README.md", "# Two\n").write("lib.rs", "fn two() {}\n");
     repo.write_bytes("logo.md", b"\x89PNG\0\0\x01");
-    let service = Arc::new(Service::new());
-    let _pending = service.review(ReviewRequest::new(repo.path())).unwrap();
 
-    let rt = window(&service);
+    let (_service, _id, rt) = review(&repo);
 
     assert!(rt.find("rendered-README.md").is_some(), "the markdown file's header doesn't offer Rendered");
     assert!(rt.find("rendered-lib.rs").is_none(), "a Rust file's header offers Rendered");
@@ -100,17 +100,50 @@ fn a_changed_markdown_file_offers_the_rendered_view_and_other_files_dont() {
 }
 
 #[test]
+fn a_collapsed_markdown_file_offers_the_rendered_view_too() {
+    let repo = TestRepo::new();
+    repo.write("API.md", "<!-- @generated -->\n# One\n").commit_all("base");
+    repo.write("API.md", "<!-- @generated -->\n# Two\n");
+
+    let (_service, _id, rt) = review(&repo);
+
+    assert!(rt.find("rendered-API.md").is_some(), "the collapsed markdown file's header doesn't offer Rendered");
+}
+
+#[test]
 fn pressing_rendered_shows_the_file_as_rendered_markdown() {
     let repo = repo_with_a_changed_readme();
-    let service = Arc::new(Service::new());
-    let _pending = service.review(ReviewRequest::new(repo.path())).unwrap();
-    let mut rt = window(&service);
+    let (_service, _id, mut rt) = review(&repo);
 
     press(&mut rt, "rendered-README.md");
 
     let texts = texts_within(&rt, "rendered-view");
     assert!(texts.iter().any(|t| t == "Two"), "the heading isn't rendered: {texts:?}");
     assert!(!texts.iter().any(|t| t.contains("# Two")), "the file shows as raw lines: {texts:?}");
+}
+
+#[test]
+fn the_rendered_view_is_nearly_as_wide_as_the_window() {
+    let repo = repo_with_a_changed_readme();
+    let (_service, _id, mut rt) = review(&repo);
+
+    press(&mut rt, "rendered-README.md");
+
+    let view = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("rendered-view")).unwrap();
+    assert!(view.rect[2] >= 1200.0, "the Rendered view is {} points wide in a 1280-point window", view.rect[2]);
+}
+
+#[test]
+fn side_by_side_shows_the_old_version_beside_the_new() {
+    let repo = repo_with_a_changed_readme();
+    let (_service, _id, mut rt) = review(&repo);
+    pick_side_by_side(&mut rt);
+
+    press(&mut rt, "rendered-README.md");
+
+    let (old, new) = (texts_within(&rt, "rendered-old"), texts_within(&rt, "rendered-new"));
+    assert!(old.iter().any(|t| t == "One") && old.iter().any(|t| t == "Gone paragraph."), "old column: {old:?}");
+    assert!(new.iter().any(|t| t == "Two") && new.iter().any(|t| t == "New paragraph."), "new column: {new:?}");
 }
 
 #[test]
@@ -121,9 +154,6 @@ fn side_by_side_tints_the_removed_lines_on_the_old_side_and_the_added_lines_on_t
 
     press(&mut rt, "rendered-README.md");
 
-    let (old, new) = (texts_within(&rt, "rendered-old"), texts_within(&rt, "rendered-new"));
-    assert!(old.iter().any(|t| t == "One") && old.iter().any(|t| t == "Gone paragraph."), "old column: {old:?}");
-    assert!(new.iter().any(|t| t == "Two") && new.iter().any(|t| t == "New paragraph."), "new column: {new:?}");
     let (removed, added) = (tints(&rt, "removed"), tints(&rt, "added"));
     assert_eq!((removed.len(), added.len()), (2, 2), "the heading and last paragraph are tinted on each side");
     let (old_x, _) = rt.find("rendered-old").unwrap();
@@ -189,21 +219,18 @@ fn a_wholly_deleted_file_shows_its_old_version_alone_untinted() {
 }
 
 #[test]
-fn the_header_counts_the_open_threads_on_the_file_outdated_ones_included() {
+fn the_header_counts_the_open_threads_on_the_file() {
     let repo = repo_with_a_changed_readme();
     repo.write("lib.rs", "fn one() {}\n");
     let (service, id, mut rt) = review(&repo);
-    service.comment(&id, Anchor::lines(Side::New, "README.md", 5..=5), "Outdated soon.").unwrap();
+    service.comment(&id, Anchor::lines(Side::New, "README.md", 5..=5), "On a line.").unwrap();
     service.comment(&id, Anchor::file("README.md"), "On the whole file.").unwrap();
     service.comment(&id, Anchor::file("lib.rs"), "Another file.").unwrap();
     service.comment(&id, Anchor::Review, "The Review.").unwrap();
-    repo.write("README.md", "# Two\n\nKept paragraph.\n");
-    service.reload(&id).unwrap();
     deliver_window(&mut rt, &service);
 
     press(&mut rt, "rendered-README.md");
 
-    assert!(service.window().sessions[0].threads[0].outdated, "the line Thread didn't become Outdated");
     assert_eq!(texts_within(&rt, "rendered-threads"), ["2 open Threads"]);
 }
 
@@ -281,17 +308,36 @@ fn a_click_outside_closes_the_rendered_view_leaving_the_diff_as_it_was() {
     assert_eq!(diff_scroll(&rt), scrolled, "the diff moved");
 }
 
-#[test]
-fn the_rendered_view_stays_open_through_switching_tabs_and_back() {
-    let (repo, other) = (repo_with_a_changed_readme(), repo_with_a_changed_readme());
-    let (service, id, mut rt) = review(&repo);
-    let other = service.review(ReviewRequest::new(other.path())).unwrap().session().clone();
+/// Two Sessions with a changed `README.md`, the first shown with its Rendered view open; the
+/// second's id.
+fn rendered_view_open_beside_another_session(
+    repos: &(TestRepo, TestRepo),
+) -> (Arc<Service>, SessionId, SessionId, Runtime<State>) {
+    let (service, id, mut rt) = review(&repos.0);
+    let other = service.review(ReviewRequest::new(repos.1.path())).unwrap().session().clone();
     deliver_window(&mut rt, &service);
     press(&mut rt, "rendered-README.md");
+    (service, id, other, rt)
+}
+
+#[test]
+fn the_rendered_view_doesnt_show_over_another_sessions_tab() {
+    let repos = (repo_with_a_changed_readme(), repo_with_a_changed_readme());
+    let (service, _id, other, mut rt) = rendered_view_open_beside_another_session(&repos);
 
     service.display(&other).unwrap();
     deliver_window(&mut rt, &service);
+
     assert!(rt.find("rendered-view").is_none(), "the Rendered view shows over another Session");
+}
+
+#[test]
+fn the_rendered_view_stays_open_through_switching_tabs_and_back() {
+    let repos = (repo_with_a_changed_readme(), repo_with_a_changed_readme());
+    let (service, id, other, mut rt) = rendered_view_open_beside_another_session(&repos);
+
+    service.display(&other).unwrap();
+    deliver_window(&mut rt, &service);
     service.display(&id).unwrap();
     deliver_window(&mut rt, &service);
 

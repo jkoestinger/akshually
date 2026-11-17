@@ -1173,6 +1173,30 @@ fn second_round(svc: &Service) -> (TestRepo, akshually_core::PendingReview) {
 }
 
 #[test]
+fn a_files_open_threads_count_its_outdated_ones_but_not_resolved_ones_or_other_files() {
+    let repo = agent_branch();
+    repo.write("other.rs", "fn o() {}\n");
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "Why a?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(pending.wait_timeout(Duration::from_secs(1)));
+    svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b2?").unwrap();
+    svc.comment(&id, Anchor::file("lib.rs"), "On the whole file.").unwrap();
+    svc.comment(&id, Anchor::file("other.rs"), "Another file.").unwrap();
+    svc.comment(&id, Anchor::Review, "The Review.").unwrap();
+    repo.write("lib.rs", "fn a() {}\nfn b3() {}\nfn c2() {}\nfn d() {}\n");
+    svc.reload(&id).unwrap();
+    assert!(svc.session(&id).unwrap().threads[1].outdated, "T2 didn't become Outdated");
+
+    let open = svc.session(&id).unwrap().open_threads_on("lib.rs");
+
+    assert_eq!(open, 2, "T2, Outdated, and T3, on the whole file");
+}
+
+#[test]
 fn files_can_be_ticked_as_viewed_and_unticked() {
     let repo = agent_branch();
     let svc = Service::new();
