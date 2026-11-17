@@ -32,6 +32,18 @@ const INBOX_TAB: &str = "inbox";
 const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
+/// The tallest the Publish dialog's list of Drafts grows before it scrolls, in a window tall
+/// enough: a few cards show at once, and the dialog stays short of an 800-pixel-high window.
+const PUBLISH_LIST_MAX_HEIGHT: f32 = 320.0;
+/// The shortest the Publish dialog's list of Drafts shrinks to in a short window: about one card.
+const PUBLISH_LIST_MIN_HEIGHT: f32 = 120.0;
+/// The height of everything in the window around the Publish dialog's list of Drafts, which gets
+/// the rest: the dialog's header, Verdicts, Feedback note and buttons with a two-line summary
+/// (271, measured in `--scene publish-many`), the summary grown to its eight lines (105), a line
+/// of error (20), and a 16-pixel margin above and below the dialog (32).
+const PUBLISH_DIALOG_CHROME: f32 = 428.0;
+/// How opaque a discarded Draft's card is in the Publish dialog, muted next to what goes out.
+const DISCARDED_OPACITY: f32 = 0.6;
 
 mod mono_font;
 mod notifier;
@@ -58,6 +70,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("inbox", scene_inbox),
             ("publish", scene_publish),
             ("publish-gitlab", scene_publish_gitlab),
+            ("publish-many", scene_publish_many),
             ("co-review", scene_co_review),
             ("update", scene_update),
             ("update-installed", scene_update_installed),
@@ -790,8 +803,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(inbox_view(k, s, draft))
         }
     };
-    publish_dialog(k, s, &mut layer);
-    rune_kit::root(body.fill(k.c.bg_base), layer)
+    // The window's height, for the Publish dialog to keep inside it: the body fills the window.
+    publish_dialog(k, s, cx.layout_size("window").map(|[_, h]| h), &mut layer);
+    rune_kit::root(body.key("window").fill(k.c.bg_base), layer)
 }
 
 /// The update notice above whatever the Window shows: a newer release to install, then Restart
@@ -1044,8 +1058,9 @@ fn hand_over_button(k: &Kit, tab: &SessionTab, hand_over: HandOver) -> El {
         .build(k)
 }
 
-/// The Publish dialog: what will be sent and what won't, the Verdict and the summary.
-fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
+/// The Publish dialog: what will be sent and what won't, the Verdict and the summary. Its list of
+/// Drafts shrinks to keep it inside a `window_height` window; `None` before the first layout.
+fn publish_dialog(k: &Kit, s: &State, window_height: Option<f32>, layer: &mut Vec<El>) {
     let Some(publish) = &s.publish else { return };
     let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
     let Some(pr) = tab.session.pull_request() else { return };
@@ -1053,16 +1068,22 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
     if let Some(plan) = &publish.plan {
         let mut list = col().key("publish-drafts").w_full().gap(8.0);
         for (thread, kept) in plan.kept.iter().map(|t| (t, true)).chain(plan.discarded.iter().map(|t| (t, false))) {
-            list = list.child(publish_row(k, thread, kept));
+            list = list.child(publish_card(k, thread, kept));
         }
         let resolutions = plan.resolve.iter().map(|t| (t, "Resolve")).chain(plan.reopen.iter().map(|t| (t, "Reopen")));
         for (thread, what) in resolutions {
-            list = list.child(resolution_row(k, thread, what));
+            list = list.child(resolution_card(k, thread, what));
         }
         if [&plan.kept, &plan.discarded, &plan.resolve, &plan.reopen].iter().all(|l| l.is_empty()) {
             list =
                 list.child(text("No Drafts: only the Verdict and summary go out.").font(k.ty.ui).color(k.c.text_muted));
         }
+        // `Dialog::fit()` doesn't scroll on its own: the list scrolls so the rest stays in view.
+        let height = window_height.map_or(PUBLISH_LIST_MAX_HEIGHT, |h| {
+            (h - PUBLISH_DIALOG_CHROME).clamp(PUBLISH_LIST_MIN_HEIGHT, PUBLISH_LIST_MAX_HEIGHT)
+        });
+        let list =
+            col().key("publish-scroll").w_full().max_h(height).scroll(ScrollSpec { stick_bottom: false }).child(list);
         let verdicts = Verdict::ALL.iter().filter(|v| plan.verdicts.contains(v)).fold(row().gap(8.0), |row, &v| {
             row.child(
                 RadioItem::new(verdict_label(v), publish.verdict == Some(v))
@@ -1141,32 +1162,39 @@ fn publish_dialog(k: &Kit, s: &State, layer: &mut Vec<El>) {
         .build(k, layer);
 }
 
-/// One Thread's Drafts in the Publish dialog, ticked when they're sent.
-fn publish_row(k: &Kit, thread: &Thread, kept: bool) -> El {
+/// One Thread's Drafts in the Publish dialog, in full, ticked when they're sent.
+fn publish_card(k: &Kit, thread: &Thread, kept: bool) -> El {
     let on = thread.anchor.to_string();
-    let first = first_line(thread);
     let on = if thread.forge.is_some() { format!("Reply in {} on {on}", thread.id) } else { on };
-    let what = if kept { format!("{on} — {first}") } else { format!("{on} — {first} (not sent)") };
+    let label = if kept { on } else { format!("{on} (not sent)") };
     let suggestion = thread.comments.iter().any(|c| c.suggestion.is_some());
-    row()
-        .w_full()
-        .gap(8.0)
-        .items_center()
-        .child(Checkbox::new(kept).disabled(true).build(k))
-        .child(text(what).font(k.ty.ui).color(if kept { k.c.text_base } else { k.c.text_faint }).grow(1.0).min_w(0.0))
-        .children(suggestion.then(|| text("suggestion").font(k.ty.small).color(k.c.text_faint)))
+    let header = publish_card_header(k, kept, label)
+        .children(suggestion.then(|| text("suggestion").font(k.ty.small).color(k.c.text_faint)));
+    // `PublishPlan` holds a Thread's Drafts alone, so every Comment here is one.
+    let card = thread.comments.iter().fold(card(k).child(header), |card, draft| {
+        let card = card.child(Markdown::new(draft.body.clone()).selectable(true).build(k));
+        let Some(suggestion) = &draft.suggestion else { return card };
+        card.child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
+            .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k))
+    });
+    if kept { card } else { card.opacity(DISCARDED_OPACITY) }
 }
 
 /// A Thread Publish resolves or reopens on the Forge (`what`), in the Publish dialog.
-fn resolution_row(k: &Kit, thread: &Thread, what: &str) -> El {
-    let first = first_line(thread);
-    let line = format!("{what} {} on {} — {first}", thread.id, thread.anchor);
+fn resolution_card(k: &Kit, thread: &Thread, what: &str) -> El {
+    card(k)
+        .child(publish_card_header(k, true, format!("{what} {} on {}", thread.id, thread.anchor)))
+        .child(text(first_line(thread).to_owned()).font(k.ty.ui).color(k.c.text_muted).wrap())
+}
+
+/// A Publish dialog card's header: whether it goes out, read-only, then what it is.
+fn publish_card_header(k: &Kit, sent: bool, label: String) -> El {
     row()
         .w_full()
         .gap(8.0)
         .items_center()
-        .child(Checkbox::new(true).disabled(true).build(k))
-        .child(text(line).font(k.ty.ui).color(k.c.text_base).grow(1.0).min_w(0.0))
+        .child(Checkbox::new(sent).disabled(true).build(k))
+        .child(text(label).font(k.ty.ui_medium).color(k.c.text_base).wrap().grow(1.0).min_w(0.0))
 }
 
 /// The header's Changeset view dropdown: the views the Session offers, with the active one
@@ -2205,6 +2233,17 @@ fn scene_publish(s: &mut State) {
     let mut answered = sample_thread("T5", 4..=4, "Is the round number still needed?", None);
     answered.comments[0].author = Party::Other("lee".into());
     answered.forge = Some(akshually_core::ForgeThread { id: "PRRT_5".into(), resolved: false });
+    let mut reopened = sample_thread("T6", 6..=6, "This still swallows the error.", None);
+    reopened.forge = Some(akshually_core::ForgeThread { id: "PRRT_6".into(), resolved: true });
+    // Drafts kept from a co-Reviewer often open with a long paragraph (#74).
+    let long = sample_thread(
+        "T7",
+        7..=7,
+        "The snapshot is taken after the Round is built, so a Draft the agent adds while the Round is being built \
+         lands in neither the old Round nor the new one, and the human never sees it.\n\n\
+         Take the snapshot first, then build the Round from it.",
+        None,
+    );
     let session = SessionView {
         id: SessionId::new("pr"),
         source: Source::PullRequest(pr),
@@ -2217,10 +2256,10 @@ fn scene_publish(s: &mut State) {
     let plan = PublishPlan {
         verdicts: Verdict::ALL.to_vec(),
         own: false,
-        kept: vec![reply, suggested, sample_thread("T3", 5..=5, "Should this return the error as is?", None)],
+        kept: vec![reply, suggested, sample_thread("T3", 5..=5, "Should this return the error as is?", None), long],
         discarded: vec![outdated],
         resolve: vec![answered],
-        reopen: Vec::new(),
+        reopen: vec![reopened],
     };
     s.publish = Some(Publish {
         session: SessionId::new("pr"),
@@ -2241,6 +2280,15 @@ fn scene_publish_gitlab(s: &mut State) {
     // `kind()` tells GitLab by its merge request URL.
     pr.url = "https://gitlab.example.com/platform/infra/-/merge_requests/97".into();
     s.apply(scene_window(vec![session], None));
+}
+
+/// `--scene publish-many`: the Publish dialog of `--scene publish`, with more Drafts than fit.
+fn scene_publish_many(s: &mut State) {
+    scene_publish(s);
+    let Some(plan) = s.publish.as_mut().and_then(|p| p.plan.as_mut()) else { return };
+    for n in 10..30 {
+        plan.kept.push(sample_thread(&format!("T{n}"), n..=n, "Another Draft, so the list outgrows the window.", None));
+    }
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
