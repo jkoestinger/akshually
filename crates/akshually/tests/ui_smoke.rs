@@ -1,6 +1,7 @@
 //! UI: a headless render smoke check (Rune's `--snap`, and `--tree` for the text a scene shows),
-//! the Publish dialog, the update notice, and the Session header's Changeset view dropdown and
-//! diff layout control, read from the `--tree` accessibility tree after a `--script` of input.
+//! the Publish dialog, the update notice, the Rendered view, and the Session header's Changeset
+//! view dropdown and diff layout control, read from the `--tree` accessibility tree after a
+//! `--script` of input.
 //! Needs a Vulkan or Metal adapter, but no display; on a GPU-less Linux CI runner, install
 //! lavapipe (`mesa-vulkan-drivers`).
 
@@ -184,6 +185,26 @@ fn a_long_publish_list_scrolls_and_keeps_the_verdict_and_buttons_in_a_short_wind
     assert!(!verdicts.is_empty() && !below, "a Verdict is below the window");
     let lists = tree.with_role("scroll-view").into_iter().filter(|s| s["key"] == "publish-scroll").count();
     assert_eq!(lists, 1, "the Drafts aren't in a scroll area");
+}
+
+#[test]
+fn the_rendered_scene_shows_the_readme_rendered_side_by_side() {
+    let tree = scene_tree("rendered", &[]);
+
+    let dialog = tree.with_role("dialog");
+    assert_eq!(dialog.len(), 1, "the Rendered view isn't open");
+    assert_eq!(dialog[0]["name"], "README.md");
+    let text = tree.0.to_string();
+    assert!(text.contains("cargo install akshually"), "the old version doesn't show");
+    assert!(text.contains("No account needed"), "the new version doesn't show");
+    assert!(text.contains("1 open Thread"), "the header doesn't count the open Thread");
+}
+
+#[test]
+fn escape_closes_the_rendered_view_in_the_app() {
+    let tree = scene_tree("rendered", &[json!({ "t": 0.2, "type": "key", "name": "Escape" })]);
+
+    assert!(tree.with_role("dialog").is_empty(), "Escape left the Rendered view open");
 }
 
 #[test]

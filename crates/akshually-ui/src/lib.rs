@@ -47,10 +47,12 @@ const DISCARDED_OPACITY: f32 = 0.6;
 
 mod mono_font;
 mod notifier;
+mod rendered;
 mod theme;
 
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
+use rendered::{rendered_button, rendered_view};
 
 /// Whether `rune_args` ask Rune for a headless render (`--snap`, `--tree`, ...) rather than
 /// a window. Such a run must not bind the socket or touch the state dir.
@@ -72,6 +74,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("publish-gitlab", scene_publish_gitlab),
             ("publish-many", scene_publish_many),
             ("co-review", scene_co_review),
+            ("rendered", scene_rendered),
             ("update", scene_update),
             ("update-installed", scene_update_installed),
         ],
@@ -197,6 +200,9 @@ struct SessionTab {
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
+    /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
+    /// lost on restart.
+    rendered: Option<String>,
 }
 
 impl SessionTab {
@@ -205,7 +211,7 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, &session);
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false };
+        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None };
         tab.annotate(None);
         tab
     }
@@ -365,6 +371,10 @@ impl State {
                     // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
                     // resolved again (#69).
                     tab.expanded.retain(|id| session.threads.iter().any(|t| &t.id == id && collapses(t)));
+                    // The Rendered view re-renders its file from the new Changeset, or closes
+                    // once the file is gone from it.
+                    let shown = &session.shown().files;
+                    tab.rendered.take_if(|path| !shown.iter().any(|f| &f.path == path && f.binary.is_none()));
                     tab.session = session;
                     tab
                 }
@@ -824,6 +834,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(inbox_view(k, s, draft))
         }
     };
+    if let Some(tab) = s.displayed_tab() {
+        rendered_view(k, cx.system_dark(), s.diff_layout, tab, &mut layer);
+    }
     // The window's height, for the Publish dialog to keep inside it: the body fills the window.
     publish_dialog(k, s, cx.layout_size("window").map(|[_, h]| h), &mut layer);
     rune_kit::root(body.key("window").fill(k.c.bg_base), layer)
@@ -1549,6 +1562,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .gap(12.0)
             .items_center()
             .child(text(note).font(kc.ty.small).color(kc.c.text_muted))
+            .children(rendered_button(&kc, &tab.session.id, change))
             .child(
                 Button::new("Comment on file")
                     .variant(ButtonVariant::GhostMuted)
@@ -2037,7 +2051,8 @@ fn composer_title(s: &State) -> String {
 }
 
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    s.displayed_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
+    // The Rendered view covers the diff, whose keys must not move it underneath.
+    s.displayed_tab_mut().filter(|t| t.rendered.is_none()).is_some_and(|t| t.diff.key(ev, tx))
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
@@ -2162,6 +2177,33 @@ fn scene_threads(s: &mut State) {
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
     s.apply(scene_window(vec![session], Some("sample")));
+}
+
+/// `--scene rendered`: a Session whose changed `README.md` shows in its Rendered view, side by
+/// side, with lines both removed and added.
+fn scene_rendered(s: &mut State) {
+    let old = "# akshually\n\nReview an agent's work before it lands.\n\n## Install\n\n```sh\ncargo install akshually\n```\n\nSee the [guide](docs/guide.md).\n";
+    let new = "# akshually\n\nReview an agent's work, one Round at a time, before it lands.\n\n## Install\n\n```sh\ncurl -fsSL https://akshually.dev/install.sh | sh\n```\n\n- Linux and macOS\n- No account needed\n\nSee the [guide](docs/guide.md).\n\n![The Session window](docs/session.png)\n";
+    let session = SessionView {
+        id: SessionId::new("sample"),
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "docs/readme".into() },
+        agent: Some(Role::Author),
+        changeset: Changeset {
+            base: "3e61ed7c0ffee".into(),
+            files: vec![FileChange::text("README.md", Some(old), Some(new))],
+        },
+        round: 1,
+        turn: Turn::Human,
+        agent_waiting: true,
+        threads: vec![Thread {
+            anchor: Anchor::file("README.md"),
+            ..sample_thread("T1", 1..=1, "Mention Windows?", None)
+        }],
+        ..SessionView::default()
+    };
+    let window = WindowView { diff_layout: DiffLayout::SideBySide, ..scene_window(vec![session], Some("sample")) };
+    s.apply(window);
+    s.open_rendered(&SessionId::new("sample"), "README.md");
 }
 
 /// `--scene update`: the Inbox under the notice offering a newer release.
