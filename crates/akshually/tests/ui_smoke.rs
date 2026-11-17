@@ -1,7 +1,8 @@
 //! UI: a headless render smoke check (Rune's `--snap`, and `--tree` for the text a scene shows),
-//! the update notice, and the Session header's Changeset view dropdown and diff layout control, read from the
-//! `--tree` accessibility tree after a `--script` of input. Needs a Vulkan or Metal adapter, but no display; on a GPU-less
-//! Linux CI runner, install lavapipe (`mesa-vulkan-drivers`).
+//! the Publish dialog, the update notice, and the Session header's Changeset view dropdown and
+//! diff layout control, read from the `--tree` accessibility tree after a `--script` of input.
+//! Needs a Vulkan or Metal adapter, but no display; on a GPU-less Linux CI runner, install
+//! lavapipe (`mesa-vulkan-drivers`).
 
 use std::path::Path;
 use std::process::Command;
@@ -134,6 +135,58 @@ fn the_publish_dialog_names_a_github_pull_request_with_its_sigil() {
 }
 
 #[test]
+fn the_publish_dialog_shows_a_long_draft_in_full_inside_the_dialog() {
+    let tree = scene_tree("publish", &[]);
+
+    let text = tree.0.to_string();
+    assert!(text.contains(LONG_DRAFT_FIRST_PARAGRAPH), "the long Draft's first paragraph isn't shown in full");
+    assert!(text.contains(LONG_DRAFT_SECOND_PARAGRAPH), "only the long Draft's first line is shown");
+    let dialog = &tree.with_role("dialog")[0];
+    let inside = Tree((*dialog).clone());
+    let wider: Vec<&Value> =
+        inside.with_role("label").into_iter().filter(|l| edges(l).right > edges(dialog).right).collect();
+    assert!(wider.is_empty(), "text runs past the dialog's right edge: {wider:#?}");
+}
+
+#[test]
+fn each_publish_card_shows_whether_it_goes_out() {
+    let tree = scene_tree("publish", &[]);
+
+    let boxes = tree.with_role("check-box");
+    let states: Vec<bool> = boxes.iter().map(|b| has_state(b, "checked")).collect();
+    assert_eq!(
+        states,
+        [true, true, true, true, false, true, true],
+        "kept, resolve and reopen are ticked, discarded isn't"
+    );
+    assert!(boxes.iter().all(|b| has_state(b, "disabled")), "an indicator can be toggled");
+    assert!(tree.0.to_string().contains("(not sent)"), "the discarded Draft doesn't say it's not sent");
+}
+
+#[test]
+fn a_publish_card_shows_its_drafts_suggestion() {
+    let tree = scene_tree("publish", &[]);
+
+    let text = tree.0.to_string();
+    assert!(text.contains("\"suggestion\""), "the suggestion tag is gone");
+    assert!(text.contains("let before = self.changeset.snapshot()?;"), "the suggested code isn't shown");
+}
+
+#[test]
+fn a_long_publish_list_scrolls_and_keeps_the_verdict_and_buttons_in_a_short_window() {
+    let tree = scene_tree_at("publish-many", SHORT_WINDOW, &[]);
+
+    let publish = tree.with_role("button").into_iter().find(|b| b["name"].as_str().unwrap().starts_with("Publish"));
+    let publish = publish.expect("no Publish button");
+    assert!(edges(publish).bottom <= SHORT_WINDOW.1, "the Publish button is below the window: {publish:#?}");
+    let verdicts = tree.with_role("radio-button");
+    let below = verdicts.iter().any(|v| edges(v).bottom > SHORT_WINDOW.1);
+    assert!(!verdicts.is_empty() && !below, "a Verdict is below the window");
+    let lists = tree.with_role("scroll-view").into_iter().filter(|s| s["key"] == "publish-scroll").count();
+    assert_eq!(lists, 1, "the Drafts aren't in a scroll area");
+}
+
+#[test]
 fn the_update_notice_names_the_newer_release_and_offers_update() {
     let tree = scene_tree("update", &[]);
 
@@ -207,15 +260,30 @@ fn session_tree(script: &[Value]) -> Tree {
 
 /// The accessibility tree of `scene` once `script`, a list of Rune `--script` events, has played.
 fn scene_tree(scene: &str, script: &[Value]) -> Tree {
+    scene_tree_at(scene, (1280.0, 800.0), script)
+}
+
+/// [`scene_tree`] in a window of `(width, height)` logical pixels.
+fn scene_tree_at(scene: &str, (width, height): (f64, f64), script: &[Value]) -> Tree {
     let dirs = TestDirs::new();
     let script_path = dirs.path().join("script.json");
     std::fs::write(&script_path, json!(script).to_string()).unwrap();
 
-    let args = ["--scene", scene, "--size", "1280x800", "--script", script_path.to_str().unwrap(), "--at", "2"];
+    let size = format!("{width}x{height}");
+    let args = ["--scene", scene, "--size", &size, "--script", script_path.to_str().unwrap(), "--at", "2"];
     let tree = render("tree.json", "--tree", &args, |path| std::fs::read_to_string(path).unwrap());
 
     Tree(serde_json::from_str::<Value>(&tree).unwrap()["accessibility"].clone())
 }
+
+/// A window shorter than the default 800 pixels, in logical pixels: the Publish dialog's list must
+/// shrink to keep the dialog inside it.
+const SHORT_WINDOW: (f64, f64) = (1280.0, 500.0);
+
+/// The long Draft of the `publish` scene, one paragraph at a time.
+const LONG_DRAFT_FIRST_PARAGRAPH: &str = "The snapshot is taken after the Round is built, so a Draft the agent adds while \
+    the Round is being built lands in neither the old Round nor the new one, and the human never sees it.";
+const LONG_DRAFT_SECOND_PARAGRAPH: &str = "Take the snapshot first, then build the Round from it.";
 
 /// A press on the Changeset view dropdown.
 fn open_views() -> Value {
@@ -225,6 +293,17 @@ fn open_views() -> Value {
 /// A press on the diff layout control's side-by-side segment.
 fn pick_side_by_side() -> Value {
     json!({ "t": 0.2, "type": "click", "key": "segment1" })
+}
+
+/// The right and bottom edges of `node`'s bounds, in logical pixels.
+fn edges(node: &Value) -> Edges {
+    let at = |i: usize| node["bounds"][i].as_f64().unwrap();
+    Edges { right: at(0) + at(2), bottom: at(1) + at(3) }
+}
+
+struct Edges {
+    right: f64,
+    bottom: f64,
 }
 
 fn has_state(node: &Value, state: &str) -> bool {
