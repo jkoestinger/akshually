@@ -210,6 +210,13 @@ impl SessionTab {
         tab
     }
 
+    /// Folds the diff of the file at `path` in the shown Changeset, or unfolds it.
+    fn fold(&mut self, path: &str, folded: bool) {
+        if let Some(at) = self.session.shown().files.iter().position(|f| f.path == path) {
+            self.diff.set_collapsed(at, folded);
+        }
+    }
+
     /// Puts each current Thread, and the composer when it's on this Session, under its last
     /// line. Outdated Threads have no line; they show above the diff.
     fn annotate(&mut self, composer: Option<&Composer>) {
@@ -693,13 +700,12 @@ impl State {
     /// Ticks `path` as viewed, or unticks it, and folds its diff to match, as GitHub does (#78).
     /// The fold is the UI's own: the human can still expand a viewed file by hand.
     fn mark_viewed(&mut self, id: &SessionId, path: &str, viewed: bool) {
-        if let Err(error) = self.service.mark_viewed(id, path, viewed) {
-            eprintln!("akshually: {error}");
-            return;
+        let marked = self.service.mark_viewed(id, path, viewed);
+        if marked.is_err() {
+            return report(marked);
         }
-        let Some(tab) = self.tab_mut(id) else { return };
-        if let Some(at) = tab.session.shown().files.iter().position(|f| f.path == path) {
-            tab.diff.set_collapsed(at, viewed);
+        if let Some(tab) = self.tab_mut(id) {
+            tab.fold(path, viewed);
         }
     }
 

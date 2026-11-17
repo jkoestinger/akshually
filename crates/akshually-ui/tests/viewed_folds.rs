@@ -28,6 +28,9 @@ fn repo_with_three_edits() -> TestRepo {
     repo
 }
 
+/// Lines enough for the core to call a file Large (it allows 2,000 changed lines).
+const LARGE: usize = 2_001;
+
 /// A headless window over `service`, its first frame built.
 fn window(service: &Arc<Service>) -> Runtime<State> {
     let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
@@ -84,7 +87,7 @@ fn unticking_viewed_on_a_folded_file_unfolds_its_diff() {
 }
 
 #[test]
-fn a_session_opened_with_a_file_ticked_as_viewed_shows_it_folded_and_the_others_expanded() {
+fn a_session_opened_with_a_file_ticked_as_viewed_folds_only_that_file() {
     let repo = repo_with_three_edits();
     let service = Arc::new(Service::new());
     let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
@@ -94,7 +97,31 @@ fn a_session_opened_with_a_file_ticked_as_viewed_shows_it_folded_and_the_others_
 
     assert!(!shows_diff(&rt, 0), "the viewed file opened expanded");
     assert!(shows_diff(&rt, 1), "the file not viewed opened folded");
+}
+
+#[test]
+fn a_generated_file_not_viewed_still_opens_folded() {
+    let repo = repo_with_three_edits();
+    let service = Arc::new(Service::new());
+    let _pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+
+    let rt = window(&service);
+
     assert!(!shows_diff(&rt, 2), "the Generated file opened expanded");
+}
+
+#[test]
+fn a_large_file_ticked_as_viewed_opens_folded() {
+    let repo = TestRepo::new();
+    repo.write("big.txt", "").commit_all("base");
+    repo.write("big.txt", &"line\n".repeat(LARGE));
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    service.mark_viewed(pending.session(), "big.txt", true).unwrap();
+
+    let rt = window(&service);
+
+    assert!(!shows_diff(&rt, 0), "the viewed Large file opened expanded");
 }
 
 #[test]
@@ -126,6 +153,7 @@ fn a_viewed_file_expanded_by_hand_stays_viewed_and_expanded_through_an_update() 
     let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
     service.mark_viewed(pending.session(), "a.txt", true).unwrap();
     let mut rt = window(&service);
+    // Rune's diff view keys each file header's fold button `toggle`; there is one file here.
     press(&mut rt, "toggle");
     assert!(shows_diff(&rt, 0), "the file header's toggle didn't expand the viewed file");
 
