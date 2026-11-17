@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
-use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineRange, LineRef};
+use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, el, row, text};
+use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineKind, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
-    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Kit, Markdown, RadioItem, SegmentedControl, Select,
-    SelectAppearance, TextArea, TextInput,
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Dialog, Highlight, IconButton, IconButtonVariant, Kit,
+    Markdown, RadioItem, SegmentedControl, Select, SelectAppearance, TextArea, TextInput,
 };
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
@@ -42,6 +42,9 @@ const PUBLISH_LIST_MIN_HEIGHT: f32 = 120.0;
 /// (271, measured in `--scene publish-many`), the summary grown to its eight lines (105), a line
 /// of error (20), and a 16-pixel margin above and below the dialog (32).
 const PUBLISH_DIALOG_CHROME: f32 = 428.0;
+/// The margin around the Rendered view, between it and the window's edges, in points: it is
+/// nearly as large as the window, with the diff still showing round it.
+const RENDERED_MARGIN: f32 = 24.0;
 /// How opaque a discarded Draft's card is in the Publish dialog, muted next to what goes out.
 const DISCARDED_OPACITY: f32 = 0.6;
 
@@ -72,6 +75,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("publish-gitlab", scene_publish_gitlab),
             ("publish-many", scene_publish_many),
             ("co-review", scene_co_review),
+            ("rendered", scene_rendered),
             ("update", scene_update),
             ("update-installed", scene_update_installed),
         ],
@@ -197,6 +201,9 @@ struct SessionTab {
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
+    /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
+    /// lost on restart.
+    rendered: Option<String>,
 }
 
 impl SessionTab {
@@ -205,7 +212,7 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, session.shown());
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false };
+        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None };
         tab.annotate(None);
         tab
     }
@@ -356,6 +363,10 @@ impl State {
                     // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
                     // resolved again (#69).
                     tab.expanded.retain(|id| session.threads.iter().any(|t| &t.id == id && collapses(t)));
+                    // The Rendered view re-renders its file from the new Changeset, or closes
+                    // once the file is gone from it.
+                    let shown = &session.shown().files;
+                    tab.rendered.take_if(|path| !shown.iter().any(|f| &f.path == path && f.binary.is_none()));
                     tab.session = session;
                     tab
                 }
@@ -553,6 +564,20 @@ impl State {
     fn choose_view(&mut self, id: &SessionId, open: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
             tab.choosing_view = open;
+        }
+    }
+
+    /// Opens the Rendered view of `path` over the diff of `id`'s tab.
+    fn open_rendered(&mut self, id: &SessionId, path: &str) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.rendered = Some(path.to_owned());
+        }
+    }
+
+    /// Closes the Rendered view of `id`'s tab, leaving its diff as it was.
+    fn close_rendered(&mut self, id: &SessionId) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.rendered = None;
         }
     }
 
@@ -803,6 +828,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(inbox_view(k, s, draft))
         }
     };
+    if let Some(tab) = s.displayed_tab() {
+        rendered_view(k, cx.system_dark(), s.diff_layout, tab, &mut layer);
+    }
     // The window's height, for the Publish dialog to keep inside it: the body fills the window.
     publish_dialog(k, s, cx.layout_size("window").map(|[_, h]| h), &mut layer);
     rune_kit::root(body.key("window").fill(k.c.bg_base), layer)
@@ -1528,6 +1556,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .gap(12.0)
             .items_center()
             .child(text(note).font(kc.ty.small).color(kc.c.text_muted))
+            .children(rendered_button(&kc, &tab.session.id, change))
             .child(
                 Button::new("Comment on file")
                     .variant(ButtonVariant::GhostMuted)
@@ -1558,6 +1587,143 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         }
     })
     .build(s, k)
+}
+
+/// The **Rendered** button in the header of a changed markdown text file, which opens its
+/// Rendered view; `None` for any other file.
+fn rendered_button(k: &Kit, id: &SessionId, change: &FileChange) -> Option<El> {
+    if change.binary.is_some() || !is_markdown(&change.path) {
+        return None;
+    }
+    let (id, path) = (id.clone(), change.path.clone());
+    let key = format!("rendered-{path}");
+    Some(
+        Button::new("Rendered")
+            .variant(ButtonVariant::GhostMuted)
+            .on_press(move |s: &mut State| s.open_rendered(&id, &path))
+            .build(k)
+            .key(key),
+    )
+}
+
+/// Whether `path` names a markdown file: it ends in `.md` or `.markdown`, in any case.
+fn is_markdown(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".markdown")
+}
+
+/// The Rendered view of `tab`'s open markdown file, over the diff: rendered side by side or
+/// stacked as `layout` lays out the diff, with its changed lines tinted. Its own layer rather
+/// than a `Dialog`, whose body is a fixed height or doesn't scroll. Nothing when it's closed or
+/// its file isn't in the Changeset shown.
+fn rendered_view(k: &Kit, dark: bool, layout: DiffLayout, tab: &SessionTab, layer: &mut Vec<El>) {
+    let Some(path) = &tab.rendered else { return };
+    let Some(change) = tab.session.shown().files.iter().find(|f| &f.path == path) else { return };
+    let tokens = theme::tokens(dark);
+    let (added, removed) = (tokens.color("diff-add-bg"), tokens.color("diff-del-bg"));
+    let diff = tab.diff.file_index(path).and_then(|at| tab.diff.files().get(at));
+    let changed = |kind: LineKind, side: diff::Side| -> Vec<u32> {
+        let lines = diff.into_iter().flat_map(|d| &d.hunks).flat_map(|h| &h.lines);
+        lines.filter(|l| l.kind == kind).filter_map(|l| l.number(side)).collect()
+    };
+    let column = |key: &str, text: &str, tint: Option<(&str, Color, Vec<u32>)>| {
+        let mut markdown = Markdown::new(text).selectable(true);
+        if let Some((name, colour, lines)) = tint {
+            let ranges = line_ranges(text, &lines).into_iter().enumerate();
+            markdown = markdown.highlights(
+                ranges.map(|(i, range)| (range, Highlight::new().bg(colour).key(format!("rendered-{name}-{i}")))),
+            );
+        }
+        col().key(key).grow(1.0).min_w(0.0).child(markdown.build(k))
+    };
+    let mut removed_note = None;
+    let columns = match (change.old.as_deref(), change.new.as_deref()) {
+        (None, Some(new)) => vec![column("rendered-new", new, None)],
+        (Some(old), None) => vec![column("rendered-old", old, None)],
+        (Some(old), Some(new)) => {
+            let new = column("rendered-new", new, Some(("added", added, changed(LineKind::Added, diff::Side::New))));
+            match layout {
+                DiffLayout::SideBySide => {
+                    let tint = ("removed", removed, changed(LineKind::Removed, diff::Side::Old));
+                    vec![column("rendered-old", old, Some(tint)), new]
+                }
+                DiffLayout::Stacked => {
+                    removed_note = match changed(LineKind::Removed, diff::Side::Old).len() {
+                        0 => None,
+                        1 => Some("1 line removed, see the diff".to_owned()),
+                        n => Some(format!("{n} lines removed, see the diff")),
+                    };
+                    vec![new]
+                }
+            }
+        }
+        (None, None) => return,
+    };
+    let open = tab.session.threads.iter().filter(|t| t.resolved.is_none() && anchored_to(t, path)).count();
+    let open = match open {
+        0 => None,
+        1 => Some("1 open Thread".to_owned()),
+        n => Some(format!("{n} open Threads")),
+    };
+    let (close_id, dismiss_id) = (tab.session.id.clone(), tab.session.id.clone());
+    let close = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::Ghost)
+        .label("Close")
+        .build(k)
+        .key("rendered-close")
+        .on_press(move |s: &mut State| s.close_rendered(&close_id));
+    let header = row()
+        .key("rendered-header")
+        .w_full()
+        .padding(16.0)
+        .gap(12.0)
+        .items_center()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(text(path.clone()).font(k.ty.mono).color(k.c.text_base))
+        .children(open.map(|n| text(n).font(k.ty.small).color(k.c.text_muted).key("rendered-threads")))
+        .children(removed_note.map(|n| text(n).font(k.ty.small).color(k.c.text_muted).key("rendered-removed-note")))
+        .child(row().grow(1.0))
+        .child(close);
+    let body = col()
+        .key("rendered-scroll")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(row().w_full().padding(16.0).gap(24.0).items_start().children(columns));
+    let panel = col()
+        .key("rendered-view")
+        .role("dialog")
+        .label(path.clone())
+        .w_full()
+        .h_full()
+        .radius(6.0)
+        .fill(k.c.layer_01)
+        .child(header)
+        .child(body)
+        .modal(true, move |s: &mut State| s.close_rendered(&dismiss_id));
+    layer.push(el().key("rendered-scrim").absolute(0.0, 0.0).w_full().h_full().fill(k.c.scrim).a11y_hidden());
+    layer.push(el().key("rendered-layer").absolute(0.0, 0.0).w_full().h_full().padding(RENDERED_MARGIN).child(panel));
+}
+
+/// Whether `thread` is anchored to the file at `path`, on its lines or as a whole.
+fn anchored_to(thread: &Thread, path: &str) -> bool {
+    match &thread.anchor {
+        Anchor::Lines { path: on, .. } | Anchor::File { path: on } => on == path,
+        Anchor::Review => false,
+    }
+}
+
+/// The byte ranges in `text` of its 1-based `lines`, each whole line without its line break.
+/// Lines past the end are left out.
+fn line_ranges(text: &str, lines: &[u32]) -> Vec<std::ops::Range<usize>> {
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        starts.push(at..at + line.trim_end_matches(['\n', '\r']).len());
+        at += line.len();
+    }
+    lines.iter().filter_map(|&n| starts.get((n as usize).checked_sub(1)?).cloned()).collect()
 }
 
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
@@ -2015,7 +2181,8 @@ fn composer_title(s: &State) -> String {
 }
 
 fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    s.displayed_tab_mut().is_some_and(|t| t.diff.key(ev, tx))
+    // The Rendered view covers the diff, whose keys must not move it underneath.
+    s.displayed_tab_mut().filter(|t| t.rendered.is_none()).is_some_and(|t| t.diff.key(ev, tx))
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
@@ -2140,6 +2307,33 @@ fn scene_threads(s: &mut State) {
     session.threads[3].comments.push(agent("Renamed."));
     session.threads[3].resolved = Some(Party::Agent);
     s.apply(scene_window(vec![session], Some("sample")));
+}
+
+/// `--scene rendered`: a Session whose changed `README.md` shows in its Rendered view, side by
+/// side, with lines both removed and added.
+fn scene_rendered(s: &mut State) {
+    let old = "# akshually\n\nReview an agent's work before it lands.\n\n## Install\n\n```sh\ncargo install akshually\n```\n\nSee the [guide](docs/guide.md).\n";
+    let new = "# akshually\n\nReview an agent's work, one Round at a time, before it lands.\n\n## Install\n\n```sh\ncurl -fsSL https://akshually.dev/install.sh | sh\n```\n\n- Linux and macOS\n- No account needed\n\nSee the [guide](docs/guide.md).\n\n![The Session window](docs/session.png)\n";
+    let session = SessionView {
+        id: SessionId::new("sample"),
+        source: Source::Local { repo: "/home/me/akshually".into(), branch: "docs/readme".into() },
+        agent: Some(Role::Author),
+        changeset: Changeset {
+            base: "3e61ed7c0ffee".into(),
+            files: vec![FileChange::text("README.md", Some(old), Some(new))],
+        },
+        round: 1,
+        turn: Turn::Human,
+        agent_waiting: true,
+        threads: vec![Thread {
+            anchor: Anchor::file("README.md"),
+            ..sample_thread("T1", 1..=1, "Mention Windows?", None)
+        }],
+        ..SessionView::default()
+    };
+    let window = WindowView { diff_layout: DiffLayout::SideBySide, ..scene_window(vec![session], Some("sample")) };
+    s.apply(window);
+    s.open_rendered(&SessionId::new("sample"), "README.md");
 }
 
 /// `--scene update`: the Inbox under the notice offering a newer release.
