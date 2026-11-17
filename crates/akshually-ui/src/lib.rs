@@ -2181,6 +2181,8 @@ fn scene_inbox(s: &mut State) {
         created_at: now - opened_h * 3600,
         updated_at: now - 600,
         role,
+        approved: false,
+        verdict_given: false,
     };
     let rows = vec![
         (item("acme/web", 482, "Add SSO login", "maria", 2, InboxRole::Reviewer), InboxRowState::New),

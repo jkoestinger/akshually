@@ -483,22 +483,55 @@ fn with_no_token_anywhere_nothing_is_sent() {
 // --- The Inbox ---
 
 impl Harness {
-    /// `GET search/issues` for the open Pull Requests matching `filter`, answering `body`.
+    /// The GraphQL search for the open Pull Requests matching `filter`, answering `body`.
     fn search(&mut self, filter: &str, body: &str) -> Mock {
+        let q = format!("is:pr is:open archived:false sort:updated-desc {filter}");
         self.server
-            .mock("GET", "/search/issues")
-            .match_query(Matcher::AllOf(vec![
-                Matcher::UrlEncoded("q".into(), format!("is:pr is:open archived:false {filter}")),
-                Matcher::UrlEncoded("per_page".into(), "100".into()),
-            ]))
+            .mock("POST", "/graphql")
             .match_header("authorization", format!("Bearer {TOKEN}").as_str())
-            .match_header("accept", "application/vnd.github+json")
-            .match_header("x-github-api-version", "2022-11-28")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "variables": { "q": q } })))
             .with_header("content-type", "application/json")
             .with_body(body)
             .create()
     }
+
+    /// The Inbox of a human asked to review `acme/web#482` alone, which is `as_found` (fields of
+    /// the GraphQL search's Pull Request node).
+    fn inbox_of_one_review_request(&mut self, as_found: serde_json::Value) -> Vec<InboxItem> {
+        self.only_found("review-requested:@me", as_found);
+        self.search("assignee:@me", NONE_FOUND);
+        self.github().inbox().unwrap()
+    }
+
+    /// The Inbox of a human assigned `acme/web#482` alone, which is `as_found`.
+    fn inbox_of_one_assignment(&mut self, as_found: serde_json::Value) -> Vec<InboxItem> {
+        self.search("review-requested:@me", NONE_FOUND);
+        self.only_found("assignee:@me", as_found);
+        self.github().inbox().unwrap()
+    }
+
+    /// The search for `filter` finds `acme/web#482` alone, with `as_found`'s fields.
+    fn only_found(&mut self, filter: &str, as_found: serde_json::Value) -> Mock {
+        let mut node = serde_json::json!({
+            "number": 482,
+            "title": "Add SSO login",
+            "url": "https://github.com/acme/web/pull/482",
+            "createdAt": "2026-11-12T08:00:00Z",
+            "updatedAt": "2026-11-12T09:30:00Z",
+            "author": { "login": "maria" },
+            "repository": { "nameWithOwner": "acme/web" },
+            "reviewDecision": "REVIEW_REQUIRED",
+            "latestOpinionatedReviews": { "nodes": [] },
+            "viewerLatestReview": null,
+        });
+        for (field, value) in as_found.as_object().expect("fields of a node") {
+            node[field] = value.clone();
+        }
+        self.search(filter, &serde_json::json!({ "data": { "search": { "nodes": [node] } } }).to_string())
+    }
 }
+
+const NONE_FOUND: &str = r#"{"data":{"search":{"nodes":[]}}}"#;
 
 fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRole) -> InboxItem {
     InboxItem {
@@ -510,6 +543,8 @@ fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRol
         created_at: 0,
         updated_at: 0,
         role,
+        approved: false,
+        verdict_given: false,
     }
 }
 
@@ -540,7 +575,7 @@ fn inbox_times_are_seconds_since_the_epoch() {
     let mut h = Harness::new();
     let github = h.github();
     h.search("review-requested:@me", &fixture("search-review-requested.json"));
-    h.search("assignee:@me", r#"{"total_count":0,"incomplete_results":false,"items":[]}"#);
+    h.search("assignee:@me", NONE_FOUND);
 
     let inbox = github.inbox().unwrap();
 
@@ -548,6 +583,66 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_470_400, 1_794_475_800));
     // 2026-11-11T16:45:10Z.
     assert_eq!(inbox[1].updated_at, 1_794_415_510);
+}
+
+#[test]
+fn a_pull_request_is_approved_by_its_review_decision_or_one_approval_without_a_requirement() {
+    use serde_json::json;
+    // (GitHub's review decision, the latest Approve or Request changes of each reviewer) and
+    // whether it's approved. The decision is null when the project requires no review.
+    let cases = [
+        (json!("APPROVED"), vec!["APPROVED", "APPROVED"], true),
+        // Not enough approvals for the project's rules.
+        (json!("REVIEW_REQUIRED"), vec!["APPROVED"], false),
+        (json!("CHANGES_REQUESTED"), vec!["APPROVED", "CHANGES_REQUESTED"], false),
+        (json!(null), vec!["CHANGES_REQUESTED", "APPROVED"], true),
+        (json!(null), vec!["CHANGES_REQUESTED"], false),
+        (json!(null), vec![], false),
+    ];
+    for (decision, latest, approved) in cases {
+        let mut h = Harness::new();
+        let reviews: Vec<_> = latest.iter().map(|state| json!({ "state": state })).collect();
+
+        let inbox = h.inbox_of_one_review_request(json!({
+            "reviewDecision": decision,
+            "latestOpinionatedReviews": { "nodes": reviews },
+        }));
+
+        assert_eq!(inbox[0].approved, approved, "review decision {decision}, latest reviews {latest:?}");
+    }
+}
+
+#[test]
+fn an_assignment_the_human_reviewed_is_done() {
+    use serde_json::json;
+    // The human's latest review, and whether it gave a Verdict.
+    let cases = [
+        (json!(null), false),
+        (json!({ "state": "APPROVED" }), true),
+        (json!({ "state": "CHANGES_REQUESTED" }), true),
+        (json!({ "state": "COMMENTED" }), true),
+        // Not submitted yet.
+        (json!({ "state": "PENDING" }), false),
+        // A Verdict taken back no longer counts.
+        (json!({ "state": "DISMISSED" }), false),
+    ];
+    for (review, done) in cases {
+        let mut h = Harness::new();
+
+        let inbox = h.inbox_of_one_assignment(json!({ "viewerLatestReview": review }));
+
+        assert_eq!(inbox[0].role, InboxRole::Assignee);
+        assert_eq!(inbox[0].verdict_given, done, "latest review {review}");
+    }
+}
+
+#[test]
+fn a_review_requested_again_is_to_do_whatever_the_human_s_earlier_review() {
+    let mut h = Harness::new();
+
+    let inbox = h.inbox_of_one_review_request(serde_json::json!({ "viewerLatestReview": { "state": "APPROVED" } }));
+
+    assert!(!inbox[0].verdict_given, "GitHub removes a review request once the human reviews");
 }
 
 // --- New pushes ---

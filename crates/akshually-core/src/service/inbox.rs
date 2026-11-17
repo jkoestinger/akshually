@@ -1,5 +1,7 @@
 //! The Inbox: the open Pull Requests, across every Forge host, where the human is a requested
-//! reviewer or an assignee. Refreshed on a timer and on demand; a new review request marks it.
+//! reviewer or an assignee, leaving out those already approved and those the human gave a Verdict
+//! on since their review was last requested, unless they have a Session open on them. Refreshed
+//! on a timer and on demand, deciding afresh each time; a new review request marks it.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -153,6 +155,11 @@ impl Service {
             let first = !listed.contains(&i.id);
             listed.push(i.id.clone());
             first
+        });
+        // Done with, unless the human is still reviewing it: their Session keeps it listed.
+        items.retain(|i| {
+            !(i.approved || i.verdict_given)
+                || inner.sessions.iter().any(|s| s.view.pull_request().is_some_and(|p| p.id == i.id))
         });
         items.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
 

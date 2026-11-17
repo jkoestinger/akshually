@@ -45,6 +45,8 @@ impl FakeForge {
             created_at: 1_000,
             updated_at,
             role,
+            approved: false,
+            verdict_given: false,
         }
     }
 }
@@ -381,4 +383,81 @@ fn window_subscribers_hear_when_a_session_changes_an_inbox_rows_state() {
 
     let last = heard.lock().unwrap().last().cloned();
     assert_eq!(last, Some(InboxRowState::SessionOpen { session: id, drafts: 1 }));
+}
+
+// --- Approved, and Verdicts given ---
+
+#[test]
+fn an_approved_pull_request_leaves_the_inbox_even_while_its_review_is_requested() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![
+        InboxItem { approved: true, ..github.item(1, InboxRole::Reviewer, 100) },
+        github.item(2, InboxRole::Reviewer, 100),
+    ]);
+    let svc = service(&[&github]);
+
+    svc.refresh_inbox();
+
+    assert_eq!(listed(&svc).iter().map(|r| r.1).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
+fn a_pull_request_the_human_gave_a_verdict_on_leaves_the_inbox() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Assignee, 100)]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+
+    github.lists(vec![InboxItem { verdict_given: true, ..github.item(1, InboxRole::Assignee, 200) }]);
+    svc.refresh_inbox();
+
+    assert!(listed(&svc).is_empty(), "{:?}", listed(&svc));
+}
+
+#[test]
+fn a_pull_request_whose_approval_goes_away_comes_back() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![InboxItem { approved: true, ..github.item(1, InboxRole::Assignee, 100) }]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+
+    github.lists(vec![github.item(1, InboxRole::Assignee, 200)]);
+    svc.refresh_inbox();
+
+    assert_eq!(listed(&svc), vec![("github.com".into(), 1, InboxRowState::New)]);
+}
+
+#[test]
+fn a_review_requested_again_comes_back_and_marks_the_inbox() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![InboxItem { verdict_given: true, ..github.item(1, InboxRole::Assignee, 100) }]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+    svc.display_inbox();
+    svc.open_pull_request("https://github.com/acme/web/pull/2").unwrap();
+
+    github.lists(vec![github.item(1, InboxRole::Reviewer, 200)]);
+    svc.refresh_inbox();
+
+    let inbox = svc.inbox();
+    assert_eq!(inbox.rows.iter().map(|r| r.item.id.number).collect::<Vec<_>>(), vec![1]);
+    assert!(inbox.attention, "a review request coming back marks the Inbox");
+}
+
+#[test]
+fn an_open_session_keeps_a_done_pull_request_listed_until_it_is_closed() {
+    let github = FakeForge::new("github.com");
+    github.lists(vec![github.item(1, InboxRole::Reviewer, 100)]);
+    let svc = service(&[&github]);
+    svc.refresh_inbox();
+    let id = svc.open_pull_request("https://github.com/acme/web/pull/1").unwrap();
+    github.lists(vec![InboxItem { approved: true, verdict_given: true, ..github.item(1, InboxRole::Reviewer, 200) }]);
+
+    svc.refresh_inbox();
+    let open = InboxRowState::SessionOpen { session: id.clone(), drafts: 0 };
+    assert_eq!(listed(&svc), vec![("github.com".into(), 1, open)]);
+
+    svc.close(&id).unwrap();
+    svc.refresh_inbox();
+    assert!(listed(&svc).is_empty(), "{:?}", listed(&svc));
 }
