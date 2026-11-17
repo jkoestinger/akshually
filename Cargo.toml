@@ -6,7 +6,7 @@ default-members = ["crates/akshually"]
 [workspace.package]
 version = "0.0.4"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/jkoestinger/akshually"
 # Shipped as an app (release binaries), not via crates.io,
 # where the `akshually` name belongs to another crate.

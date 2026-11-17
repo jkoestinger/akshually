@@ -30,7 +30,7 @@ linux)
     mkdir -p "$dir"
     install -m 755 "$binary" "$dir/akshually"
     install -m 644 "$root/packaging/linux/akshually.desktop" "$root/README.md" \
-        "$root/LICENSE-APACHE" "$root/LICENSE-MIT" "$dir/"
+        "$root/LICENSE-MIT" "$dir/"
     asset="$out/$stem.tar.gz"
     tar -C "$work" -czf "$asset" "$stem"
     ;;
@@ -39,7 +39,7 @@ macos)
     mkdir -p "$app/MacOS" "$app/Resources"
     install -m 755 "$binary" "$app/MacOS/akshually"
     sed "s/@VERSION@/$version/g" "$root/packaging/macos/Info.plist" >"$app/Info.plist"
-    install -m 644 "$root/LICENSE-APACHE" "$root/LICENSE-MIT" "$app/Resources/"
+    install -m 644 "$root/LICENSE-MIT" "$app/Resources/"
     # Ad-hoc signature (no Developer ID): seals the bundle so Gatekeeper sees one consistent app.
     if command -v codesign >/dev/null; then
         codesign --force --sign - "$work/akshually.app"
