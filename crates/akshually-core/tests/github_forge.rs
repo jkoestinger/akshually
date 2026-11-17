@@ -522,6 +522,7 @@ impl Harness {
             "repository": { "nameWithOwner": "acme/web" },
             "reviewDecision": "REVIEW_REQUIRED",
             "latestOpinionatedReviews": { "nodes": [] },
+            "viewerDidAuthor": false,
             "viewerLatestReview": null,
         });
         for (field, value) in as_found.as_object().expect("fields of a node") {
@@ -634,6 +635,18 @@ fn an_assignment_the_human_reviewed_is_done() {
         assert_eq!(inbox[0].role, InboxRole::Assignee);
         assert_eq!(inbox[0].verdict_given, done, "latest review {review}");
     }
+}
+
+#[test]
+fn the_human_s_own_assigned_pull_request_stays_whatever_they_reply() {
+    let mut h = Harness::new();
+
+    let inbox = h.inbox_of_one_assignment(serde_json::json!({
+        "viewerDidAuthor": true,
+        "viewerLatestReview": { "state": "COMMENTED" },
+    }));
+
+    assert!(!inbox[0].verdict_given, "no one can request the author's review, so it would never come back");
 }
 
 #[test]

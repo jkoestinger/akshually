@@ -193,15 +193,13 @@ struct Approvals {
     /// It meets its approval rules. Also true before anyone approved when it has none.
     #[serde(default)]
     approved: bool,
+    /// Counted only.
     #[serde(default)]
-    approved_by: Vec<Approver>,
+    approved_by: Vec<serde::de::IgnoredAny>,
     /// GitLab's approval rules let them approve it now (false once they have).
     user_can_approve: bool,
     user_has_approved: bool,
 }
-
-#[derive(Deserialize)]
-struct Approver {}
 
 impl Approvals {
     /// It meets its approval requirement, or has an approval when it has none.

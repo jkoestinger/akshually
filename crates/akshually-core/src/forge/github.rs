@@ -472,6 +472,7 @@ impl GitHub {
             review_decision: Option<String>,
             /// Each reviewer's latest Approve or Request changes.
             latest_opinionated_reviews: Nodes<ReviewState>,
+            viewer_did_author: bool,
             viewer_latest_review: Option<ReviewState>,
         }
         #[derive(Deserialize)]
@@ -497,9 +498,11 @@ impl GitHub {
                 };
                 // A review removes the human's review request, and a new request lists the Pull
                 // Request as a review request again: only an assignment can be one they reviewed
-                // since. Their reply to a Thread is a review too.
-                let reviewed =
-                    pr.viewer_latest_review.is_some_and(|r| !matches!(r.state.as_str(), "PENDING" | "DISMISSED"));
+                // since. Their reply to a Thread is a review too. Taken as since the last request
+                // even when that request was withdrawn unanswered: GitHub doesn't say when it was.
+                // Never their own: no one can request the author's review to bring it back.
+                let reviewed = !pr.viewer_did_author
+                    && pr.viewer_latest_review.is_some_and(|r| !matches!(r.state.as_str(), "PENDING" | "DISMISSED"));
                 Ok(InboxItem {
                     id: PullRequestRef {
                         host: self.client.host().to_owned(),
@@ -622,7 +625,7 @@ const INBOX_QUERY: &str = "query($q: String!) {
         number title url createdAt updatedAt author { login } repository { nameWithOwner }
         reviewDecision
         latestOpinionatedReviews(first: 100) { nodes { state } }
-        viewerLatestReview { state }
+        viewerDidAuthor viewerLatestReview { state }
       }
     }
   }

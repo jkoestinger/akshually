@@ -12,6 +12,7 @@
           "repository": { "nameWithOwner": "acme/api" },
           "reviewDecision": "REVIEW_REQUIRED",
           "latestOpinionatedReviews": { "nodes": [] },
+          "viewerDidAuthor": false,
           "viewerLatestReview": null
         },
         {
@@ -24,6 +25,7 @@
           "repository": { "nameWithOwner": "acme/docs" },
           "reviewDecision": null,
           "latestOpinionatedReviews": { "nodes": [] },
+          "viewerDidAuthor": false,
           "viewerLatestReview": null
         }
       ]

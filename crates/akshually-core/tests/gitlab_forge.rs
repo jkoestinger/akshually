@@ -367,8 +367,7 @@ impl Harness {
             { "user": { "id": 2, "username": "ann", "name": "Ann" }, "state": "approved" },
             { "user": { "id": 1, "username": "me", "name": "Me" }, "state": mine },
         ]);
-        let path = format!("/projects/{}/merge_requests/{iid}/reviewers", repo.replace('/', "%2F"));
-        self.get(&path, TOKEN, &body.to_string())
+        self.get(&mr_path(repo, iid, "reviewers"), TOKEN, &body.to_string())
     }
 
     /// `GET …/approvals` of `repo!iid`: whether it meets its approval requirement (GitLab's
@@ -381,8 +380,7 @@ impl Harness {
             "user_has_approved": has,
             "user_can_approve": !has,
         });
-        let path = format!("/projects/{}/merge_requests/{iid}/approvals", repo.replace('/', "%2F"));
-        self.get(&path, TOKEN, &body.to_string())
+        self.get(&mr_path(repo, iid, "approvals"), TOKEN, &body.to_string())
     }
 
     /// Each of the fixtures' merge requests awaits the human's review, and none is approved.
@@ -392,6 +390,11 @@ impl Harness {
             self.mr_approvals(mr, false, &[], false);
         }
     }
+}
+
+/// The API path of `rest` under the merge request `repo!iid`.
+fn mr_path(repo: &str, iid: u64, rest: &str) -> String {
+    format!("/projects/{}/merge_requests/{iid}/{rest}", repo.replace('/', "%2F"))
 }
 
 fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRole) -> InboxItem {
