@@ -203,11 +203,18 @@ impl SessionTab {
     fn new(session: SessionView, layout: DiffLayout) -> Self {
         let mut diff = DiffState::new(Vec::new());
         diff.set_mode(diff_mode(layout));
-        show_files(&mut diff, session.shown());
+        show_files(&mut diff, &session);
         let actions = session.actions();
         let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false };
         tab.annotate(None);
         tab
+    }
+
+    /// Folds the diff of the file at `path` in the shown Changeset, or unfolds it.
+    fn fold(&mut self, path: &str, folded: bool) {
+        if let Some(at) = self.session.shown().files.iter().position(|f| f.path == path) {
+            self.diff.set_collapsed(at, folded);
+        }
     }
 
     /// Puts each current Thread, and the composer when it's on this Session, under its last
@@ -261,11 +268,13 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
         .collect()
 }
 
-/// Shows `changeset` in `diff`, with generated and large files collapsed.
-fn show_files(diff: &mut DiffState, changeset: &Changeset) {
+/// Shows the Changeset `session` shows in `diff`, with generated, large and viewed files
+/// collapsed (#78).
+fn show_files(diff: &mut DiffState, session: &SessionView) {
+    let changeset = session.shown();
     diff.set_files(file_diffs(changeset));
     for (at, file) in changeset.files.iter().enumerate() {
-        if file.collapsed.is_some() {
+        if file.collapsed.is_some() || session.viewed.contains(&file.path) {
             diff.set_collapsed(at, true);
         }
     }
@@ -346,7 +355,7 @@ impl State {
                 Some(at) => {
                     let mut tab = old.swap_remove(at);
                     if tab.session.changeset_rev != session.changeset_rev {
-                        show_files(&mut tab.diff, session.shown());
+                        show_files(&mut tab.diff, &session);
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -686,6 +695,18 @@ impl State {
 
     fn tab_mut(&mut self, id: &SessionId) -> Option<&mut SessionTab> {
         self.tabs.iter_mut().find(|t| &t.session.id == id)
+    }
+
+    /// Ticks `path` as viewed, or unticks it, and folds its diff to match, as GitHub does (#78).
+    /// The fold is the UI's own: the human can still expand a viewed file by hand.
+    fn mark_viewed(&mut self, id: &SessionId, path: &str, viewed: bool) {
+        let marked = self.service.mark_viewed(id, path, viewed);
+        if marked.is_err() {
+            return report(marked);
+        }
+        if let Some(tab) = self.tab_mut(id) {
+            tab.fold(path, viewed);
+        }
     }
 
     /// The tab of the Session the Window displays; `None` while it displays the Inbox.
@@ -1542,8 +1563,9 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .child(
                 Checkbox::new(viewed)
                     .label("Viewed")
-                    .on_toggle(move |s: &mut State| report(s.service.mark_viewed(&id, &path, !viewed)))
-                    .build(&kc),
+                    .on_toggle(move |s: &mut State| s.mark_viewed(&id, &path, !viewed))
+                    .build(&kc)
+                    .key(format!("viewed-{}", change.path)),
             )
     })
     .annotation({
