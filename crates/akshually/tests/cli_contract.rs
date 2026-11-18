@@ -365,26 +365,36 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
     assert_eq!(finish(call).status.code(), Some(0));
 }
 
-/// Lines of `process`'s stderr that log running out of file descriptors (`EMFILE`).
-fn out_of_fds_log(process: &mut AppProcess) -> mpsc::Receiver<String> {
+/// More connections than an app under any of [`FD_LIMITS`] has descriptors for.
+const CONNECTIONS: usize = 32;
+/// The `ulimit -n` values the app runs out under. An app that needed two descriptors for each
+/// connection would be left with one under every other limit, and cut clients off there (#91).
+const FD_LIMITS: std::ops::RangeInclusive<u32> = 13..=18;
+/// How many times the app logs running out of file descriptors before the test goes on: each
+/// time, an app that cuts connections off has had the chance to cut another one.
+const OUT_OF_FDS_LOGS_AWAITED: usize = 3;
+
+/// Runs the app headless under `ulimit -n limit` and waits until it listens. Also returns the
+/// lines of its stderr that log running out of file descriptors (`EMFILE`).
+fn app_with_fd_limit(limit: u32) -> (LaunchedApp, AppProcess, mpsc::Receiver<String>) {
+    let app = LaunchedApp::new();
+    let mut process = app.spawn_app_with_fd_limit(limit);
     let log = BufReader::new(process.0.stderr.take().expect("the app's stderr is piped"));
     let (lines, logged) = mpsc::channel();
     std::thread::spawn(move || {
         let mut emfile = log.lines().map_while(Result::ok).filter(|line| line.contains("os error 24"));
         emfile.try_for_each(|line| lines.send(line))
     });
-    logged
+    app.wait_for("the app to listen", |_| true);
+    (app, process, logged)
 }
 
 #[test]
 fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
-    let app = LaunchedApp::new();
-    let mut process = app.spawn_app_with_fd_limit(16);
-    let logged = out_of_fds_log(&mut process);
-    app.wait_for("the app to listen", |_| true);
+    let (app, process, logged) = app_with_fd_limit(16);
 
     // Each idle connection holds one of the app's file descriptors until it closes.
-    let idle: Vec<_> = (0..32).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
+    let idle: Vec<_> = (0..CONNECTIONS).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
     let out_of_fds = logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
     drop(idle);
     let answered = wait_until(TIMEOUT, "the app to answer again", || app.state());
@@ -393,22 +403,12 @@ fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
     assert_eq!(answered.pid, process.0.id(), "another app answered");
 }
 
-/// How many times the app logs running out of file descriptors before the test goes on: each
-/// time, an app that cuts connections off has had the chance to cut another one.
-const OUT_OF_FDS_RETRIES: usize = 3;
-
 #[test]
 fn clients_queued_past_the_file_descriptor_limit_are_served_once_descriptors_free_up() {
-    // Whether the app has an odd or even number of descriptors left once the connections hold
-    // the rest depends on the limit, so try a few: an app that needs two descriptors for each
-    // connection cuts clients off under one of them (#91).
-    for limit in 13..=18 {
-        let app = LaunchedApp::new();
-        let mut process = app.spawn_app_with_fd_limit(limit);
-        let logged = out_of_fds_log(&mut process);
-        app.wait_for("the app to listen", |_| true);
-        let clients: Vec<_> = (0..32).map(|_| ipc::connect(&app.paths()).unwrap()).collect();
-        for _ in 0..OUT_OF_FDS_RETRIES {
+    for limit in FD_LIMITS {
+        let (app, process, logged) = app_with_fd_limit(limit);
+        let clients: Vec<_> = (0..CONNECTIONS).map(|_| ipc::connect(&app.paths()).unwrap()).collect();
+        for _ in 0..OUT_OF_FDS_LOGS_AWAITED {
             logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
         }
 

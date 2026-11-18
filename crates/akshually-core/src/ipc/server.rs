@@ -9,7 +9,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::proto::{AppState, Envelope, ErrorCode, ErrorReply, HumanCommand, Reply, Request, VERSION, source};
-use crate::{NewComment, Paths, ReviewRequest, Service};
+use crate::{NewComment, Paths, PendingReview, ReviewRequest, Service};
 
 /// How long `serve` first waits after a brief accept error before it tries again. It doubles
 /// while accepting keeps failing, so running out of file descriptors doesn't spin a core.
@@ -110,7 +110,8 @@ impl Server {
     /// Serves one connection through the descriptor `accept` gave it. A second one, such as a
     /// `try_clone` to read with, could fail for lack of descriptors after the connection was
     /// accepted, cutting the client off as though the app had restarted (#91). Running out
-    /// shows up only at `accept`, which leaves the connection queued until descriptors free up.
+    /// before a connection is served shows up only at `accept`, which leaves the connection
+    /// queued until descriptors free up.
     fn handle(&self, stream: UnixStream) {
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
@@ -154,21 +155,7 @@ impl Server {
                 }
                 let _ = next_line.send(read.then_some(line));
             });
-
-            let Some(outcome) = pending.receive() else {
-                let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
-                return;
-            };
-            if send(stream, Reply::Ok(json(outcome))).is_err() {
-                return;
-            }
-            // Without the ack, dropping `pending` queues the Round or Verdict again.
-            if let Ok(Some(line)) = client.recv()
-                && matches!(parse(&line), Ok(Request::Ack))
-            {
-                pending.ack();
-                let _ = send(stream, Reply::Ok(serde_json::json!({})));
-            }
+            deliver(&pending, stream, &client);
         });
     }
 
@@ -220,6 +207,25 @@ impl Server {
         }
         .map_err(failed)?;
         Ok(serde_json::json!({}))
+    }
+}
+
+/// Sends the human's outcome to the waiting `review` call, and hands it over for good once the
+/// CLI's `next_line` acknowledges it.
+fn deliver(pending: &PendingReview, stream: &UnixStream, next_line: &mpsc::Receiver<Option<String>>) {
+    let Some(outcome) = pending.receive() else {
+        let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
+        return;
+    };
+    if send(stream, Reply::Ok(json(outcome))).is_err() {
+        return;
+    }
+    // Without the ack, dropping `pending` queues the Round or Verdict again.
+    if let Ok(Some(line)) = next_line.recv()
+        && matches!(parse(&line), Ok(Request::Ack))
+    {
+        pending.ack();
+        let _ = send(stream, Reply::Ok(serde_json::json!({})));
     }
 }
 

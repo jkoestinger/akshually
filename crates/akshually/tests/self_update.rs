@@ -167,15 +167,16 @@ fn a_review_waiting_when_the_app_restarts_says_so_and_the_session_comes_back() {
 }
 
 /// A stdout no write can go through, and its other end, which nothing reads: a non-blocking
-/// socket whose buffer is already full. Closing a pipe's read end instead isn't enough, as a
+/// socket whose buffer is already full, so writing fails with `WouldBlock` (`EAGAIN`). Closing a pipe's read end instead isn't enough, as a
 /// child spawned meanwhile on another test's thread can inherit it and keep the pipe open; nor
 /// is a read-only file, whose `EBADF` Rust's stdout takes for success (#91).
 fn full_stdout() -> (Stdio, UnixStream) {
+    /// Any size fills the buffer; this one does it in a few writes.
+    const FILL_CHUNK: usize = 4096;
     let (stdout, unread) = UnixStream::pair().unwrap();
     stdout.set_nonblocking(true).unwrap();
-    let chunk = [0; 4096];
     loop {
-        match (&stdout).write(&chunk) {
+        match (&stdout).write(&[0; FILL_CHUNK]) {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e) => panic!("can't fill the stdout socket: {e}"),
@@ -190,7 +191,7 @@ fn a_review_that_cannot_print_its_outcome_does_not_blame_a_restart() {
     let repo = TestRepo::new();
     repo.write("lib.rs", "fn a() {}\n").commit_all("base");
     repo.branch("agent").write("lib.rs", "fn a() {}\nfn b() {}\n");
-    let (stdout, _unread) = full_stdout();
+    let (stdout, _held_open) = full_stdout();
     let review = app.akshually(repo.path(), &["review"]).stdout(stdout).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
 
