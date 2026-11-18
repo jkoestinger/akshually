@@ -104,6 +104,15 @@ fn no_credentials() -> CredentialSources {
     }
 }
 
+/// The adapters for the config file `toml`, as `Settings::load` reads it, with no credentials.
+fn adapters_from_config(toml: &str) -> Vec<Box<dyn ForgeAdapter>> {
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(&file, toml).unwrap();
+    let settings = Settings::load(&file).unwrap();
+    adapters(&settings.hosts, &no_credentials())
+}
+
 fn pr_ref() -> PullRequestRef {
     PullRequestRef { host: "github.com".into(), repo: "acme/web".into(), number: 482 }
 }
@@ -156,13 +165,9 @@ fn ignores_urls_that_are_not_one_of_its_pull_requests() {
 
 #[test]
 fn a_configured_enterprise_host_serves_its_own_urls() {
-    let dirs = TestDirs::new();
-    let file = dirs.path().join("config.toml");
-    std::fs::write(&file, "untracked = false\n\n[[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n")
-        .unwrap();
-    let settings = Settings::load(&file).unwrap();
+    let toml = "untracked = false\n\n[[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n";
 
-    let forges = adapters(&settings.hosts, &no_credentials());
+    let forges = adapters_from_config(toml);
 
     let url = "https://github.example.com/platform/infra/pull/97";
     let recognised: Vec<_> = forges.iter().filter_map(|f| f.recognise(url)).collect();
@@ -175,17 +180,10 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
 
 #[test]
 fn turning_github_com_off_removes_it() {
-    let dirs = TestDirs::new();
-    let file = dirs.path().join("config.toml");
-    std::fs::write(
-        &file,
-        "[[hosts]]\nkind = \"github\"\nhost = \"github.com\"\nenabled = false\n\n\
-         [[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n",
-    )
-    .unwrap();
-    let settings = Settings::load(&file).unwrap();
+    let toml = "[[hosts]]\nkind = \"github\"\nhost = \"github.com\"\nenabled = false\n\n\
+                [[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n";
 
-    let forges = adapters(&settings.hosts, &no_credentials());
+    let forges = adapters_from_config(toml);
 
     assert!(forges.iter().all(|f| f.recognise("https://github.com/acme/web/pull/482").is_none()), "github.com stays");
     assert_eq!(forges.len(), 1, "only github.example.com is left");
@@ -207,7 +205,6 @@ fn a_config_without_enabled_turns_every_host_on() {
             ..HostConfig::new(ForgeKind::GitHub, "github.example.com")
         }]
     );
-    assert!(settings.hosts[0].enabled);
 }
 
 // --- Pull Request, Changeset, Threads ---
@@ -701,12 +698,7 @@ fn a_review_requested_again_is_to_do_whatever_the_human_s_earlier_review() {
 
 /// The adapter `adapters` builds for github.com from the config `toml`, with no credentials.
 fn github_com_from_config(toml: &str) -> Box<dyn ForgeAdapter> {
-    let dirs = TestDirs::new();
-    let file = dirs.path().join("config.toml");
-    std::fs::write(&file, toml).unwrap();
-    let settings = Settings::load(&file).unwrap();
-
-    adapters(&settings.hosts, &no_credentials())
+    adapters_from_config(toml)
         .into_iter()
         .find(|f| f.recognise("https://github.com/acme/web/pull/482").is_some())
         .expect("an adapter for github.com")
@@ -752,9 +744,9 @@ fn default_github_com_skipped_from_the_inbox_still_says_how_to_log_in_for_a_past
 }
 
 #[test]
-fn optional_github_com_with_a_token_reports_a_failing_inbox() {
+fn quiet_github_com_with_a_token_reports_a_failing_inbox() {
     let mut h = Harness::new();
-    let github = h.github().optional();
+    let github = h.github().quiet_without_credentials();
     h.server.mock("POST", "/graphql").with_status(401).create();
 
     let inbox = github.inbox();

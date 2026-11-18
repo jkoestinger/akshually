@@ -104,16 +104,21 @@ impl ForgeKind {
     }
 }
 
-/// Every host to serve: those `configured` and turned on, plus github.com unless configured.
-pub(super) fn with_github_com(configured: &[HostConfig]) -> Vec<HostConfig> {
-    let mut hosts: Vec<_> = configured.iter().filter(|h| h.enabled).cloned().collect();
-    if !configures_github_com(configured) {
-        hosts.insert(0, HostConfig::new(ForgeKind::GitHub, ForgeKind::GitHub.default_host()));
-    }
-    hosts
+/// The hosts the Forge adapters serve.
+pub(super) struct Served {
+    pub(super) hosts: Vec<HostConfig>,
+    /// Whether `hosts` starts with github.com because no entry names it.
+    pub(super) github_com_by_default: bool,
 }
 
-/// Whether `configured` has an entry for github.com, turned on or off.
-pub(super) fn configures_github_com(configured: &[HostConfig]) -> bool {
-    configured.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host))
+/// Every host to serve: those `configured` and turned on, plus github.com unless configured (an
+/// entry turned off counts). The default github.com, when there, comes first.
+pub(super) fn with_github_com(configured: &[HostConfig]) -> Served {
+    let mut hosts: Vec<_> = configured.iter().filter(|h| h.enabled).cloned().collect();
+    let github_com_by_default =
+        !configured.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host));
+    if github_com_by_default {
+        hosts.insert(0, HostConfig::new(ForgeKind::GitHub, ForgeKind::GitHub.default_host()));
+    }
+    Served { hosts, github_com_by_default }
 }

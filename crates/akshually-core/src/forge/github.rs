@@ -44,8 +44,8 @@ pub struct GitHub {
     graphql: String,
     /// The last `update` answer per Pull Request, to poll again conditionally.
     polls: Mutex<HashMap<PullRequestRef, Polled>>,
-    /// Whether its Inbox is `None` without credentials (see [`GitHub::optional`]).
-    optional: bool,
+    /// Whether its Inbox is `None` without credentials (see [`GitHub::quiet_without_credentials`]).
+    quiet_without_credentials: bool,
 }
 
 /// What polling a Pull Request for pushes answered last.
@@ -76,15 +76,15 @@ impl GitHub {
             client: Client::new(host, &api, credentials, DIALECT),
             graphql,
             polls: Mutex::default(),
-            optional: false,
+            quiet_without_credentials: false,
         }
     }
 
     /// For a host the human may not use, as github.com when it's there by default: without
     /// credentials its Inbox is `None`, the host not set up, rather than an error. Everything
     /// else fails as before, so a Pull Request URL pasted for it still says how to log in.
-    pub fn optional(mut self) -> Self {
-        self.optional = true;
+    pub fn quiet_without_credentials(mut self) -> Self {
+        self.quiet_without_credentials = true;
         self
     }
 
@@ -397,18 +397,21 @@ impl ForgeAdapter for GitHub {
     }
 
     fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
-        // `review-requested` includes requests to the human's teams. A review removes the
-        // request, so a reviewed Pull Request is listed again only when assigned.
-        let mut items = match self.search("review-requested:@me", InboxRole::Reviewer) {
-            Err(ForgeError::NoCredentials { .. }) if self.optional => return Ok(None),
-            found => found?,
-        };
-        for item in self.search("assignee:@me", InboxRole::Assignee)? {
-            if !items.iter().any(|i| i.id == item.id) {
-                items.push(item);
+        let search = || -> Result<Vec<InboxItem>, ForgeError> {
+            // `review-requested` includes requests to the human's teams. A review removes the
+            // request, so a reviewed Pull Request is listed again only when assigned.
+            let mut items = self.search("review-requested:@me", InboxRole::Reviewer)?;
+            for item in self.search("assignee:@me", InboxRole::Assignee)? {
+                if !items.iter().any(|i| i.id == item.id) {
+                    items.push(item);
+                }
             }
+            Ok(items)
+        };
+        match search() {
+            Err(ForgeError::NoCredentials { .. }) if self.quiet_without_credentials => Ok(None),
+            found => found.map(Some),
         }
-        Ok(Some(items))
     }
 
     fn viewer(&self) -> Result<String, ForgeError> {

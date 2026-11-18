@@ -320,18 +320,21 @@ impl ForgeError {
 /// The adapters for github.com and every configured host turned on (`Settings::hosts`).
 ///
 /// github.com is there by default, unless configured. Next to another host the human may not
-/// use it at all: then it's [`GitHub::optional`], so the Inbox skips it while it has no
-/// credentials.
+/// use it at all: then it's [`GitHub::quiet_without_credentials`], so the Inbox skips it while
+/// it has no credentials.
 pub fn adapters(configured: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
-    let hosts = config::with_github_com(configured);
-    let optional = hosts.len() > 1 && !config::configures_github_com(configured);
-    hosts
+    let served = config::with_github_com(configured);
+    // The default github.com comes first.
+    let quiet_first = served.github_com_by_default && served.hosts.len() > 1;
+    served
+        .hosts
         .into_iter()
-        .map(|host| match host.kind {
+        .enumerate()
+        .map(|(at, host)| match host.kind {
             ForgeKind::GitHub => {
-                let by_default = optional && ForgeKind::GitHub.is_default_host(&host.host);
                 let github = GitHub::new(host, sources.clone());
-                Box::new(if by_default { github.optional() } else { github }) as Box<dyn ForgeAdapter>
+                let github = if quiet_first && at == 0 { github.quiet_without_credentials() } else { github };
+                Box::new(github) as Box<dyn ForgeAdapter>
             }
             ForgeKind::GitLab => Box::new(GitLab::new(host, sources.clone())),
         })

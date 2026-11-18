@@ -152,13 +152,14 @@ impl Service {
         let mut inner = self.lock();
         let before = std::mem::take(&mut inner.inbox.items);
         for (forge, result) in fetched {
-            if !matches!(result, Ok(None)) {
-                hosts.push(forge.host().to_owned());
-            }
             match result {
                 Ok(None) => {}
-                Ok(Some(found)) => items.extend(found),
+                Ok(Some(found)) => {
+                    hosts.push(forge.host().to_owned());
+                    items.extend(found);
+                }
                 Err(error) => {
+                    hosts.push(forge.host().to_owned());
                     errors.push(error.to_string());
                     items.extend(before.iter().filter(|i| forge.recognise(&i.url).is_some()).cloned());
                 }
