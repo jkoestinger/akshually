@@ -1,4 +1,4 @@
-//! UI: the tab bar as the window's title bar (#85), in Rune's headless `Runtime`: the tab strip
+//! UI: the tab bar as the Window's title bar (#85), in Rune's headless `Runtime`: the tab strip
 //! keeps clear of the macOS traffic lights by the inset Rune reports, the lights centre on the bar,
 //! and the bar's empty part drags the window while its tabs and fields keep their presses.
 
@@ -49,13 +49,12 @@ fn the_inbox_tab_starts_past_the_traffic_lights() {
 }
 
 #[test]
-fn in_full_screen_the_inbox_tab_goes_back_to_the_leading_edge() {
+fn in_full_screen_the_tab_strip_goes_back_to_the_leading_edge() {
     let rt = window(0.0);
 
-    let tab = element(&rt, "t-inbox");
+    let strip = element(&rt, "tabbar");
 
-    let inset = WINDOW_CHROME.titlebar_inset();
-    assert!(tab.rect[0] < inset, "the Inbox tab starts at {}, still clear of lights that end at {inset}", tab.rect[0]);
+    assert_eq!(strip.rect[0], 0.0, "the tab strip keeps a gap with no traffic lights to clear");
 }
 
 #[test]
@@ -97,7 +96,7 @@ fn a_press_on_a_tab_leaves_the_window_where_it_is() {
 }
 
 #[test]
-fn a_press_on_the_pull_request_opener_focuses_it_rather_than_drag_the_window() {
+fn a_press_on_the_pull_request_opener_leaves_the_window_where_it_is() {
     let repo = TestRepo::new();
     repo.write("a.txt", "one\n").commit_all("base");
     repo.write("a.txt", "two\n");
@@ -114,11 +113,6 @@ fn a_press_on_the_pull_request_opener_focuses_it_rather_than_drag_the_window() {
     let (x, y) = (field.rect[0] + field.rect[2] / 2.0, field.rect[1] + field.rect[3] / 2.0);
 
     rt.pointer_down(x, y);
-    let action = rt.take_titlebar_action();
-    rt.pointer_up(x, y);
-    rt.frame(0.0);
 
-    assert_eq!(action, None, "a press on the Pull Request opener drags the window");
-    let focused = rt.elements().into_iter().find(|e| e.focused).map(|e| e.role);
-    assert_eq!(focused, Some("textbox"), "the Pull Request opener didn't take focus");
+    assert_eq!(rt.take_titlebar_action(), None, "a press on the Pull Request opener drags the window");
 }

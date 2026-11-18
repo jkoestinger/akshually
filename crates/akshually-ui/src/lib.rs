@@ -52,7 +52,7 @@ const TRAFFIC_LIGHTS_INSET: f32 = (TAB_BAR_HEIGHT - Chrome::TRAFFIC_LIGHT) / 2.0
 /// The space between the traffic lights and the first tab, in points, as Rune's own shell keeps.
 const TRAFFIC_LIGHTS_GAP: f32 = 8.0;
 
-/// The window's frame. On macOS the tab bar is the title bar, as in a browser (#85): the content
+/// The Window's frame. On macOS the tab bar is the title bar, as in a browser (#85): the content
 /// fills the window, the traffic lights sit in the tab bar, and only `.window_drag()` regions move
 /// the window, so the tabs under the title bar stay clickable. Other platforms keep their native
 /// frame.
@@ -820,12 +820,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .build_layered(k, &mut layer);
     // Clear of the macOS traffic lights; flush with the leading edge in full screen and on other
     // platforms, where Rune reports no inset (#85).
-    let lights = cx.titlebar_inset();
+    let lights_end = cx.titlebar_inset();
     let tab_bar = row()
         .h(TAB_BAR_HEIGHT)
         .w_full()
         .gap(8.0)
-        .pl(if lights > 0.0 { lights + TRAFFIC_LIGHTS_GAP } else { 0.0 })
+        .pl(if lights_end > 0.0 { lights_end + TRAFFIC_LIGHTS_GAP } else { 0.0 })
         .pr(8.0)
         .items_center()
         // Its empty part moves the window; tabs and the Pull Request opener keep their presses.
