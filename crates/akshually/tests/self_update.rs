@@ -5,8 +5,11 @@
 mod support;
 
 use std::fs;
+use std::io::{ErrorKind, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use akshually_core::{
     Anchor, Side,
@@ -163,16 +166,33 @@ fn a_review_waiting_when_the_app_restarts_says_so_and_the_session_comes_back() {
     assert!(!after.sessions[0].agent_waiting, "the restored Session still has an agent waiting");
 }
 
+/// A stdout no write can go through, and its other end, which nothing reads: a non-blocking
+/// socket whose buffer is already full. Closing a pipe's read end instead isn't enough, as a
+/// child spawned meanwhile on another test's thread can inherit it and keep the pipe open; nor
+/// is a read-only file, whose `EBADF` Rust's stdout takes for success (#91).
+fn full_stdout() -> (Stdio, UnixStream) {
+    let (stdout, unread) = UnixStream::pair().unwrap();
+    stdout.set_nonblocking(true).unwrap();
+    let chunk = [0; 4096];
+    loop {
+        match (&stdout).write(&chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => panic!("can't fill the stdout socket: {e}"),
+        }
+    }
+    (Stdio::from(OwnedFd::from(stdout)), unread)
+}
+
 #[test]
 fn a_review_that_cannot_print_its_outcome_does_not_blame_a_restart() {
     let app = HostedApp::start();
     let repo = TestRepo::new();
     repo.write("lib.rs", "fn a() {}\n").commit_all("base");
     repo.branch("agent").write("lib.rs", "fn a() {}\nfn b() {}\n");
-    let mut review = app.akshually(repo.path(), &["review"]).spawn().unwrap();
+    let (stdout, _unread) = full_stdout();
+    let review = app.akshually(repo.path(), &["review"]).stdout(stdout).spawn().unwrap();
     let session = app.wait_for_session(repo.path());
-    // The agent stops reading: printing the outcome fails with a broken pipe.
-    drop(review.stdout.take());
 
     app.service.approve(&session.id).unwrap();
 

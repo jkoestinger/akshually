@@ -11,7 +11,7 @@ use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Party, Side, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
-use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
+use support::{AppProcess, HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
 const EXIT_ERROR: i32 = 1;
 
@@ -365,19 +365,25 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
     assert_eq!(finish(call).status.code(), Some(0));
 }
 
-#[test]
-fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
-    let app = LaunchedApp::new();
-    let mut process = app.spawn_app_with_fd_limit(16);
-    let log = BufReader::new(process.0.stderr.take().unwrap());
+/// Lines of `process`'s stderr that log running out of file descriptors (`EMFILE`).
+fn out_of_fds_log(process: &mut AppProcess) -> mpsc::Receiver<String> {
+    let log = BufReader::new(process.0.stderr.take().expect("the app's stderr is piped"));
     let (lines, logged) = mpsc::channel();
     std::thread::spawn(move || {
         let mut emfile = log.lines().map_while(Result::ok).filter(|line| line.contains("os error 24"));
         emfile.try_for_each(|line| lines.send(line))
     });
+    logged
+}
+
+#[test]
+fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
+    let app = LaunchedApp::new();
+    let mut process = app.spawn_app_with_fd_limit(16);
+    let logged = out_of_fds_log(&mut process);
     app.wait_for("the app to listen", |_| true);
 
-    // Each idle connection holds some of the app's file descriptors until it closes.
+    // Each idle connection holds one of the app's file descriptors until it closes.
     let idle: Vec<_> = (0..32).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
     let out_of_fds = logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
     drop(idle);
@@ -385,6 +391,38 @@ fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
 
     assert!(out_of_fds.starts_with("akshually: "), "logged: {out_of_fds}");
     assert_eq!(answered.pid, process.0.id(), "another app answered");
+}
+
+/// How many times the app logs running out of file descriptors before the test goes on: each
+/// time, an app that cuts connections off has had the chance to cut another one.
+const OUT_OF_FDS_RETRIES: usize = 3;
+
+#[test]
+fn clients_queued_past_the_file_descriptor_limit_are_served_once_descriptors_free_up() {
+    // Whether the app has an odd or even number of descriptors left once the connections hold
+    // the rest depends on the limit, so try a few: an app that needs two descriptors for each
+    // connection cuts clients off under one of them (#91).
+    for limit in 13..=18 {
+        let app = LaunchedApp::new();
+        let mut process = app.spawn_app_with_fd_limit(limit);
+        let logged = out_of_fds_log(&mut process);
+        app.wait_for("the app to listen", |_| true);
+        let clients: Vec<_> = (0..32).map(|_| ipc::connect(&app.paths()).unwrap()).collect();
+        for _ in 0..OUT_OF_FDS_RETRIES {
+            logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
+        }
+
+        // Each answered client frees its descriptor for the next one in the queue.
+        let calls: Vec<_> = clients.into_iter().map(|c| std::thread::spawn(move || c.test_state())).collect();
+
+        for call in calls {
+            let state = call.join().unwrap();
+            assert!(
+                matches!(state, Ok(ref s) if s.pid == process.0.id()),
+                "under `ulimit -n {limit}`, a queued client was cut off: {state:?}"
+            );
+        }
+    }
 }
 
 #[test]

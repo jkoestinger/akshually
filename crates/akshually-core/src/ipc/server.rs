@@ -107,9 +107,12 @@ impl Server {
         Ok(())
     }
 
+    /// Serves one connection through the descriptor `accept` gave it. A second one, such as a
+    /// `try_clone` to read with, could fail for lack of descriptors after the connection was
+    /// accepted, cutting the client off as though the app had restarted (#91). Running out
+    /// shows up only at `accept`, which leaves the connection queued until descriptors free up.
     fn handle(&self, stream: UnixStream) {
-        let Ok(read) = stream.try_clone() else { return };
-        let mut reader = BufReader::new(read);
+        let mut reader = BufReader::new(&stream);
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
             return;
@@ -129,7 +132,7 @@ impl Server {
     /// Serves a `review` call: waits for the human while watching the connection, so a CLI
     /// that goes away frees the Session, and hands a Round over for good only once the CLI
     /// acknowledges it.
-    fn review(&self, request: ReviewRequest, stream: &UnixStream, mut reader: BufReader<UnixStream>) {
+    fn review(&self, request: ReviewRequest, stream: &UnixStream, mut reader: BufReader<&UnixStream>) {
         let pending = match self.service.review(request) {
             Ok(pending) => pending,
             Err(error) => {
@@ -140,29 +143,33 @@ impl Server {
         // The CLI's next line is the ack; EOF before it means the CLI went away.
         let (next_line, client) = mpsc::channel();
         let cancel = pending.canceller();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let read = matches!(reader.read_line(&mut line), Ok(n) if n > 0);
-            if !read {
-                cancel.cancel();
-            }
-            let _ = next_line.send(read.then_some(line));
-        });
+        // Scoped, so the watcher reads through this connection's descriptor rather than a clone
+        // of it. The CLI closes the connection once it has its reply, ending the watcher.
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut line = String::new();
+                let read = matches!(reader.read_line(&mut line), Ok(n) if n > 0);
+                if !read {
+                    cancel.cancel();
+                }
+                let _ = next_line.send(read.then_some(line));
+            });
 
-        let Some(outcome) = pending.receive() else {
-            let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
-            return;
-        };
-        if send(stream, Reply::Ok(json(outcome))).is_err() {
-            return;
-        }
-        // Without the ack, dropping `pending` queues the Round or Verdict again.
-        if let Ok(Some(line)) = client.recv()
-            && matches!(parse(&line), Ok(Request::Ack))
-        {
-            pending.ack();
-            let _ = send(stream, Reply::Ok(serde_json::json!({})));
-        }
+            let Some(outcome) = pending.receive() else {
+                let _ = send(stream, Reply::Err(ErrorReply::new(ErrorCode::Failed, "stopped waiting for the human")));
+                return;
+            };
+            if send(stream, Reply::Ok(json(outcome))).is_err() {
+                return;
+            }
+            // Without the ack, dropping `pending` queues the Round or Verdict again.
+            if let Ok(Some(line)) = client.recv()
+                && matches!(parse(&line), Ok(Request::Ack))
+            {
+                pending.ack();
+                let _ = send(stream, Reply::Ok(serde_json::json!({})));
+            }
+        });
     }
 
     fn answer(&self, request: Request) -> Reply {
