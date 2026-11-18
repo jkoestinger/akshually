@@ -369,9 +369,11 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
 const CONNECTIONS: usize = 32;
 /// The `ulimit -n` values the app runs out under. An app that needed two descriptors for each
 /// connection would be left with one under every other limit, and cut clients off there (#91).
+#[cfg(target_os = "linux")]
 const FD_LIMITS: std::ops::RangeInclusive<u32> = 13..=18;
 /// How many times the app logs running out of file descriptors before the test goes on: each
 /// time, an app that cuts connections off has had the chance to cut another one.
+#[cfg(target_os = "linux")]
 const OUT_OF_FDS_LOGS_AWAITED: usize = 3;
 
 /// Runs the app headless under `ulimit -n limit` and waits until it listens. Also returns the
@@ -403,6 +405,10 @@ fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
     assert_eq!(answered.pid, process.0.id(), "another app answered");
 }
 
+// Linux only: when `accept` runs out of descriptors, macOS closes the queued connection on
+// purpose rather than leave it queued (XNU's `accept_nocancel`, "Drop the socket"), so no app
+// can keep that client waiting there (#91).
+#[cfg(target_os = "linux")]
 #[test]
 fn clients_queued_past_the_file_descriptor_limit_are_served_once_descriptors_free_up() {
     for limit in FD_LIMITS {

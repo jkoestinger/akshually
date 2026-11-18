@@ -110,8 +110,8 @@ impl Server {
     /// Serves one connection through the descriptor `accept` gave it. A second one, such as a
     /// `try_clone` to read with, could fail for lack of descriptors after the connection was
     /// accepted, cutting the client off as though the app had restarted (#91). Running out
-    /// before a connection is served shows up only at `accept`, which leaves the connection
-    /// queued until descriptors free up.
+    /// before a connection is served shows up only at `accept`. Linux then leaves the connection
+    /// queued until descriptors free up; macOS closes it, which no app can prevent.
     fn handle(&self, stream: UnixStream) {
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
