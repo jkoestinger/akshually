@@ -547,6 +547,20 @@ impl State {
         }
     }
 
+    /// Human, from the ✕ on its tab or the header's Abandon: ends the Session as its end action
+    /// says, asking first when that can't be undone. The question shows with the Session it is about, so that Session
+    /// shows first.
+    fn end(&mut self, id: SessionId) {
+        let Some(tab) = self.tab(&id) else { return };
+        match tab.actions.end {
+            EndAction::Close => self.act(&id, Service::close),
+            EndAction::Abandon => {
+                self.open_tab(id.clone());
+                self.confirming_end = Some(id);
+            }
+        }
+    }
+
     /// Human: lays out every Session's Changeset as `layout`.
     fn set_diff_layout(&mut self, layout: DiffLayout) {
         self.service.set_diff_layout(layout);
@@ -699,6 +713,11 @@ impl State {
         }
     }
 
+    /// The Session whose tab in the strip is keyed `tab`; `None` for the Inbox's.
+    fn tab_session(&self, tab: &str) -> Option<SessionId> {
+        self.tabs.iter().find(|t| t.session.id.as_str() == tab).map(|t| t.session.id.clone())
+    }
+
     fn tab(&self, id: &SessionId) -> Option<&SessionTab> {
         self.tabs.iter().find(|t| &t.session.id == id)
     }
@@ -787,7 +806,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .tabs(std::iter::once(inbox_tab).chain(s.tabs.iter().map(|t| {
             TabItem::new(t.session.id.as_str(), t.session.title())
                 .icon(&rune_kit::glyphs::FILE_CODE)
-                .closable(false)
                 .status(tab_status(&t.session))
         })))
         .active(Some(s.displayed_tab().map_or(INBOX_TAB, |t| t.session.id.as_str())))
@@ -795,8 +813,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .on_select(|s: &mut State, id: &str, _| {
             if id == INBOX_TAB {
                 s.open_inbox();
-            } else if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone()) {
+            } else if let Some(id) = s.tab_session(id) {
                 s.open_tab(id);
+            }
+        })
+        .on_close(|s: &mut State, id: &str, _| {
+            if let Some(id) = s.tab_session(id) {
+                s.end(id);
             }
         })
         .build_layered(k, &mut layer);
@@ -1034,8 +1057,7 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
 fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
     let session = &tab.session;
     let base = &session.changeset.base[..session.changeset.base.len().min(SHORT_HASH)];
-    let (close_id, publish_id) = (session.id.clone(), session.id.clone());
-    let end = tab.actions.end;
+    let publish_id = session.id.clone();
     row()
         .key("session-header")
         .w_full()
@@ -1053,16 +1075,6 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut State| s.compose_general(None))
-                .build(k),
-        )
-        .child(
-            Button::new("Close")
-                .variant(ButtonVariant::Ghost)
-                .on_press(move |s: &mut State| match end {
-                    EndAction::Close => s.act(&close_id, Service::close),
-                    // Unpublished Drafts go with it: ask first.
-                    EndAction::Abandon => s.confirming_end = Some(close_id.clone()),
-                })
                 .build(k),
         )
         .children(tab.actions.hand_over.map(|hand_over| hand_over_button(k, tab, hand_over)))
@@ -1316,8 +1328,9 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 }
 
 /// A Session's header: its branch and the base of the Changeset shown, Round and Turn, the
-/// Changeset views it offers, and the actions that end it or hand the Turn over. A Pull Request
-/// Session has its own header. The view dropdown's list goes into `layer`.
+/// Changeset views it offers, and the actions that abandon it, give the Verdict or hand the Turn
+/// over; closing it is its tab's ✕. A Pull Request Session has its own header. The view
+/// dropdown's list goes into `layer`.
 fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
@@ -1337,6 +1350,13 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
             .variant(ButtonVariant::Outline)
             .on_press(move |s: &mut State| s.act(&verdict_id, Service::take_turn_back))
             .build(k),
+    });
+    // Closing is the tab's ✕. Abandoning stays here: it tells the Author agent to stop (#86).
+    let abandon = (tab.actions.end == EndAction::Abandon).then(|| {
+        Button::new("Abandon")
+            .variant(ButtonVariant::Ghost)
+            .on_press(move |s: &mut State| s.end(end_id.clone()))
+            .build(k)
     });
     let view_select = view_dropdown(k, tab, layer);
     row()
@@ -1360,16 +1380,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
                 .on_press(|s: &mut State| s.compose_general(None))
                 .build(k),
         )
-        .child(
-            match tab.actions.end {
-                EndAction::Close => Button::new("Close").on_press(move |s: &mut State| s.act(&end_id, Service::close)),
-                EndAction::Abandon => {
-                    Button::new("Abandon").on_press(move |s: &mut State| s.confirming_end = Some(end_id.clone()))
-                }
-            }
-            .variant(ButtonVariant::Ghost)
-            .build(k),
-        )
+        .children(abandon)
         .children(verdict)
         .children(tab.actions.hand_over.map(|hand_over| hand_over_button(k, tab, hand_over)))
 }
@@ -1383,7 +1394,8 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
     let (question, label) = match session.pull_request() {
         Some(_) => {
             let agent = if session.agent.is_some() { " The co-Reviewer is told to stop." } else { "" };
-            (format!("Close this Pull Request? Your Drafts are discarded.{agent}"), "Close")
+            // "Session", not "Pull Request": nothing changes on the Forge (#86).
+            (format!("Close this Session? Your Drafts are discarded.{agent}"), "Close Session")
         }
         None => ("Abandon this Session? The agent is told to stop.".to_owned(), "Abandon"),
     };
@@ -1403,7 +1415,8 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
                 Button::new("Cancel")
                     .variant(ButtonVariant::Ghost)
                     .on_press(|s: &mut State| s.confirming_end = None)
-                    .build(k),
+                    .build(k)
+                    .key("end-confirm-cancel"),
             )
             .child(
                 Button::new(label)
@@ -1412,7 +1425,8 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
                         s.confirming_end = None;
                         s.act(&id, Service::abandon);
                     })
-                    .build(k),
+                    .build(k)
+                    .key("end-confirm-end"),
             ),
     )
 }
