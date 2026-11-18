@@ -70,6 +70,10 @@ impl FakeForge {
 }
 
 impl ForgeAdapter for FakeForge {
+    fn host(&self) -> &str {
+        "forge.test"
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         url.starts_with(URL).then(pr_ref)
     }

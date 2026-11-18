@@ -94,6 +94,16 @@ impl Harness {
     }
 }
 
+/// No `gh`, no `glab` and an empty environment: no credentials for any host but pasted ones.
+fn no_credentials() -> CredentialSources {
+    CredentialSources {
+        config: "/home/me/.config/akshually/config.toml".into(),
+        gh: "/nonexistent".into(),
+        glab: "/nonexistent".into(),
+        env: HashMap::new(),
+    }
+}
+
 fn pr_ref() -> PullRequestRef {
     PullRequestRef { host: "github.com".into(), repo: "acme/web".into(), number: 482 }
 }
@@ -152,15 +162,7 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
         .unwrap();
     let settings = Settings::load(&file).unwrap();
 
-    let forges = adapters(
-        &settings.hosts,
-        &CredentialSources {
-            config: "/home/me/.config/akshually/config.toml".into(),
-            gh: "/nonexistent".into(),
-            glab: "/nonexistent".into(),
-            env: HashMap::new(),
-        },
-    );
+    let forges = adapters(&settings.hosts, &no_credentials());
 
     let url = "https://github.example.com/platform/infra/pull/97";
     let recognised: Vec<_> = forges.iter().filter_map(|f| f.recognise(url)).collect();
@@ -169,6 +171,43 @@ fn a_configured_enterprise_host_serves_its_own_urls() {
         vec![PullRequestRef { host: "github.example.com".into(), repo: "platform/infra".into(), number: 97 }]
     );
     assert!(forges.iter().any(|f| f.recognise("https://github.com/acme/web/pull/482").is_some()), "github.com stays");
+}
+
+#[test]
+fn turning_github_com_off_removes_it() {
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[[hosts]]\nkind = \"github\"\nhost = \"github.com\"\nenabled = false\n\n\
+         [[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\n",
+    )
+    .unwrap();
+    let settings = Settings::load(&file).unwrap();
+
+    let forges = adapters(&settings.hosts, &no_credentials());
+
+    assert!(forges.iter().all(|f| f.recognise("https://github.com/acme/web/pull/482").is_none()), "github.com stays");
+    assert_eq!(forges.len(), 1, "only github.example.com is left");
+}
+
+#[test]
+fn a_config_without_enabled_turns_every_host_on() {
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(&file, "[[hosts]]\nkind = \"github\"\nhost = \"github.example.com\"\ntoken = \"ghp_pasted\"\n")
+        .unwrap();
+
+    let settings = Settings::load(&file).unwrap();
+
+    assert_eq!(
+        settings.hosts,
+        vec![HostConfig {
+            token: Some("ghp_pasted".into()),
+            ..HostConfig::new(ForgeKind::GitHub, "github.example.com")
+        }]
+    );
+    assert!(settings.hosts[0].enabled);
 }
 
 // --- Pull Request, Changeset, Threads ---
@@ -500,14 +539,14 @@ impl Harness {
     fn inbox_of_one_review_request(&mut self, as_found: serde_json::Value) -> Vec<InboxItem> {
         self.only_found("review-requested:@me", as_found);
         self.search("assignee:@me", NONE_FOUND);
-        self.github().inbox().unwrap()
+        self.github().inbox().unwrap().unwrap()
     }
 
     /// The Inbox of a human assigned `acme/web#482` alone, which is `as_found`.
     fn inbox_of_one_assignment(&mut self, as_found: serde_json::Value) -> Vec<InboxItem> {
         self.search("review-requested:@me", NONE_FOUND);
         self.only_found("assignee:@me", as_found);
-        self.github().inbox().unwrap()
+        self.github().inbox().unwrap().unwrap()
     }
 
     /// The search for `filter` finds `acme/web#482` alone, with `as_found`'s fields.
@@ -556,7 +595,7 @@ fn the_inbox_lists_review_requests_then_assignments_once_each() {
     let requested = h.search("review-requested:@me", &fixture("search-review-requested.json"));
     let assigned = h.search("assignee:@me", &fixture("search-assigned.json"));
 
-    let inbox = github.inbox().unwrap();
+    let inbox = github.inbox().unwrap().unwrap();
 
     requested.assert();
     assigned.assert();
@@ -578,7 +617,7 @@ fn inbox_times_are_seconds_since_the_epoch() {
     h.search("review-requested:@me", &fixture("search-review-requested.json"));
     h.search("assignee:@me", NONE_FOUND);
 
-    let inbox = github.inbox().unwrap();
+    let inbox = github.inbox().unwrap().unwrap();
 
     // 2026-11-12T08:00:00Z and 2026-11-12T09:30:00Z.
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_470_400, 1_794_475_800));
@@ -656,6 +695,71 @@ fn a_review_requested_again_is_to_do_whatever_the_human_s_earlier_review() {
     let inbox = h.inbox_of_one_review_request(serde_json::json!({ "viewerLatestReview": { "state": "APPROVED" } }));
 
     assert!(!inbox[0].verdict_given, "GitHub removes a review request once the human reviews");
+}
+
+// --- github.com when it's there by default ---
+
+/// The adapter `adapters` builds for github.com from the config `toml`, with no credentials.
+fn github_com_from_config(toml: &str) -> Box<dyn ForgeAdapter> {
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(&file, toml).unwrap();
+    let settings = Settings::load(&file).unwrap();
+
+    adapters(&settings.hosts, &no_credentials())
+        .into_iter()
+        .find(|f| f.recognise("https://github.com/acme/web/pull/482").is_some())
+        .expect("an adapter for github.com")
+}
+
+#[test]
+fn default_github_com_without_credentials_is_skipped_when_another_host_is_configured() {
+    let github = github_com_from_config("[[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\n");
+
+    let inbox = github.inbox();
+
+    assert!(matches!(inbox, Ok(None)), "{inbox:?}");
+}
+
+#[test]
+fn default_github_com_without_credentials_says_how_to_log_in_when_it_is_the_only_host() {
+    let github = github_com_from_config("untracked = false\n");
+
+    let inbox = github.inbox();
+
+    assert!(matches!(&inbox, Err(ForgeError::NoCredentials { host, .. }) if host == "github.com"), "{inbox:?}");
+}
+
+#[test]
+fn configured_github_com_without_credentials_says_how_to_log_in_next_to_other_hosts() {
+    let github = github_com_from_config(
+        "[[hosts]]\nkind = \"github\"\nhost = \"github.com\"\n\n\
+         [[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\n",
+    );
+
+    let inbox = github.inbox();
+
+    assert!(matches!(&inbox, Err(ForgeError::NoCredentials { host, .. }) if host == "github.com"), "{inbox:?}");
+}
+
+#[test]
+fn default_github_com_skipped_from_the_inbox_still_says_how_to_log_in_for_a_pasted_url() {
+    let github = github_com_from_config("[[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\n");
+
+    let error = github.pull_request(&pr_ref()).unwrap_err();
+
+    assert!(matches!(&error, ForgeError::NoCredentials { host, .. } if host == "github.com"), "{error:?}");
+}
+
+#[test]
+fn optional_github_com_with_a_token_reports_a_failing_inbox() {
+    let mut h = Harness::new();
+    let github = h.github().optional();
+    h.server.mock("POST", "/graphql").with_status(401).create();
+
+    let inbox = github.inbox();
+
+    assert!(matches!(&inbox, Err(ForgeError::Unauthorized { .. })), "{inbox:?}");
 }
 
 // --- New pushes ---

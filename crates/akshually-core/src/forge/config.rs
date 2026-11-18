@@ -15,7 +15,18 @@
 //! ```
 //!
 //! github.com needs no entry; one with `host = "github.com"` overrides the default. GitLab hosts,
-//! gitlab.com included, are served only when configured.
+//! gitlab.com included, are served only when configured. `enabled = false` turns a host off, so
+//! an entry for github.com with it removes github.com:
+//!
+//! ```toml
+//! [[hosts]]
+//! kind = "github"
+//! host = "github.com"
+//! enabled = false
+//! ```
+//!
+//! While github.com is there only by default, next to another host, the Inbox skips it until it
+//! has credentials.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,12 +43,24 @@ pub struct HostConfig {
     /// A pasted personal access token, used when neither the CLI nor the environment has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Whether akshually uses the host at all. A turned-off host has no adapter: the Inbox
+    /// doesn't ask it and its Pull Request URLs aren't recognised.
+    #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+fn is_enabled(enabled: &bool) -> bool {
+    *enabled
 }
 
 impl HostConfig {
     /// A host of `kind` at `host` with everything else derived.
     pub fn new(kind: ForgeKind, host: impl Into<String>) -> Self {
-        HostConfig { kind, host: host.into(), api_base: None, token: None }
+        HostConfig { kind, host: host.into(), api_base: None, token: None, enabled: true }
     }
 }
 
@@ -81,11 +104,16 @@ impl ForgeKind {
     }
 }
 
-/// Every host to serve: `configured`, plus github.com unless configured.
+/// Every host to serve: those `configured` and turned on, plus github.com unless configured.
 pub(super) fn with_github_com(configured: &[HostConfig]) -> Vec<HostConfig> {
-    let mut hosts = configured.to_vec();
-    if !hosts.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host)) {
+    let mut hosts: Vec<_> = configured.iter().filter(|h| h.enabled).cloned().collect();
+    if !configures_github_com(configured) {
         hosts.insert(0, HostConfig::new(ForgeKind::GitHub, ForgeKind::GitHub.default_host()));
     }
     hosts
+}
+
+/// Whether `configured` has an entry for github.com, turned on or off.
+pub(super) fn configures_github_com(configured: &[HostConfig]) -> bool {
+    configured.iter().any(|h| h.kind == ForgeKind::GitHub && ForgeKind::GitHub.is_default_host(&h.host))
 }

@@ -20,6 +20,9 @@ pub struct InboxView {
     pub refreshed_at: Option<i64>,
     /// Why hosts failed in the last refresh; their rows are the ones from before.
     pub errors: Vec<String>,
+    /// The hosts the last refresh asked, whether they answered or failed, in the adapters'
+    /// order. A host that isn't set up isn't listed.
+    pub hosts: Vec<String>,
     /// A new review request arrived while the Inbox wasn't displayed, and it hasn't been since.
     pub attention: bool,
 }
@@ -55,6 +58,8 @@ pub(super) struct Inbox {
     attention: bool,
     #[serde(skip)]
     errors: Vec<String>,
+    /// Saved with `refreshed_at`, which it goes with, so the Inbox still names them on launch.
+    hosts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,7 +110,13 @@ impl Inbox {
                 InboxRow { item: item.clone(), state }
             })
             .collect();
-        InboxView { rows, refreshed_at: self.refreshed_at, errors: self.errors.clone(), attention: self.attention }
+        InboxView {
+            rows,
+            refreshed_at: self.refreshed_at,
+            errors: self.errors.clone(),
+            hosts: self.hosts.clone(),
+            attention: self.attention,
+        }
     }
 }
 
@@ -129,18 +140,24 @@ impl Service {
     }
 
     /// Asks every Forge host for its Inbox; blocks on them. A host that fails keeps its rows
-    /// from before, and its error shows until a refresh succeeds. A review request that wasn't
-    /// listed before marks the Inbox, unless the human opened it and the Window displays it.
+    /// from before, and its error shows until a refresh succeeds; one that isn't set up is
+    /// skipped. A review request that wasn't listed before marks the Inbox, unless the human
+    /// opened it and the Window displays it.
     pub fn refresh_inbox(&self) {
         // Not holding the lock: the Forges may take a while.
         let fetched: Vec<_> = self.forges.iter().map(|forge| (forge, forge.inbox())).collect();
         let mut items = Vec::new();
         let mut errors = Vec::new();
+        let mut hosts = Vec::new();
         let mut inner = self.lock();
         let before = std::mem::take(&mut inner.inbox.items);
         for (forge, result) in fetched {
+            if !matches!(result, Ok(None)) {
+                hosts.push(forge.host().to_owned());
+            }
             match result {
-                Ok(found) => items.extend(found),
+                Ok(None) => {}
+                Ok(Some(found)) => items.extend(found),
                 Err(error) => {
                     errors.push(error.to_string());
                     items.extend(before.iter().filter(|i| forge.recognise(&i.url).is_some()).cloned());
@@ -176,6 +193,7 @@ impl Service {
         state.seen.retain(|s| items.iter().any(|i| i.id == s.pr));
         state.items = items;
         state.errors = errors;
+        state.hosts = hosts;
         state.refreshed_at = Some(now());
         inner.notify_inbox();
     }

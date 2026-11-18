@@ -21,13 +21,11 @@ pub use credentials::CredentialSources;
 pub use github::GitHub;
 pub use gitlab::GitLab;
 
-/// Every host the Forge adapters serve: `configured` (`Settings::hosts`), plus github.com.
-pub fn served_hosts(configured: &[HostConfig]) -> Vec<HostConfig> {
-    config::with_github_com(configured)
-}
-
 /// One Forge host, as the review service sees it. Methods block on the network.
 pub trait ForgeAdapter: Send + Sync {
+    /// The web host it serves (`github.com`, `gitlab.example.com`), as configured.
+    fn host(&self) -> &str;
+
     /// The Pull Request `url` points at, if it's one on this adapter's host.
     fn recognise(&self, url: &str) -> Option<PullRequestRef>;
 
@@ -61,12 +59,14 @@ pub trait ForgeAdapter: Send + Sync {
 
     /// The human's Inbox on this host: open Pull Requests where they are a requested reviewer
     /// or an assignee, each listed once (as reviewer when both). A host without one has none.
+    /// `None` when the host isn't set up, so the Inbox skips it without an error: github.com,
+    /// there only by default, without credentials (see [`adapters`]).
     ///
     /// Those already approved, or that the human gave a Verdict on since their review was last
     /// requested, are listed too, marked `approved` or `verdict_given`: the service leaves them
     /// out of the Inbox unless the human has a Session open on them.
-    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
-        Ok(Vec::new())
+    fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
+        Ok(Some(Vec::new()))
     }
 }
 
@@ -317,12 +317,22 @@ impl ForgeError {
     }
 }
 
-/// The adapters for github.com and every configured host (`Settings::hosts`).
-pub fn adapters(hosts: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
-    config::with_github_com(hosts)
+/// The adapters for github.com and every configured host turned on (`Settings::hosts`).
+///
+/// github.com is there by default, unless configured. Next to another host the human may not
+/// use it at all: then it's [`GitHub::optional`], so the Inbox skips it while it has no
+/// credentials.
+pub fn adapters(configured: &[HostConfig], sources: &CredentialSources) -> Vec<Box<dyn ForgeAdapter>> {
+    let hosts = config::with_github_com(configured);
+    let optional = hosts.len() > 1 && !config::configures_github_com(configured);
+    hosts
         .into_iter()
         .map(|host| match host.kind {
-            ForgeKind::GitHub => Box::new(GitHub::new(host, sources.clone())) as Box<dyn ForgeAdapter>,
+            ForgeKind::GitHub => {
+                let by_default = optional && ForgeKind::GitHub.is_default_host(&host.host);
+                let github = GitHub::new(host, sources.clone());
+                Box::new(if by_default { github.optional() } else { github }) as Box<dyn ForgeAdapter>
+            }
             ForgeKind::GitLab => Box::new(GitLab::new(host, sources.clone())),
         })
         .collect()

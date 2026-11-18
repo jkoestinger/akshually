@@ -893,18 +893,19 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
 }
 
 /// The Inbox tab: open Pull Requests where the human is a requested reviewer or assignee, on
-/// every configured host. Opening a row starts or focuses its Session.
+/// every host the last refresh asked. Opening a row starts or focuses its Session.
 fn inbox_view(k: &Kit, s: &State, draft: Color) -> El {
     let now = now();
-    let hosts: Vec<String> =
-        akshually_core::forge::served_hosts(&s.service.settings().hosts).into_iter().map(|h| h.host).collect();
+    let hosts = match s.inbox.hosts.as_slice() {
+        [] => String::new(),
+        hosts => format!(" · {}", hosts.join(", ")),
+    };
     let refreshed = match (s.refreshing, s.inbox.refreshed_at) {
         (true, _) => " · refreshing…".to_owned(),
         (false, Some(at)) => format!(" · refreshed {}", ago(now - at)),
         (false, None) => String::new(),
     };
-    let subtitle =
-        format!("Pull Requests where you are a requested reviewer or assignee · {}{refreshed}", hosts.join(", "));
+    let subtitle = format!("Pull Requests where you are a requested reviewer or assignee{hosts}{refreshed}");
     let header = row()
         .key("inbox-header")
         .w_full()
@@ -2274,6 +2275,7 @@ fn scene_inbox(s: &mut State) {
         rows: rows.into_iter().map(|(item, state)| InboxRow { item, state }).collect(),
         refreshed_at: Some(now - 60),
         errors: Vec::new(),
+        hosts: vec!["github.com".into(), "gitlab.example.com".into()],
         attention: false,
     };
 }

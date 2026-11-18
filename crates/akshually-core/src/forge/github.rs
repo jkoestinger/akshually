@@ -44,6 +44,8 @@ pub struct GitHub {
     graphql: String,
     /// The last `update` answer per Pull Request, to poll again conditionally.
     polls: Mutex<HashMap<PullRequestRef, Polled>>,
+    /// Whether its Inbox is `None` without credentials (see [`GitHub::optional`]).
+    optional: bool,
 }
 
 /// What polling a Pull Request for pushes answered last.
@@ -70,7 +72,20 @@ impl GitHub {
             Some(root) => format!("{root}/api/graphql"),
             None => format!("{api}/graphql"),
         };
-        GitHub { client: Client::new(host, &api, credentials, DIALECT), graphql, polls: Mutex::default() }
+        GitHub {
+            client: Client::new(host, &api, credentials, DIALECT),
+            graphql,
+            polls: Mutex::default(),
+            optional: false,
+        }
+    }
+
+    /// For a host the human may not use, as github.com when it's there by default: without
+    /// credentials its Inbox is `None`, the host not set up, rather than an error. Everything
+    /// else fails as before, so a Pull Request URL pasted for it still says how to log in.
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
     }
 
     /// Sends `request` asking for `accept`, with the headers GitHub wants on every request.
@@ -222,6 +237,10 @@ fn next_page(response: &Response<Body>) -> Option<String> {
 }
 
 impl ForgeAdapter for GitHub {
+    fn host(&self) -> &str {
+        self.client.host()
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         let url = Url::parse(url).ok()?;
         if !host_matches(&url, self.client.host()) {
@@ -377,16 +396,19 @@ impl ForgeAdapter for GitHub {
         }
     }
 
-    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
+    fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
         // `review-requested` includes requests to the human's teams. A review removes the
         // request, so a reviewed Pull Request is listed again only when assigned.
-        let mut items = self.search("review-requested:@me", InboxRole::Reviewer)?;
+        let mut items = match self.search("review-requested:@me", InboxRole::Reviewer) {
+            Err(ForgeError::NoCredentials { .. }) if self.optional => return Ok(None),
+            found => found?,
+        };
         for item in self.search("assignee:@me", InboxRole::Assignee)? {
             if !items.iter().any(|i| i.id == item.id) {
                 items.push(item);
             }
         }
-        Ok(items)
+        Ok(Some(items))
     }
 
     fn viewer(&self) -> Result<String, ForgeError> {
