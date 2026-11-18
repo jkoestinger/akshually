@@ -8,9 +8,9 @@ use akshually_core::forge::{
     ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate, RemoteThread, Review,
 };
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Comment, EndAction, Ending, Error, FileChange, HandOver, Party, ReviewRequest,
-    Role, Service, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn,
-    Verdict, VerdictAction,
+    Anchor, Changeset, ChangesetView, Comment, EndAction, Ending, Error, FileChange, ForgeThread, HandOver, Party,
+    ReviewRequest, Role, Service, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId,
+    ThreadRef, Turn, Verdict, VerdictAction,
 };
 use akshually_testkit::TestRepo;
 
@@ -118,9 +118,9 @@ fn the_verdict_is_approve_in_the_humans_turn_and_take_turn_back_in_the_agents_on
 }
 
 #[test]
-fn a_session_ends_by_abandoning_it_unless_it_has_its_outcome_or_is_a_local_co_review() {
+fn a_session_ends_by_abandoning_it_unless_it_has_its_outcome_is_a_local_co_review_or_loses_nothing() {
     use EndAction::{Abandon, Close};
-    let expected = [Abandon, Abandon, Close, Close, Close, Close, Close, Abandon, Abandon, Abandon, Close];
+    let expected = [Abandon, Abandon, Close, Close, Close, Close, Close, Close, Abandon, Abandon, Close];
 
     let endings = every_session().map(|(what, session)| (what, session.actions().end));
 
@@ -199,6 +199,79 @@ fn a_pull_request_without_an_agent_has_no_round_to_hand_over() {
     let hand_over = session.actions().hand_over;
 
     assert_eq!(hand_over, None);
+}
+
+// --- Closing a Pull Request Session that loses nothing ---
+
+/// A Thread already on the Forge, open there unless `on_forge_resolved`, and here as `resolved`.
+fn forge_thread(on_forge_resolved: bool, resolved: Option<Party>) -> Thread {
+    let forge = Some(ForgeThread { id: "R1".into(), resolved: on_forge_resolved });
+    Thread { resolved, forge, ..thread("T1", vec![comment(Party::Other("lee".into()), Some(1))]) }
+}
+
+/// A Pull Request Session with no agent, in the human's Turn, holding `threads`.
+fn pull_request_alone(threads: Vec<Thread>) -> SessionView {
+    with_threads(pull_request(None, Turn::Human, None), threads)
+}
+
+#[test]
+fn a_pull_request_alone_with_a_draft_is_abandoned() {
+    let draft = thread("T1", vec![comment(Party::Human, None)]);
+    let session = pull_request_alone(vec![draft]);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Abandon);
+}
+
+#[test]
+fn a_pull_request_alone_with_a_co_reviewer_draft_not_kept_yet_is_abandoned() {
+    let agent_draft = thread("T1", vec![comment(Party::Agent, None)]);
+    let session = pull_request_alone(vec![agent_draft]);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Abandon);
+}
+
+#[test]
+fn a_pull_request_alone_with_a_thread_resolved_here_but_open_on_the_forge_is_abandoned() {
+    let resolved_here = forge_thread(false, Some(Party::Human));
+    let session = pull_request_alone(vec![resolved_here]);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Abandon);
+}
+
+#[test]
+fn a_pull_request_alone_with_a_thread_reopened_here_but_resolved_on_the_forge_is_abandoned() {
+    let reopened_here = forge_thread(true, None);
+    let session = pull_request_alone(vec![reopened_here]);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Abandon);
+}
+
+#[test]
+fn a_pull_request_alone_whose_threads_match_the_forge_closes() {
+    let threads =
+        vec![forge_thread(false, None), Thread { id: ThreadId::new("T2"), ..forge_thread(true, Some(Party::Human)) }];
+    let session = pull_request_alone(threads);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Close);
+}
+
+#[test]
+fn a_pull_request_with_a_co_reviewer_is_abandoned_even_with_nothing_unpublished() {
+    let session = pull_request(Some(Role::CoReviewer), Turn::Human, None);
+
+    let end = session.actions().end;
+
+    assert_eq!(end, EndAction::Abandon, "its co-Reviewer is told to stop");
 }
 
 // --- Threads ---
