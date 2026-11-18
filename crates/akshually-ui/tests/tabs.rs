@@ -259,7 +259,10 @@ fn closing_the_tab_of_a_pull_request_with_drafts_asks_before_discarding_them() {
     press_close(&mut rt, &id);
 
     let asked = texts_within(&rt, "end-confirm");
-    assert!(asked.contains(&"Close this Session? Your Drafts are discarded.".to_owned()), "asked {asked:?}");
+    assert!(
+        asked.contains(&"Close this Session? Your unpublished changes are discarded.".to_owned()),
+        "asked {asked:?}"
+    );
     assert!(asked.contains(&"Close Session".to_owned()), "no Close Session button in {asked:?}");
     assert!(service.session(&id).is_some(), "it closed before the human confirmed");
 }
@@ -273,7 +276,8 @@ fn closing_the_tab_of_a_pull_request_with_a_co_reviewer_says_it_is_told_to_stop(
     press_close(&mut rt, pending.session());
 
     let asked = texts_within(&rt, "end-confirm");
-    let question = "Close this Session? Your Drafts are discarded. The co-Reviewer is told to stop.".to_owned();
+    let question =
+        "Close this Session? Your unpublished changes are discarded. The co-Reviewer is told to stop.".to_owned();
     assert!(asked.contains(&question), "asked {asked:?}");
 }
 

@@ -1410,8 +1410,8 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .children(tab.actions.hand_over.map(|hand_over| hand_over_button(k, tab, hand_over)))
 }
 
-/// Asks the human to confirm abandoning a Session (or closing a Pull Request Session before
-/// Publish), which can't be undone. Cancel keeps everything.
+/// Asks the human to confirm abandoning a Session (or closing a Pull Request Session that holds
+/// something not Published, or has a co-Reviewer), which can't be undone. Cancel keeps everything.
 fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
     if s.confirming_end.as_ref() != Some(&session.id) {
         return None;
@@ -1420,7 +1420,7 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
         Some(_) => {
             let agent = if session.agent.is_some() { " The co-Reviewer is told to stop." } else { "" };
             // "Session", not "Pull Request": nothing changes on the Forge (#86).
-            (format!("Close this Session? Your Drafts are discarded.{agent}"), "Close Session")
+            (format!("Close this Session? Your unpublished changes are discarded.{agent}"), "Close Session")
         }
         None => ("Abandon this Session? The agent is told to stop.".to_owned(), "Abandon"),
     };

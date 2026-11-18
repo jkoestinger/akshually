@@ -998,7 +998,8 @@ impl Service {
 
     /// Human: closes the Session without a Verdict and tells the agent to stop.
     /// A Pull Request Session with no agent has no one to tell, and a co-review of local work
-    /// has no Verdict: abandoning either closes it.
+    /// has no Verdict: abandoning either closes it. The UI asks first only when `actions().end`
+    /// is `Abandon`, which for a Pull Request means it has a co-Reviewer or something unpublished.
     pub fn abandon(&self, id: &SessionId) -> Result<(), Error> {
         let (end, pull_request) = {
             let inner = self.lock();
@@ -1018,7 +1019,8 @@ impl Service {
     /// Human: closes the Session. One that has its outcome already (a Verdict, Published,
     /// Abandoned) and whose agent hasn't collected it goes at once, outcome and all: the agent's
     /// next `review` then starts a new Session. Otherwise a Pull Request Session closes Published
-    /// or not, its unpublished Drafts going with it, and its co-Reviewer is told it was Abandoned;
+    /// or not, its unpublished Drafts, Resolves and Reopens going with it, and its co-Reviewer is
+    /// told it was Abandoned;
     /// closing a co-review of local work is its normal end, which its co-Reviewer is told as
     /// Closed. Local work under Review by its Author ends with a Verdict or by abandoning it.
     pub fn close(&self, id: &SessionId) -> Result<(), Error> {

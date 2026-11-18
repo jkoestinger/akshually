@@ -5,8 +5,8 @@ use super::{Role, SessionView, Source, Turn};
 use crate::Error;
 use crate::thread::{Comment, Thread, ThreadId};
 
-/// What the human can do in a Session now, worked out from its Source, agent role, Turn and
-/// whether it has ended. The service refuses every action this doesn't offer.
+/// What the human can do in a Session now, worked out from its Source, agent role, Turn,
+/// whether it has ended and, for a Pull Request, whether it holds something unpublished. The service refuses every action this doesn't offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionActions {
     /// The Verdict, or what stands in for it; `None` when neither applies: a Pull Request takes
@@ -39,12 +39,12 @@ pub enum VerdictAction {
 /// How the human ends a Session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndAction {
-    /// Closing is a normal end: the Session has its outcome already, or it's a co-review of
-    /// local work, which has no Verdict.
+    /// Closing is a normal end: the Session has its outcome already, it's a co-review of local
+    /// work, which has no Verdict, or it's a Pull Request with no agent and nothing unpublished.
     Close,
     /// Ending now loses something, so the human confirms first: local work's Author is told
-    /// it was Abandoned, and a Pull Request not Published yet loses its Drafts (and its
-    /// co-Reviewer is told it was Abandoned).
+    /// it was Abandoned, and a Pull Request not Published yet loses its Drafts and its Resolves
+    /// and Reopens not sent to the Forge (and its co-Reviewer is told it was Abandoned).
     Abandon,
 }
 
@@ -87,6 +87,8 @@ impl SessionView {
         let end = match &self.source {
             _ if ended => EndAction::Close,
             Source::Local { .. } if self.agent == Some(Role::CoReviewer) => EndAction::Close,
+            // Nothing to lose and no one to tell (#90).
+            Source::PullRequest(_) if self.agent.is_none() && !self.has_unpublished() => EndAction::Close,
             _ => EndAction::Abandon,
         };
         let hand_over = self.agent.map(|_| {

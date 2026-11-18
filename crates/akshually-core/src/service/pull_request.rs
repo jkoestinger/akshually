@@ -338,10 +338,10 @@ impl Drafts {
     fn of(view: &SessionView) -> Self {
         let (mut kept, mut discarded, mut resolve, mut reopen) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for thread in &view.threads {
-            match &thread.forge {
-                Some(forge) if !forge.resolved && thread.resolved.is_some() => resolve.push(thread.clone()),
-                Some(forge) if forge.resolved && thread.resolved.is_none() => reopen.push(thread.clone()),
-                _ => {}
+            match resolves_on_forge(thread) {
+                Some(true) => resolve.push(thread.clone()),
+                Some(false) => reopen.push(thread.clone()),
+                None => {}
             }
             let mut drafts: Vec<Comment> = thread.comments.iter().filter(|c| c.is_draft()).cloned().collect();
             if drafts.is_empty() {
@@ -367,6 +367,23 @@ impl Drafts {
             list.push(Thread { comments: drafts, ..thread.clone() });
         }
         Drafts { kept, discarded, resolve, reopen }
+    }
+}
+
+/// How Publish changes `thread`'s Resolved state on the Forge: `Some(true)` resolves it there
+/// (the human resolved it here), `Some(false)` reopens it (they reopened it here), and `None`
+/// leaves it, as for a Thread not on the Forge.
+fn resolves_on_forge(thread: &Thread) -> Option<bool> {
+    let forge = thread.forge.as_ref()?;
+    let here = thread.resolved.is_some();
+    (here != forge.resolved).then_some(here)
+}
+
+impl SessionView {
+    /// Whether the Session holds something not Published: a Draft (the human's, or the
+    /// co-Reviewer's not kept yet), or a Resolve or Reopen Publish would send to the Forge.
+    pub(super) fn has_unpublished(&self) -> bool {
+        self.drafts() > 0 || self.threads.iter().any(|t| resolves_on_forge(t).is_some())
     }
 }
 
