@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rune::{AppHandle, AppSpec, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
+use rune::{AppHandle, AppSpec, Chrome, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
 use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
@@ -44,6 +44,23 @@ const PUBLISH_LIST_MIN_HEIGHT: f32 = 120.0;
 const PUBLISH_DIALOG_CHROME: f32 = 428.0;
 /// How opaque a discarded Draft's card is in the Publish dialog, muted next to what goes out.
 const DISCARDED_OPACITY: f32 = 0.6;
+/// The tab bar's height in points: it is the window's title bar on macOS.
+const TAB_BAR_HEIGHT: f32 = 40.0;
+/// How far the macOS traffic lights sit from the window's top and leading edges, in points:
+/// centred on the tab bar, and as far in from the side as from the top.
+const TRAFFIC_LIGHTS_INSET: f32 = (TAB_BAR_HEIGHT - Chrome::TRAFFIC_LIGHT) / 2.0;
+/// The space between the traffic lights and the first tab, in points, as Rune's own shell keeps.
+const TRAFFIC_LIGHTS_GAP: f32 = 8.0;
+
+/// The window's frame. On macOS the tab bar is the title bar, as in a browser (#85): the content
+/// fills the window, the traffic lights sit in the tab bar, and only `.window_drag()` regions move
+/// the window, so the tabs under the title bar stay clickable. Other platforms keep their native
+/// frame.
+pub const WINDOW_CHROME: Chrome = Chrome {
+    full_size_content: true,
+    traffic_lights: Some((TRAFFIC_LIGHTS_INSET, TRAFFIC_LIGHTS_INSET)),
+    drag_regions: true,
+};
 
 mod mono_font;
 mod notifier;
@@ -91,6 +108,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         .init(move || State::new(init_service).headless(headless))
         // The app outlives its window: agents keep calling in (ADR 0002).
         .keep_running()
+        .chrome(WINDOW_CHROME)
         // Notifications are for when the human looks elsewhere.
         .on_focus(|s: &mut State, focused, _| s.service.set_window_focused(focused));
     let handle = app.handle();
@@ -800,13 +818,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             }
         })
         .build_layered(k, &mut layer);
+    // Clear of the macOS traffic lights; flush with the leading edge in full screen and on other
+    // platforms, where Rune reports no inset (#85).
+    let lights = cx.titlebar_inset();
     let tab_bar = row()
-        .h(40.0)
+        .h(TAB_BAR_HEIGHT)
         .w_full()
         .gap(8.0)
+        .pl(if lights > 0.0 { lights + TRAFFIC_LIGHTS_GAP } else { 0.0 })
         .pr(8.0)
         .items_center()
-        .child(row().key("tabbar").h(40.0).grow(1.0).min_w(0.0).child(tabs));
+        // Its empty part moves the window; tabs and the Pull Request opener keep their presses.
+        .window_drag()
+        .child(row().key("tabbar").h(TAB_BAR_HEIGHT).grow(1.0).min_w(0.0).child(tabs));
     let agent = theme::tokens(cx.system_dark()).color("state-agent");
     let body = match s.displayed_tab() {
         Some(tab) => col()
