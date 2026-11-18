@@ -334,6 +334,10 @@ impl Position {
 }
 
 impl ForgeAdapter for GitLab {
+    fn host(&self) -> &str {
+        self.client.host()
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         let url = Url::parse(url).ok()?;
         if !host_matches(&url, self.client.host()) {
@@ -494,7 +498,7 @@ impl ForgeAdapter for GitLab {
         sent.map(|()| mr.web_url)
     }
 
-    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
+    fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
         let me = self.viewer()?;
         let mut items = self.merge_requests("reviewer_username", &me, InboxRole::Reviewer)?;
         for item in self.merge_requests("assignee_username", &me, InboxRole::Assignee)? {
@@ -514,7 +518,7 @@ impl ForgeAdapter for GitLab {
                 item.verdict_given |= reviewers.iter().any(|r| r.user.username == me && r.verdict_given());
             }
         }
-        Ok(items)
+        Ok(Some(items))
     }
 }
 

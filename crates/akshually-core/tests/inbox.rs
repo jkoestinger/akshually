@@ -13,17 +13,22 @@ use akshually_testkit::{TestDirs, TestRepo, wait_until};
 #[derive(Clone)]
 struct FakeForge {
     host: &'static str,
-    inbox: Arc<Mutex<Result<Vec<InboxItem>, String>>>,
+    /// `None` while the host isn't set up.
+    inbox: Arc<Mutex<Result<Option<Vec<InboxItem>>, String>>>,
     asked: Arc<Mutex<u32>>,
 }
 
 impl FakeForge {
     fn new(host: &'static str) -> Self {
-        FakeForge { host, inbox: Arc::new(Mutex::new(Ok(Vec::new()))), asked: Arc::default() }
+        FakeForge { host, inbox: Arc::new(Mutex::new(Ok(Some(Vec::new())))), asked: Arc::default() }
     }
 
     fn lists(&self, items: Vec<InboxItem>) {
-        *self.inbox.lock().unwrap() = Ok(items);
+        *self.inbox.lock().unwrap() = Ok(Some(items));
+    }
+
+    fn not_set_up(&self) {
+        *self.inbox.lock().unwrap() = Ok(None);
     }
 
     fn fails(&self) {
@@ -52,6 +57,10 @@ impl FakeForge {
 }
 
 impl ForgeAdapter for FakeForge {
+    fn host(&self) -> &str {
+        self.host
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         let number = url.strip_prefix(&format!("https://{}/acme/web/pull/", self.host))?;
         Some(PullRequestRef { host: self.host.into(), repo: "acme/web".into(), number: number.parse().ok()? })
@@ -77,7 +86,7 @@ impl ForgeAdapter for FakeForge {
         Ok(Vec::new())
     }
 
-    fn inbox(&self) -> Result<Vec<InboxItem>, ForgeError> {
+    fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
         *self.asked.lock().unwrap() += 1;
         self.inbox.lock().unwrap().clone().map_err(|message| ForgeError::Http { host: self.host.into(), message })
     }
@@ -150,6 +159,36 @@ fn a_host_that_fails_keeps_its_last_rows_and_reports_why() {
     let errors = svc.inbox().errors;
     assert_eq!(errors.len(), 1);
     assert!(errors[0].contains("github.example.com"), "{errors:?}");
+}
+
+#[test]
+fn a_host_that_is_not_set_up_is_skipped_without_rows_or_an_error() {
+    let (github, gitlab) = (FakeForge::new("github.com"), FakeForge::new("gitlab.example.com"));
+    github.not_set_up();
+    gitlab.lists(vec![gitlab.item(9, InboxRole::Reviewer, 200)]);
+    let svc = service(&[&github, &gitlab]);
+
+    svc.refresh_inbox();
+
+    let inbox = svc.inbox();
+    let rows: Vec<_> = listed(&svc).into_iter().map(|(host, n, _)| (host, n)).collect();
+    assert_eq!(rows, vec![("gitlab.example.com".into(), 9)]);
+    assert!(inbox.errors.is_empty(), "{:?}", inbox.errors);
+    assert_eq!(inbox.hosts, vec!["gitlab.example.com".to_owned()]);
+}
+
+#[test]
+fn the_inbox_names_the_hosts_it_asked_that_answered_or_failed() {
+    let (github, enterprise, gitlab) =
+        (FakeForge::new("github.com"), FakeForge::new("github.example.com"), FakeForge::new("gitlab.example.com"));
+    enterprise.fails();
+    gitlab.not_set_up();
+    let svc = service(&[&github, &enterprise, &gitlab]);
+    assert!(svc.inbox().hosts.is_empty(), "no host asked before the first refresh");
+
+    svc.refresh_inbox();
+
+    assert_eq!(svc.inbox().hosts, vec!["github.com".to_owned(), "github.example.com".to_owned()]);
 }
 
 #[test]

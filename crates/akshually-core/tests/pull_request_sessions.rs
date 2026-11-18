@@ -23,6 +23,10 @@ fn pr_ref() -> PullRequestRef {
 }
 
 impl ForgeAdapter for FakeForge {
+    fn host(&self) -> &str {
+        "forge.test"
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         url.starts_with("https://forge.test/acme/web/pull/7").then(pr_ref)
     }
@@ -218,6 +222,10 @@ fn drafts_on_a_pull_request_session_are_kept_in_the_session() {
 fn a_forge_failure_opens_no_session() {
     struct Down;
     impl ForgeAdapter for Down {
+        fn host(&self) -> &str {
+            "forge.test"
+        }
+
         fn recognise(&self, _: &str) -> Option<PullRequestRef> {
             Some(pr_ref())
         }

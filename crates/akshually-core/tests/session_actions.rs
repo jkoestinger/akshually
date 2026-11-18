@@ -32,6 +32,10 @@ fn pr() -> PullRequest {
 struct FakeForge;
 
 impl ForgeAdapter for FakeForge {
+    fn host(&self) -> &str {
+        "forge.test"
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         url.starts_with(PR_URL).then(|| pr().id)
     }
