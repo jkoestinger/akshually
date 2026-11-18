@@ -338,9 +338,9 @@ impl Drafts {
     fn of(view: &SessionView) -> Self {
         let (mut kept, mut discarded, mut resolve, mut reopen) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for thread in &view.threads {
-            match resolves_on_forge(thread) {
-                Some(true) => resolve.push(thread.clone()),
-                Some(false) => reopen.push(thread.clone()),
+            match forge_change(thread) {
+                Some(ForgeChange::Resolve) => resolve.push(thread.clone()),
+                Some(ForgeChange::Reopen) => reopen.push(thread.clone()),
                 None => {}
             }
             let mut drafts: Vec<Comment> = thread.comments.iter().filter(|c| c.is_draft()).cloned().collect();
@@ -370,20 +370,31 @@ impl Drafts {
     }
 }
 
-/// How Publish changes `thread`'s Resolved state on the Forge: `Some(true)` resolves it there
-/// (the human resolved it here), `Some(false)` reopens it (they reopened it here), and `None`
-/// leaves it, as for a Thread not on the Forge.
-fn resolves_on_forge(thread: &Thread) -> Option<bool> {
+/// How Publish changes a Thread's Resolved state on the Forge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForgeChange {
+    /// The human resolved it here, and it's open on the Forge.
+    Resolve,
+    /// The human reopened it here, and it's Resolved on the Forge.
+    Reopen,
+}
+
+/// How Publish changes `thread`'s Resolved state on the Forge; `None` when it agrees with the
+/// Forge's, or the Thread isn't on the Forge.
+fn forge_change(thread: &Thread) -> Option<ForgeChange> {
     let forge = thread.forge.as_ref()?;
-    let here = thread.resolved.is_some();
-    (here != forge.resolved).then_some(here)
+    match (thread.resolved.is_some(), forge.resolved) {
+        (true, false) => Some(ForgeChange::Resolve),
+        (false, true) => Some(ForgeChange::Reopen),
+        _ => None,
+    }
 }
 
 impl SessionView {
     /// Whether the Session holds something not Published: a Draft (the human's, or the
-    /// co-Reviewer's not kept yet), or a Resolve or Reopen Publish would send to the Forge.
+    /// co-Reviewer's not kept yet), or a Thread resolved or reopened here but not on the Forge.
     pub(super) fn has_unpublished(&self) -> bool {
-        self.drafts() > 0 || self.threads.iter().any(|t| resolves_on_forge(t).is_some())
+        self.drafts() > 0 || self.threads.iter().any(|t| forge_change(t).is_some())
     }
 }
 

@@ -6,7 +6,8 @@ use crate::Error;
 use crate::thread::{Comment, Thread, ThreadId};
 
 /// What the human can do in a Session now, worked out from its Source, agent role, Turn,
-/// whether it has ended and, for a Pull Request, whether it holds something unpublished. The service refuses every action this doesn't offer.
+/// whether it has ended and, for a Pull Request, whether it holds something unpublished. The
+/// service refuses every action this doesn't offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionActions {
     /// The Verdict, or what stands in for it; `None` when neither applies: a Pull Request takes
@@ -43,8 +44,8 @@ pub enum EndAction {
     /// work, which has no Verdict, or it's a Pull Request with no agent and nothing unpublished.
     Close,
     /// Ending now loses something, so the human confirms first: local work's Author is told
-    /// it was Abandoned, and a Pull Request not Published yet loses its Drafts and its Resolves
-    /// and Reopens not sent to the Forge (and its co-Reviewer is told it was Abandoned).
+    /// it was Abandoned, and a Pull Request not Published yet loses its Drafts and the resolves
+    /// and reopens of Threads it didn't Publish (and its co-Reviewer is told it was Abandoned).
     Abandon,
 }
 

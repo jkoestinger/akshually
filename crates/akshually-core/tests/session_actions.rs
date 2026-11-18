@@ -209,10 +209,15 @@ fn forge_thread(on_forge_resolved: bool, resolved: Option<Party>) -> Thread {
     Thread { resolved, forge, ..thread("T1", vec![comment(Party::Other("lee".into()), Some(1))]) }
 }
 
+/// A Pull Request Session with no agent, in the human's Turn, holding `threads`.
+fn pull_request_alone(threads: Vec<Thread>) -> SessionView {
+    with_threads(pull_request(None, Turn::Human, None), threads)
+}
+
 #[test]
 fn a_pull_request_alone_with_a_draft_is_abandoned() {
     let draft = thread("T1", vec![comment(Party::Human, None)]);
-    let session = with_threads(pull_request(None, Turn::Human, None), vec![draft]);
+    let session = pull_request_alone(vec![draft]);
 
     let end = session.actions().end;
 
@@ -222,7 +227,7 @@ fn a_pull_request_alone_with_a_draft_is_abandoned() {
 #[test]
 fn a_pull_request_alone_with_a_co_reviewer_draft_not_kept_yet_is_abandoned() {
     let agent_draft = thread("T1", vec![comment(Party::Agent, None)]);
-    let session = with_threads(pull_request(None, Turn::Human, None), vec![agent_draft]);
+    let session = pull_request_alone(vec![agent_draft]);
 
     let end = session.actions().end;
 
@@ -232,7 +237,7 @@ fn a_pull_request_alone_with_a_co_reviewer_draft_not_kept_yet_is_abandoned() {
 #[test]
 fn a_pull_request_alone_with_a_thread_resolved_here_but_open_on_the_forge_is_abandoned() {
     let resolved_here = forge_thread(false, Some(Party::Human));
-    let session = with_threads(pull_request(None, Turn::Human, None), vec![resolved_here]);
+    let session = pull_request_alone(vec![resolved_here]);
 
     let end = session.actions().end;
 
@@ -242,7 +247,7 @@ fn a_pull_request_alone_with_a_thread_resolved_here_but_open_on_the_forge_is_aba
 #[test]
 fn a_pull_request_alone_with_a_thread_reopened_here_but_resolved_on_the_forge_is_abandoned() {
     let reopened_here = forge_thread(true, None);
-    let session = with_threads(pull_request(None, Turn::Human, None), vec![reopened_here]);
+    let session = pull_request_alone(vec![reopened_here]);
 
     let end = session.actions().end;
 
@@ -253,7 +258,7 @@ fn a_pull_request_alone_with_a_thread_reopened_here_but_resolved_on_the_forge_is
 fn a_pull_request_alone_whose_threads_match_the_forge_closes() {
     let threads =
         vec![forge_thread(false, None), Thread { id: ThreadId::new("T2"), ..forge_thread(true, Some(Party::Human)) }];
-    let session = with_threads(pull_request(None, Turn::Human, None), threads);
+    let session = pull_request_alone(threads);
 
     let end = session.actions().end;
 
