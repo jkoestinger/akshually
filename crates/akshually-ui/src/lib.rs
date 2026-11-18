@@ -547,8 +547,8 @@ impl State {
         }
     }
 
-    /// Human, from the ✕ on its tab: ends the Session as its end action says, asking first when
-    /// that can't be undone. The question shows with the Session it is about, so that Session
+    /// Human, from the ✕ on its tab or the header's Abandon: ends the Session as its end action
+    /// says, asking first when that can't be undone. The question shows with the Session it is about, so that Session
     /// shows first.
     fn end(&mut self, id: SessionId) {
         let Some(tab) = self.tab(&id) else { return };
@@ -713,6 +713,11 @@ impl State {
         }
     }
 
+    /// The Session whose tab in the strip is keyed `tab`; `None` for the Inbox's.
+    fn tab_session(&self, tab: &str) -> Option<SessionId> {
+        self.tabs.iter().find(|t| t.session.id.as_str() == tab).map(|t| t.session.id.clone())
+    }
+
     fn tab(&self, id: &SessionId) -> Option<&SessionTab> {
         self.tabs.iter().find(|t| &t.session.id == id)
     }
@@ -808,12 +813,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .on_select(|s: &mut State, id: &str, _| {
             if id == INBOX_TAB {
                 s.open_inbox();
-            } else if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone()) {
+            } else if let Some(id) = s.tab_session(id) {
                 s.open_tab(id);
             }
         })
         .on_close(|s: &mut State, id: &str, _| {
-            if let Some(id) = s.tabs.iter().find(|t| t.session.id.as_str() == id).map(|t| t.session.id.clone()) {
+            if let Some(id) = s.tab_session(id) {
                 s.end(id);
             }
         })
@@ -1324,8 +1329,8 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 
 /// A Session's header: its branch and the base of the Changeset shown, Round and Turn, the
 /// Changeset views it offers, and the actions that abandon it, give the Verdict or hand the Turn
-/// over; closing it is its tab's ✕. A Pull Request
-/// Session has its own header. The view dropdown's list goes into `layer`.
+/// over; closing it is its tab's ✕. A Pull Request Session has its own header. The view
+/// dropdown's list goes into `layer`.
 fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
@@ -1350,7 +1355,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let abandon = (tab.actions.end == EndAction::Abandon).then(|| {
         Button::new("Abandon")
             .variant(ButtonVariant::Ghost)
-            .on_press(move |s: &mut State| s.confirming_end = Some(end_id.clone()))
+            .on_press(move |s: &mut State| s.end(end_id.clone()))
             .build(k)
     });
     let view_select = view_dropdown(k, tab, layer);

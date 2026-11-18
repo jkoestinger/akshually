@@ -261,6 +261,19 @@ fn closing_the_tab_of_a_pull_request_with_drafts_asks_before_discarding_them() {
 }
 
 #[test]
+fn closing_the_tab_of_a_pull_request_with_a_co_reviewer_says_it_is_told_to_stop() {
+    let service = Arc::new(Service::new().with_forges(vec![Box::new(FakeForge)]));
+    let pending = service.review(ReviewRequest::pull_request(PR_URL)).unwrap();
+    let mut rt = window(&service);
+
+    press_close(&mut rt, pending.session());
+
+    let asked = texts_within(&rt, "end-confirm");
+    let question = "Close this Session? Your Drafts are discarded. The co-Reviewer is told to stop.".to_owned();
+    assert!(asked.contains(&question), "asked {asked:?}");
+}
+
+#[test]
 fn confirming_the_close_of_a_pull_requests_tab_closes_its_session() {
     let (service, id) = pull_request_with_a_draft();
     let mut rt = window(&service);
@@ -309,7 +322,7 @@ fn a_local_co_reviews_header_has_no_close_button() {
 }
 
 #[test]
-fn local_works_header_still_offers_abandon() {
+fn local_works_header_offers_abandon_instead_of_close() {
     let repo = repo_with_one_edit();
     let service = Arc::new(Service::new());
     let _pending = service.review(ReviewRequest::new(repo.path())).unwrap();
@@ -318,6 +331,7 @@ fn local_works_header_still_offers_abandon() {
 
     let header = texts_within(&rt, "session-header");
     assert!(header.contains(&"Abandon".to_owned()), "no Abandon button in {header:?}");
+    assert!(!header.contains(&"Close".to_owned()), "a Close button in {header:?}");
 }
 
 #[test]
