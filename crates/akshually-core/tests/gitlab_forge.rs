@@ -144,6 +144,26 @@ fn configured_gitlab_hosts_serve_their_own_urls() {
     assert!(forges.iter().any(|f| f.recognise("https://github.com/acme/web/pull/482").is_some()), "github.com stays");
 }
 
+#[test]
+fn a_turned_off_host_has_no_adapter_and_its_urls_are_not_recognised() {
+    let dirs = TestDirs::new();
+    let file = dirs.path().join("config.toml");
+    std::fs::write(&file, "[[hosts]]\nkind = \"gitlab\"\nhost = \"gitlab.example.com\"\nenabled = false\n").unwrap();
+    let settings = Settings::load(&file).unwrap();
+    let sources = CredentialSources {
+        config: "/home/me/.config/akshually/config.toml".into(),
+        gh: "/nonexistent".into(),
+        glab: "/nonexistent".into(),
+        env: HashMap::new(),
+    };
+
+    let forges = adapters(&settings.hosts, &sources);
+
+    let url = "https://gitlab.example.com/platform/infra/-/merge_requests/97";
+    assert!(forges.iter().all(|f| f.recognise(url).is_none()), "a turned-off host's URL is recognised");
+    assert_eq!(forges.len(), 1, "only github.com is left");
+}
+
 // --- Merge request, Changeset, Threads ---
 
 impl Harness {
@@ -421,7 +441,7 @@ fn the_inbox_lists_review_requests_then_assignments_once_each() {
     let assigned = h.merge_requests(("assignee_username", "me"), &fixture("mrs-assignee.json"));
     h.none_reviewed();
 
-    let inbox = gitlab.inbox().unwrap();
+    let inbox = gitlab.inbox().unwrap().unwrap();
 
     requested.assert();
     assigned.assert();
@@ -448,7 +468,7 @@ fn inbox_times_are_seconds_since_the_epoch() {
     h.merge_requests(("assignee_username", "me"), "[]");
     h.none_reviewed();
 
-    let inbox = gitlab.inbox().unwrap();
+    let inbox = gitlab.inbox().unwrap().unwrap();
 
     // 2026-11-11T09:00:00Z and 2026-11-12T08:15:30Z.
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_387_600, 1_794_471_330));
@@ -463,7 +483,7 @@ fn inbox_of_one_review_request(h: &mut Harness) -> Vec<InboxItem> {
     let reviewer_mrs: Vec<Value> = serde_json::from_str(&fixture("mrs-reviewer.json")).unwrap();
     h.merge_requests(("reviewer_username", "me"), &json!([reviewer_mrs[0]]).to_string());
     h.merge_requests(("assignee_username", "me"), "[]");
-    gitlab.inbox().unwrap()
+    gitlab.inbox().unwrap().unwrap()
 }
 
 #[test]
@@ -522,7 +542,7 @@ fn an_assignment_the_human_approved_is_done() {
     h.merge_requests(("assignee_username", "me"), &json!([assigned[0]]).to_string());
     h.mr_approvals(("acme/docs", 12), false, &["me"], true);
 
-    let inbox = gitlab.inbox().unwrap();
+    let inbox = gitlab.inbox().unwrap().unwrap();
 
     assert!(inbox[0].verdict_given, "{inbox:?}");
 }
