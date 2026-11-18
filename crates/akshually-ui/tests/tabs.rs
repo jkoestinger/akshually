@@ -197,6 +197,10 @@ const PR_URL: &str = "https://forge.test/acme/web/pull/7";
 struct FakeForge;
 
 impl ForgeAdapter for FakeForge {
+    fn host(&self) -> &str {
+        "forge.test"
+    }
+
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
         url.starts_with(PR_URL).then(|| PullRequestRef {
             host: "forge.test".into(),

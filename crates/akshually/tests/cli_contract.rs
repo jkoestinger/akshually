@@ -11,7 +11,7 @@ use akshually_core::Settings;
 use akshually_core::ipc::{self, ClientError, ErrorCode, HumanCommand};
 use akshually_core::{Anchor, Party, Side, ThreadRef};
 use akshually_testkit::{TestDirs, TestRepo, wait_until};
-use support::{HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
+use support::{AppProcess, HostedApp, LaunchedApp, PR_URL, TIMEOUT, finish, finish_with_stdin, still_running};
 
 const EXIT_ERROR: i32 = 1;
 
@@ -365,26 +365,70 @@ fn an_app_on_the_same_state_dir_with_another_runtime_dir_is_refused_with_a_clear
     assert_eq!(finish(call).status.code(), Some(0));
 }
 
-#[test]
-fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
+/// More connections than an app under any of [`FD_LIMITS`] has descriptors for.
+const CONNECTIONS: usize = 32;
+/// The `ulimit -n` values the app runs out under. An app that needed two descriptors for each
+/// connection would be left with one under every other limit, and cut clients off there (#91).
+#[cfg(target_os = "linux")]
+const FD_LIMITS: std::ops::RangeInclusive<u32> = 13..=18;
+/// How many times the app logs running out of file descriptors before the test goes on: each
+/// time, an app that cuts connections off has had the chance to cut another one.
+#[cfg(target_os = "linux")]
+const OUT_OF_FDS_LOGS_AWAITED: usize = 3;
+
+/// Runs the app headless under `ulimit -n limit` and waits until it listens. Also returns the
+/// lines of its stderr that log running out of file descriptors (`EMFILE`).
+fn app_with_fd_limit(limit: u32) -> (LaunchedApp, AppProcess, mpsc::Receiver<String>) {
     let app = LaunchedApp::new();
-    let mut process = app.spawn_app_with_fd_limit(16);
-    let log = BufReader::new(process.0.stderr.take().unwrap());
+    let mut process = app.spawn_app_with_fd_limit(limit);
+    let log = BufReader::new(process.0.stderr.take().expect("the app's stderr is piped"));
     let (lines, logged) = mpsc::channel();
     std::thread::spawn(move || {
         let mut emfile = log.lines().map_while(Result::ok).filter(|line| line.contains("os error 24"));
         emfile.try_for_each(|line| lines.send(line))
     });
     app.wait_for("the app to listen", |_| true);
+    (app, process, logged)
+}
 
-    // Each idle connection holds some of the app's file descriptors until it closes.
-    let idle: Vec<_> = (0..32).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
+#[test]
+fn the_app_keeps_serving_after_running_out_of_file_descriptors() {
+    let (app, process, logged) = app_with_fd_limit(16);
+
+    // Each idle connection holds one of the app's file descriptors until it closes.
+    let idle: Vec<_> = (0..CONNECTIONS).map(|_| UnixStream::connect(app.paths().socket()).unwrap()).collect();
     let out_of_fds = logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
     drop(idle);
     let answered = wait_until(TIMEOUT, "the app to answer again", || app.state());
 
     assert!(out_of_fds.starts_with("akshually: "), "logged: {out_of_fds}");
     assert_eq!(answered.pid, process.0.id(), "another app answered");
+}
+
+// Linux only: when `accept` runs out of descriptors, macOS closes the queued connection on
+// purpose rather than leave it queued (XNU's `accept_nocancel`, "Drop the socket"), so no app
+// can keep that client waiting there (#91).
+#[cfg(target_os = "linux")]
+#[test]
+fn clients_queued_past_the_file_descriptor_limit_are_served_once_descriptors_free_up() {
+    for limit in FD_LIMITS {
+        let (app, process, logged) = app_with_fd_limit(limit);
+        let clients: Vec<_> = (0..CONNECTIONS).map(|_| ipc::connect(&app.paths()).unwrap()).collect();
+        for _ in 0..OUT_OF_FDS_LOGS_AWAITED {
+            logged.recv_timeout(TIMEOUT).expect("the app logs running out of file descriptors");
+        }
+
+        // Each answered client frees its descriptor for the next one in the queue.
+        let calls: Vec<_> = clients.into_iter().map(|c| std::thread::spawn(move || c.test_state())).collect();
+
+        for call in calls {
+            let state = call.join().unwrap();
+            assert!(
+                matches!(state, Ok(ref s) if s.pid == process.0.id()),
+                "under `ulimit -n {limit}`, a queued client was cut off: {state:?}"
+            );
+        }
+    }
 }
 
 #[test]
