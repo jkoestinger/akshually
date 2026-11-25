@@ -334,7 +334,10 @@ fn n_and_p_typed_in_a_reply_composer_are_text_and_move_nothing() {
 fn n_and_p_typed_in_the_search_field_are_text_and_move_nothing() {
     let repo = repo_with_a_long_change();
     let (_service, _id, mut rt) = review_with_three_threads(&repo);
-    rt.key(KeyEvent { key: Key::Command('f'), mods: Mods { cmd: true, ctrl: !cfg!(target_os = "macos"), ..Mods::default() } });
+    rt.key(KeyEvent {
+        key: Key::Command('f'),
+        mods: Mods { cmd: true, ctrl: !cfg!(target_os = "macos"), ..Mods::default() },
+    });
     rt.frame(0.0);
     assert!(rt.find("search-field").is_some(), "Ctrl+F didn't open the search field");
 

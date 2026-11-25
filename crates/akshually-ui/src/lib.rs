@@ -454,12 +454,12 @@ impl State {
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
         }
-        if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
-            self.confirming_end = None;
-        }
-        if self.confirming_approve.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
-            self.confirming_approve = None;
-        }
+        let tabs = &self.tabs;
+        self.confirming_end.take_if(|id| !tabs.iter().any(|t| &t.session.id == id));
+        // Once approving has nothing to discard (the Round went over, say), the question is over:
+        // it must not come back with the next Draft, unasked.
+        self.confirming_approve
+            .take_if(|id| !tabs.iter().any(|t| &t.session.id == id && t.actions.discarded_by_approving > 0));
         self.annotate();
         self.displayed = displayed;
         self.inbox = inbox;
