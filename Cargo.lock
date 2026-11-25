@@ -117,6 +117,7 @@ dependencies = [
  "akshually-ui",
  "anyhow",
  "clap",
+ "dirs",
  "png 0.18.1",
  "serde_json",
 ]
