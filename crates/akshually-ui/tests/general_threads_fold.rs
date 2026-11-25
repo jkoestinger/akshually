@@ -3,12 +3,16 @@
 
 use std::sync::Arc;
 
+use rune::Runtime;
 use rune::accesskit::Action;
-use rune::{Env, Runtime};
 
 use akshually_core::{Anchor, ReviewRequest, Service, SessionId, Side, ThreadRef};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
+
+mod common;
+
+use common::window;
 
 /// A repository on a feature branch with one commit ahead of `main`.
 fn repo_on_a_feature_branch() -> TestRepo {
@@ -16,13 +20,6 @@ fn repo_on_a_feature_branch() -> TestRepo {
     repo.write("lib.rs", "fn a() {}\n").commit_all("base");
     repo.branch("feature").write("lib.rs", "fn a() {}\nfn b() {}\n").commit_all("add b");
     repo
-}
-
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
 }
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.

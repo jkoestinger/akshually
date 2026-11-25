@@ -7,25 +7,21 @@
 use std::sync::Arc;
 
 use rune::accesskit::Action;
-use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune::{Key, KeyEvent, Mods, Runtime};
 
 use akshually_core::{Anchor, ReviewRequest, Service, SessionId, Side};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A headless window over `service`, its first frame built, with the app's key handler wired.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.on_key = Some(akshually_ui::on_key);
-    rt.frame(0.0);
-    rt
-}
+mod common;
+
+use common::window_with_keys;
 
 /// A Session of `repo`'s work, shown in a new window.
 fn review(repo: &TestRepo) -> (Arc<Service>, SessionId, Runtime<State>) {
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
-    let rt = window(&service);
+    let rt = window_with_keys(&service);
     (service, id, rt)
 }
 
@@ -121,7 +117,7 @@ fn ctrl_f_opens_the_search_field_in_a_displayed_session() {
 #[test]
 fn ctrl_f_does_nothing_on_the_inbox() {
     let service = Arc::new(Service::new());
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     find_chord(&mut rt);
 
@@ -314,7 +310,7 @@ fn text_only_in_a_comment_is_not_matched() {
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 1..=1), "zebra stripes").unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     find_chord(&mut rt);
 
     type_text(&mut rt, "zebra");
@@ -351,7 +347,7 @@ fn each_tab_has_its_own_query_and_keeps_it_when_switched_away_and_back() {
     let service = Arc::new(Service::new());
     let a = service.review(ReviewRequest::new(repo_a.path())).unwrap().session().clone();
     let b = service.review(ReviewRequest::new(repo_b.path())).unwrap().session().clone();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     press(&mut rt, &format!("t-{a}"));
     find_chord(&mut rt);
     type_text(&mut rt, "needle");

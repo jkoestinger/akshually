@@ -7,22 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rune::accesskit::Action;
-use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune::{Key, KeyEvent, Mods, Runtime};
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, FileChange, ReviewRequest, Service, SessionId, Side, ThreadId, Verdict,
 };
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A headless window over `service`, its first frame built, with the app's key handler wired.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.on_key = Some(akshually_ui::on_key);
-    rt.frame(0.0);
-    rt
-}
+mod common;
+
+use common::window_with_keys;
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
 fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
@@ -93,7 +89,7 @@ fn review_with_three_threads(repo: &TestRepo) -> (Arc<Service>, SessionId, Runti
     for line in THREAD_LINES {
         service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
     }
-    let rt = window(&service);
+    let rt = window_with_keys(&service);
     (service, id, rt)
 }
 
@@ -159,7 +155,7 @@ fn with_one_thread_both_keys_go_to_it() {
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 50..=50), "Why?").unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     type_text(&mut rt, "n");
     let after_n = lines_in_view(&rt);
@@ -184,7 +180,7 @@ fn a_resolved_thread_is_not_visited() {
     service.reply(repo.path(), &t2, "Because.").unwrap();
     service.resolve(repo.path(), &t2).unwrap();
     service.show(&id, ChangesetView::Full).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..3 {
@@ -206,7 +202,7 @@ fn an_outdated_thread_and_a_general_thread_are_not_visited() {
     text[49] = "rewritten\n".into();
     repo.write("a.txt", &text.concat());
     service.reload(&id).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..3 {
@@ -259,7 +255,7 @@ fn after_switching_the_changeset_view_only_threads_on_lines_of_the_view_now_show
     let _next = service.review(ReviewRequest::new(repo.path())).unwrap();
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 5..=5), "And here?").unwrap();
     service.show(&id, ChangesetView::SinceLastRound).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..2 {
@@ -374,7 +370,7 @@ fn n_and_p_typed_in_a_reply_composer_are_text_and_move_nothing() {
     }
     service.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
     service.show(&id, ChangesetView::Full).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     press(&mut rt, "reopen-T1");
     deliver_window(&mut rt, &service);
     press(&mut rt, "reply-T1");
@@ -425,7 +421,7 @@ fn n_and_p_do_nothing_while_a_rendered_view_is_open() {
         service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
     }
     service.mark_viewed(&id, "a.txt", true).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     press(&mut rt, "rendered-README.md");
     assert!(rt.find("rendered-scroll").is_some(), "the Rendered view didn't open");
 
@@ -440,7 +436,7 @@ fn n_and_p_do_nothing_while_a_rendered_view_is_open() {
 #[test]
 fn n_and_p_do_nothing_on_the_inbox() {
     let service = Arc::new(Service::new());
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     type_text(&mut rt, "np");
 
@@ -488,7 +484,7 @@ fn both_buttons_are_disabled_without_a_thread_to_visit_and_enabled_once_there_is
     let repo = repo_with_a_long_change();
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     let before = (enabled(&rt, "next-thread"), enabled(&rt, "previous-thread"));
 
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 5..=5), "Why?").unwrap();
@@ -554,7 +550,7 @@ impl ForgeAdapter for FakeForge {
 fn a_pull_request_sessions_header_has_the_buttons_too_and_they_visit_its_threads() {
     let service = Arc::new(Service::new().with_forges(vec![Box::new(FakeForge)]));
     let id = service.open_pull_request(PR_URL).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     assert!(!enabled(&rt, "next-thread"), "the button was enabled with no Thread");
     service.comment(&id, Anchor::lines(Side::New, "login.rs", 2..=2), "Why sso?").unwrap();
     deliver_window(&mut rt, &service);

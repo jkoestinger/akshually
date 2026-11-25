@@ -4,22 +4,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rune::{Env, Runtime};
+use rune::Runtime;
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{Anchor, Changeset, ChangesetView, FileChange, ReviewRequest, Service, Side, Verdict};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
+
+mod common;
+
+use common::window;
 
 /// Lines enough for the core to call a file Large (it allows 2,000 changed lines).
 const LARGE: usize = 2_001;
-
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
-}
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
 fn deliver_window(rt: &mut Runtime<State>, service: &Service) {

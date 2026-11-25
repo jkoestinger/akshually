@@ -4,28 +4,16 @@
 
 use std::sync::Arc;
 
+use rune::Runtime;
 use rune::accesskit::Action;
-use rune::{Env, Runtime};
 use serde_json::Value;
 
 use akshually_core::{DiffLayout, ReviewRequest, Service, SessionId};
-use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A repository with one uncommitted edit, so its Session's Changeset has one line to show.
-fn repo_with_one_edit() -> TestRepo {
-    let repo = TestRepo::new();
-    repo.write("a.txt", "one\n").commit_all("base");
-    repo.write("a.txt", "two\n");
-    repo
-}
+mod common;
 
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
-}
+use common::{repo_with_one_edit, window};
 
 /// Hands the service's Window to the window, as its subscriber does, and rebuilds the view.
 fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
