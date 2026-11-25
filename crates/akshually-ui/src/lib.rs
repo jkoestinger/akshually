@@ -245,8 +245,12 @@ struct SessionTab {
     /// The Session's Search: its query and where the human is in its matches. The UI's own, so
     /// it's lost on restart.
     search: search::Search,
-    /// The Thread `n` or `p` last went to, so the next press carries on from it. The UI's own.
-    reached: Option<thread_nav::Reached>,
+    /// Where the Thread `n` or `p` last went to is, so the next press carries on from it while it
+    /// is still in view. The UI's own.
+    reached: Option<thread_nav::RowOrder>,
+    /// The diff view's laid-out rect `[x, y, w, h]`, in window points, once it has one: where
+    /// to read what the diff shows (see `thread_nav`).
+    viewport: Option<[f32; 4]>,
 }
 
 impl SessionTab {
@@ -265,6 +269,7 @@ impl SessionTab {
             rendered: None,
             search: search::Search::new(),
             reached: None,
+            viewport: None,
         };
         tab.annotate(None);
         tab
@@ -418,6 +423,8 @@ impl State {
                     let mut tab = old.swap_remove(at);
                     if tab.session.changeset_rev != session.changeset_rev {
                         show_files(&mut tab.diff, &session);
+                        // The Thread reached was a place in the diff just replaced.
+                        tab.reached = None;
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -454,12 +461,12 @@ impl State {
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
         }
-        if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
-            self.confirming_end = None;
-        }
-        if self.confirming_approve.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
-            self.confirming_approve = None;
-        }
+        let tabs = &self.tabs;
+        self.confirming_end.take_if(|id| !tabs.iter().any(|t| &t.session.id == id));
+        // Once approving has nothing to discard (the Round went over, say), the question is over:
+        // it must not come back with the next Draft, unasked.
+        self.confirming_approve
+            .take_if(|id| !tabs.iter().any(|t| &t.session.id == id && t.actions.discarded_by_approving > 0));
         self.annotate();
         self.displayed = displayed;
         self.inbox = inbox;
@@ -702,8 +709,7 @@ impl State {
         let error = tab.session.check_anchor(&anchor).err().map(|e| e.to_string());
         let fallback = tab.session.fallback_anchor(&anchor);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at, error, fallback });
-        self.composer_text = TextEdit::new("");
-        self.composer_text.focused = true;
+        self.composer_text = focused_edit("");
         self.unfold_general_for_composer();
         self.annotate();
     }
@@ -756,8 +762,7 @@ impl State {
     /// Opens the reply composer in `thread`.
     fn open_reply(&mut self, thread: ThreadRef) {
         self.reply = Some(thread);
-        self.reply_text = TextEdit::new("");
-        self.reply_text.focused = true;
+        self.reply_text = focused_edit("");
     }
 
     fn close_reply(&mut self) {
@@ -780,8 +785,7 @@ impl State {
         let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread.thread)?.comments.first());
         let Some(draft) = draft else { return };
         let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
-        self.edit_text = TextEdit::new(written.to_markdown());
-        self.edit_text.focused = true;
+        self.edit_text = focused_edit(written.to_markdown());
         self.editing = Some(thread);
     }
 
@@ -1750,6 +1754,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id_mut = id.clone();
     let id_header = id.clone();
     let id_comment = id.clone();
+    let id_layout = id.clone();
     let kc = k.clone();
     DiffView::new(
         move |s: &State| s.tab(&id).map_or(&s.spare_diff, |t| &t.diff),
@@ -1804,6 +1809,11 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         }
     })
     .build(s, k)
+    .on_layout(move |s: &mut State, rect: [f32; 4]| {
+        if let Some(tab) = s.tab_mut(&id_layout) {
+            tab.viewport = Some(rect);
+        }
+    })
 }
 
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
@@ -2143,6 +2153,28 @@ fn escape_on_empty(key: &KeyEvent, text: &TextEdit) -> bool {
     key.key == Key::Escape && text.text.trim().is_empty()
 }
 
+/// The key handler of a composer's text area: Escape in an empty one discards the composer, by
+/// `close`. `text` is the area's text in the state.
+fn discard_on_escape(
+    text: fn(&State) -> &TextEdit,
+    close: fn(&mut State),
+) -> impl Fn(&mut State, &KeyEvent, &mut Tx) -> bool + 'static {
+    move |s: &mut State, key: &KeyEvent, _: &mut Tx| {
+        let discard = escape_on_empty(key, text(s));
+        if discard {
+            close(s);
+        }
+        discard
+    }
+}
+
+/// A text field that already has the keyboard focus, for a composer that has just opened.
+fn focused_edit(text: impl Into<String>) -> TextEdit {
+    let mut edit = TextEdit::new(text);
+    edit.focused = true;
+    edit
+}
+
 /// The reply being written in a Thread: a Draft until the Round is handed over.
 fn reply_composer(k: &Kit, s: &State) -> El {
     col()
@@ -2156,13 +2188,7 @@ fn reply_composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.reply_text)
                 .on_submit(|s: &mut State, _| s.save_reply())
-                .on_key(|s: &mut State, key, _| {
-                    let discard = escape_on_empty(key, &s.reply_text);
-                    if discard {
-                        s.close_reply();
-                    }
-                    discard
-                })
+                .on_key(discard_on_escape(|s| &s.reply_text, State::close_reply))
                 .build(k),
         )
         .child(
@@ -2271,13 +2297,7 @@ fn composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.composer_text)
                 .on_submit(|s: &mut State, _| s.save_draft())
-                .on_key(|s: &mut State, key, _| {
-                    let discard = escape_on_empty(key, &s.composer_text);
-                    if discard {
-                        s.close_composer();
-                    }
-                    discard
-                })
+                .on_key(discard_on_escape(|s| &s.composer_text, State::close_composer))
                 .build(k),
         )
         .child(
@@ -2329,7 +2349,8 @@ pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return false;
     }
     // The Rendered view covers the diff, whose keys must not move it underneath.
-    thread_nav::on_diff_key(s, ev, tx)
+    let Some(tab) = s.displayed_tab_mut().filter(|t| t.rendered.is_none()) else { return false };
+    tab.diff.key(ev, tx) || thread_nav::on_key(s, ev, tx)
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an

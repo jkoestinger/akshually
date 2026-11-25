@@ -3,12 +3,16 @@
 
 use std::sync::Arc;
 
+use rune::Runtime;
 use rune::accesskit::Action;
-use rune::{Env, Runtime};
 
 use akshually_core::{Anchor, ReviewRequest, Service, SessionId, Side, ThreadRef};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
+
+mod common;
+
+use common::window;
 
 /// A repository on a feature branch with one commit ahead of `main`.
 fn repo_on_a_feature_branch() -> TestRepo {
@@ -16,13 +20,6 @@ fn repo_on_a_feature_branch() -> TestRepo {
     repo.write("lib.rs", "fn a() {}\n").commit_all("base");
     repo.branch("feature").write("lib.rs", "fn a() {}\nfn b() {}\n").commit_all("add b");
     repo
-}
-
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
 }
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
@@ -88,7 +85,7 @@ fn a_session_opened_with_a_general_thread_shows_the_section_expanded_with_its_co
 }
 
 #[test]
-fn hiding_the_section_leaves_only_its_header_row_and_showing_brings_the_threads_back() {
+fn hiding_the_section_leaves_only_its_header_row() {
     let (_repo, _service, _id, mut rt) = review_with_a_general_draft();
 
     press(&mut rt, "general-toggle");
@@ -96,6 +93,12 @@ fn hiding_the_section_leaves_only_its_header_row_and_showing_brings_the_threads_
     assert!(!shows(&rt, "Needs a second look."), "the Thread still shows");
     assert!(rt.find("general-scroll").is_none(), "the scroll area still shows");
     assert!(texts_within(&rt, "general-header").iter().any(|t| t == "Show"), "the header doesn't offer Show");
+}
+
+#[test]
+fn showing_a_hidden_section_brings_the_threads_back() {
+    let (_repo, _service, _id, mut rt) = review_with_a_general_draft();
+    press(&mut rt, "general-toggle");
 
     press(&mut rt, "general-toggle");
 

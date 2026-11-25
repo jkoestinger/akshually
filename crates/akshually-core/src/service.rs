@@ -468,6 +468,13 @@ impl SessionView {
         placed.collect()
     }
 
+    /// The placed Threads that are not resolved, in the order `placed_threads` lists them: the
+    /// ones still open to the human in the diff. A Draft counts.
+    pub fn unresolved_placed_threads(&self) -> Vec<PlacedThread> {
+        let open = |p: &PlacedThread| self.threads.iter().any(|t| t.id == p.thread && t.resolved.is_none());
+        self.placed_threads().into_iter().filter(open).collect()
+    }
+
     /// The Anchor for the lines selected from `start` to `end` (each a side and a 1-based line)
     /// in the shown Changeset's file at `file`. A selection running across sides anchors to its
     /// last line alone. `None` where no Thread can go.

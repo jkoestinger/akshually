@@ -4,27 +4,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rune::Runtime;
 use rune::accesskit::Action;
-use rune::{Env, Runtime};
 
 use akshually_core::{Anchor, Ending, Outcome, ReviewRequest, Service, SessionId, Side, ThreadId, ThreadRef};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A repository with one uncommitted edit, so its Session's Changeset has one line to show.
-fn repo_with_one_edit() -> TestRepo {
-    let repo = TestRepo::new();
-    repo.write("a.txt", "one\n").commit_all("base");
-    repo.write("a.txt", "two\n");
-    repo
-}
+mod common;
 
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
-}
+use common::{repo_with_one_edit, window};
 
 /// Presses the element keyed `key` as an assistive client would.
 fn press(rt: &mut Runtime<State>, key: &str) {
@@ -161,4 +150,36 @@ fn confirming_the_question_approves_and_the_agent_receives_only_the_verdict() {
     assert_eq!(service.session(&id).unwrap().ended, Some(Ending::Approved));
     let outcome = service.review(ReviewRequest::new(repo.path())).unwrap().wait_timeout(Duration::from_secs(5));
     assert_eq!(outcome, Some(Outcome::Approved));
+}
+
+/// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
+fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
+    let window = service.window();
+    rt.update_if(move |s: &mut State, _| {
+        s.apply(window);
+        true
+    });
+    rt.frame(0.0);
+}
+
+#[test]
+fn a_question_left_unanswered_while_the_round_went_over_is_not_asked_again_in_the_next_round() {
+    let repo = repo_with_one_edit();
+    let service = Arc::new(Service::new());
+    let first = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = first.session().clone();
+    service.comment(&id, Anchor::Review, "Why?").unwrap();
+    let mut rt = window(&service);
+    press(&mut rt, "approve");
+    assert!(rt.find("approve-confirm").is_some(), "the question wasn't asked");
+    service.hand_over_round(&id).unwrap();
+    first.wait_timeout(Duration::from_secs(5)).expect("the agent receives Round 1");
+    drop(service.review(ReviewRequest::new(repo.path())).unwrap());
+    deliver_window(&mut rt, &service);
+    assert!(rt.find("approve-confirm").is_none(), "the question stayed after the Round went over");
+
+    service.comment(&id, Anchor::Review, "And this?").unwrap();
+    deliver_window(&mut rt, &service);
+
+    assert!(rt.find("approve-confirm").is_none(), "the question came back without Approve being pressed");
 }

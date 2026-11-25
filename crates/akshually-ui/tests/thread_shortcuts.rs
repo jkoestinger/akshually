@@ -7,22 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rune::accesskit::Action;
-use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune::{Key, KeyEvent, Mods, Runtime};
 
 use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, FileChange, ReviewRequest, Service, SessionId, Side, ThreadId, Verdict,
 };
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A headless window over `service`, its first frame built, with the app's key handler wired.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.on_key = Some(akshually_ui::on_key);
-    rt.frame(0.0);
-    rt
-}
+mod common;
+
+use common::window_with_keys;
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
 fn deliver_window(rt: &mut Runtime<State>, service: &Service) {
@@ -46,6 +42,21 @@ fn type_text(rt: &mut Runtime<State>, text: &str) {
         rt.key(KeyEvent { key: Key::Text(c.to_string()), mods: Mods::default() });
         rt.frame(0.0);
     }
+}
+
+/// The texts drawn inside the element keyed `key`, in tree order; empty when nothing has the key.
+fn texts_within(rt: &Runtime<State>, key: &str) -> Vec<String> {
+    let elements = rt.elements();
+    let inside = |mut at: usize| loop {
+        if elements[at].key.as_deref() == Some(key) {
+            return true;
+        }
+        match elements[at].parent {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    };
+    (0..elements.len()).filter(|&at| inside(at)).filter_map(|at| elements[at].text.clone()).collect()
 }
 
 /// The window's height, in points.
@@ -78,7 +89,7 @@ fn review_with_three_threads(repo: &TestRepo) -> (Arc<Service>, SessionId, Runti
     for line in THREAD_LINES {
         service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
     }
-    let rt = window(&service);
+    let rt = window_with_keys(&service);
     (service, id, rt)
 }
 
@@ -88,13 +99,22 @@ fn lines_in_view(rt: &Runtime<State>) -> Vec<u32> {
 }
 
 #[test]
-fn n_scrolls_to_the_next_thread_below_the_view_and_p_to_the_previous_one_above_it() {
+fn n_scrolls_to_the_next_thread_below_the_view() {
     let repo = repo_with_a_long_change();
     let (_service, _id, mut rt) = review_with_three_threads(&repo);
     type_text(&mut rt, "n");
-    assert_eq!(lines_in_view(&rt), [5], "the first `n` didn't go to the first Thread");
+
     type_text(&mut rt, "n");
-    assert_eq!(lines_in_view(&rt), [50]);
+
+    assert_eq!(lines_in_view(&rt), [50], "the second `n` didn't go to the next Thread");
+}
+
+#[test]
+fn p_scrolls_to_the_previous_thread_above_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    type_text(&mut rt, "n");
 
     type_text(&mut rt, "p");
 
@@ -135,7 +155,7 @@ fn with_one_thread_both_keys_go_to_it() {
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 50..=50), "Why?").unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     type_text(&mut rt, "n");
     let after_n = lines_in_view(&rt);
@@ -160,7 +180,7 @@ fn a_resolved_thread_is_not_visited() {
     service.reply(repo.path(), &t2, "Because.").unwrap();
     service.resolve(repo.path(), &t2).unwrap();
     service.show(&id, ChangesetView::Full).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..3 {
@@ -182,7 +202,7 @@ fn an_outdated_thread_and_a_general_thread_are_not_visited() {
     text[49] = "rewritten\n".into();
     repo.write("a.txt", &text.concat());
     service.reload(&id).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..3 {
@@ -235,7 +255,7 @@ fn after_switching_the_changeset_view_only_threads_on_lines_of_the_view_now_show
     let _next = service.review(ReviewRequest::new(repo.path())).unwrap();
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 5..=5), "And here?").unwrap();
     service.show(&id, ChangesetView::SinceLastRound).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     let mut visited = Vec::new();
     for _ in 0..2 {
@@ -263,6 +283,141 @@ fn n_and_p_typed_in_a_composer_are_text_and_move_nothing() {
     assert!(rt.find("composer").is_some(), "the composer closed");
 }
 
+/// Wheels the diff down by hand until only the last of `THREAD_LINES` is in the window.
+fn scroll_by_hand_to_the_last_thread(rt: &mut Runtime<State>) {
+    for _ in 0..80 {
+        if lines_in_view(rt) == [95] {
+            return;
+        }
+        rt.wheel(640.0, 400.0, -100.0);
+        rt.frame(0.0);
+    }
+    panic!("wheeling didn't bring the last Thread alone into view: {:?}", lines_in_view(rt));
+}
+
+#[test]
+fn n_after_scrolling_by_hand_goes_to_the_thread_below_the_top_of_the_view_not_back_to_the_one_reached() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    assert_eq!(lines_in_view(&rt), [5], "the first `n` didn't go to the first Thread");
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [95], "`n` went back up to a Thread above the view");
+}
+
+#[test]
+fn n_after_wheeling_up_a_little_goes_to_the_thread_below_the_new_top_even_if_it_was_reached() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    type_text(&mut rt, "n");
+    assert_eq!(lines_in_view(&rt), [50], "the second `n` didn't go to the second Thread");
+    rt.wheel(640.0, 400.0, 200.0);
+    rt.frame(0.0);
+    assert_eq!(lines_in_view(&rt), [50], "the wheel moved the Thread out of view");
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [50], "`n` went on from the Thread reached after the human scrolled");
+}
+
+#[test]
+fn p_after_scrolling_by_hand_goes_to_the_thread_above_the_top_of_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "p");
+
+    assert_eq!(lines_in_view(&rt), [50], "`p` didn't go to the Thread above the view");
+}
+
+#[test]
+fn p_after_n_and_scrolling_by_hand_goes_to_the_thread_above_the_top_of_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "p");
+
+    assert_eq!(lines_in_view(&rt), [50], "`p` went by the Thread reached, not by the view");
+}
+
+/// Clicks the element keyed `key` with the pointer, which focuses it, then builds the next frame.
+fn click(rt: &mut Runtime<State>, key: &str) {
+    let (x, y) = rt.find(key).unwrap_or_else(|| panic!("nothing to click at `{key}`"));
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.0);
+}
+
+#[test]
+fn n_still_goes_on_after_a_button_was_clicked() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    click(&mut rt, "next-thread");
+    assert_eq!(lines_in_view(&rt), [5], "the down chevron didn't go to the first Thread");
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [50], "`n` did nothing while the clicked button had focus");
+}
+
+#[test]
+fn n_and_p_typed_in_a_reply_composer_are_text_and_move_nothing() {
+    let repo = repo_with_a_long_change();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    // On the first old line, which the diff shows at its top, where its Reopen button can be pressed.
+    service.comment(&id, Anchor::lines(Side::Old, "a.txt", 1..=1), "Why?").unwrap();
+    for line in THREAD_LINES {
+        service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
+    }
+    service.hand_over_round(&id).unwrap();
+    assert!(pending.wait_timeout(Duration::from_secs(5)).is_some(), "the Round wasn't handed over");
+    // The Round is answered, so it is the human's Turn.
+    for thread in ["T1", "T2", "T3", "T4"] {
+        service.reply(repo.path(), &ThreadId::new(thread), "Answered.").unwrap();
+    }
+    service.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+    service.show(&id, ChangesetView::Full).unwrap();
+    let mut rt = window_with_keys(&service);
+    press(&mut rt, "reopen-T1");
+    deliver_window(&mut rt, &service);
+    press(&mut rt, "reply-T1");
+    assert!(rt.find("reply-composer").is_some(), "the reply composer didn't open");
+    let before = lines_in_view(&rt);
+
+    type_text(&mut rt, "npn");
+
+    assert_eq!(lines_in_view(&rt), before, "a key moved the diff while the reply composer had focus");
+    assert!(rt.find("reply-composer").is_some(), "the reply composer closed");
+}
+
+#[test]
+fn n_and_p_typed_in_the_search_field_are_text_and_move_nothing() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    rt.key(KeyEvent {
+        key: Key::Command('f'),
+        mods: Mods { cmd: true, ctrl: !cfg!(target_os = "macos"), ..Mods::default() },
+    });
+    rt.frame(0.0);
+    assert!(rt.find("search-field").is_some(), "Ctrl+F didn't open the search field");
+    let before = lines_in_view(&rt);
+
+    // No line says "pnew", but every one says "new": the keys didn't reach the field if it matches.
+    type_text(&mut rt, "pnew");
+
+    assert_eq!(texts_within(&rt, "search-count").join(""), "No matches", "`p` or `n` didn't reach the search field");
+    assert_eq!(lines_in_view(&rt), before, "a key moved the diff while the search field had focus");
+}
+
 /// A repository whose `README.md` and `a.txt` both changed, `a.txt` over a hundred lines.
 fn repo_with_a_readme() -> TestRepo {
     let repo = TestRepo::new();
@@ -282,7 +437,7 @@ fn n_and_p_do_nothing_while_a_rendered_view_is_open() {
         service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
     }
     service.mark_viewed(&id, "a.txt", true).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     press(&mut rt, "rendered-README.md");
     assert!(rt.find("rendered-scroll").is_some(), "the Rendered view didn't open");
 
@@ -297,7 +452,7 @@ fn n_and_p_do_nothing_while_a_rendered_view_is_open() {
 #[test]
 fn n_and_p_do_nothing_on_the_inbox() {
     let service = Arc::new(Service::new());
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
 
     type_text(&mut rt, "np");
 
@@ -345,7 +500,7 @@ fn both_buttons_are_disabled_without_a_thread_to_visit_and_enabled_once_there_is
     let repo = repo_with_a_long_change();
     let service = Arc::new(Service::new());
     let id = service.review(ReviewRequest::new(repo.path())).unwrap().session().clone();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     let before = (enabled(&rt, "next-thread"), enabled(&rt, "previous-thread"));
 
     service.comment(&id, Anchor::lines(Side::New, "a.txt", 5..=5), "Why?").unwrap();
@@ -411,7 +566,7 @@ impl ForgeAdapter for FakeForge {
 fn a_pull_request_sessions_header_has_the_buttons_too_and_they_visit_its_threads() {
     let service = Arc::new(Service::new().with_forges(vec![Box::new(FakeForge)]));
     let id = service.open_pull_request(PR_URL).unwrap();
-    let mut rt = window(&service);
+    let mut rt = window_with_keys(&service);
     assert!(!enabled(&rt, "next-thread"), "the button was enabled with no Thread");
     service.comment(&id, Anchor::lines(Side::New, "login.rs", 2..=2), "Why sso?").unwrap();
     deliver_window(&mut rt, &service);

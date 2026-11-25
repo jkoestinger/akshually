@@ -191,22 +191,14 @@ fn a_long_publish_list_scrolls_and_keeps_the_verdict_and_buttons_in_a_short_wind
 fn the_publish_line_wraps_inside_the_dialog_in_a_window_narrower_than_it() {
     let tree = scene_tree_at("publish-gitlab", (520.0, 700.0), &[]);
 
-    let dialog = &tree.with_role("dialog")[0];
-    let line = publish_line(&tree);
-    assert!(edges(line).right <= edges(dialog).right, "the line runs past the dialog: {line:#?} in {dialog:#?}");
-    let close = tree.button("Close").expect("no close button");
-    assert!(edges(close).right <= edges(dialog).right, "the close button is outside the dialog: {close:#?}");
+    assert_publish_line_and_close_inside_the_dialog(&tree);
 }
 
 #[test]
 fn the_publish_line_of_a_long_host_and_repository_wraps_inside_the_dialog() {
     let tree = scene_tree("publish-long", &[]);
 
-    let dialog = &tree.with_role("dialog")[0];
-    let line = publish_line(&tree);
-    assert!(edges(line).right <= edges(dialog).right, "the line runs past the dialog: {line:#?} in {dialog:#?}");
-    let close = tree.button("Close").expect("no close button");
-    assert!(edges(close).right <= edges(dialog).right, "the close button is outside the dialog: {close:#?}");
+    assert_publish_line_and_close_inside_the_dialog(&tree);
 }
 
 #[test]
@@ -352,6 +344,15 @@ fn open_views() -> Value {
 /// A press on the diff layout control's side-by-side segment.
 fn pick_side_by_side() -> Value {
     json!({ "t": 0.2, "type": "click", "key": "segment1" })
+}
+
+/// Asserts that the Publish dialog's line, and its close button, end inside the dialog.
+fn assert_publish_line_and_close_inside_the_dialog(tree: &Tree) {
+    let dialog = &tree.with_role("dialog")[0];
+    let line = publish_line(tree);
+    assert!(edges(line).right <= edges(dialog).right, "the line runs past the dialog: {line:#?} in {dialog:#?}");
+    let close = tree.button("Close").expect("no close button");
+    assert!(edges(close).right <= edges(dialog).right, "the close button is outside the dialog: {close:#?}");
 }
 
 /// The line under the Publish dialog's title, naming where the review goes.

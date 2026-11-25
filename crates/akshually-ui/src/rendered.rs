@@ -82,32 +82,30 @@ pub(crate) fn rendered_view(k: &Kit, dark: bool, layout: DiffLayout, tab: &Sessi
         let markdown = Markdown::new(text).selectable(true).highlights(items);
         col().key(key).grow(1.0).min_w(0.0).child(markdown.build(k))
     };
-    let mut removed_note = None;
-    let columns = match (change.old.as_deref(), change.new.as_deref()) {
-        (None, Some(new)) => vec![column(0, "rendered-new", new, None)],
-        (Some(old), None) => vec![column(0, "rendered-old", old, None)],
-        (Some(old), Some(new)) => {
-            let at = match layout {
-                DiffLayout::SideBySide => 1,
-                DiffLayout::Stacked => 0,
-            };
-            let tint = Some(("added", added, changed(LineKind::Added, diff::Side::New)));
-            let new = column(at, "rendered-new", new, tint);
-            match layout {
-                DiffLayout::SideBySide => {
-                    let tint = ("removed", removed, changed(LineKind::Removed, diff::Side::Old));
-                    vec![column(0, "rendered-old", old, Some(tint)), new]
-                }
-                DiffLayout::Stacked => {
-                    removed_note = match changed(LineKind::Removed, diff::Side::Old).len() {
-                        0 => None,
-                        n => Some(format!("{}, see the diff", counted(n, "line removed", "lines removed"))),
-                    };
-                    vec![new]
-                }
+    // Both versions are shown, or the file was added or deleted and has nothing to tint.
+    let both = change.old.is_some() && change.new.is_some();
+    let columns: Vec<El> = search::rendered_columns(change, layout)
+        .into_iter()
+        .enumerate()
+        .map(|(at, (side, source))| match side {
+            diff::Side::Old => {
+                let tint = both.then(|| ("removed", removed, changed(LineKind::Removed, diff::Side::Old)));
+                column(at, "rendered-old", source, tint)
             }
-        }
-        (None, None) => return,
+            diff::Side::New => {
+                let tint = both.then(|| ("added", added, changed(LineKind::Added, diff::Side::New)));
+                column(at, "rendered-new", source, tint)
+            }
+        })
+        .collect();
+    if columns.is_empty() {
+        return;
+    }
+    // Stacked, the removed lines have no column to be tinted in.
+    let removed_note = match (both && layout == DiffLayout::Stacked, changed(LineKind::Removed, diff::Side::Old).len())
+    {
+        (true, n) if n > 0 => Some(format!("{}, see the diff", counted(n, "line removed", "lines removed"))),
+        _ => None,
     };
     let open = match tab.session.open_threads_on(path) {
         0 => None,

@@ -7,18 +7,15 @@
 use std::sync::Arc;
 
 use rune::accesskit::Action;
-use rune::{Env, Key, KeyEvent, Runtime};
+use rune::{Key, KeyEvent, Runtime};
 
 use akshually_core::{Anchor, ReviewRequest, Service, SessionId, Side};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
-}
+mod common;
+
+use common::window;
 
 /// Presses the element keyed `key` as an assistive client would.
 fn press(rt: &mut Runtime<State>, key: &str) {

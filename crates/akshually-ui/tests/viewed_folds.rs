@@ -4,20 +4,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rune::Runtime;
 use rune::accesskit::Action;
-use rune::{Env, Runtime};
 
 use akshually_core::{Anchor, ChangesetView, ReviewRequest, Service, Side};
 use akshually_testkit::TestRepo;
-use akshually_ui::{State, view};
+use akshually_ui::State;
 
-/// A repository with one uncommitted edit to `a.txt`, so its Session's Changeset has one file.
-fn repo_with_one_edit() -> TestRepo {
-    let repo = TestRepo::new();
-    repo.write("a.txt", "one\n").commit_all("base");
-    repo.write("a.txt", "two\n");
-    repo
-}
+mod common;
+
+use common::{repo_with_one_edit, window};
 
 /// A repository with uncommitted edits to `a.txt`, `b.txt` and the Generated `go.sum`, which
 /// its Session's Changeset shows in that order.
@@ -30,13 +26,6 @@ fn repo_with_three_edits() -> TestRepo {
 
 /// Lines enough for the core to call a file Large (it allows 2,000 changed lines).
 const LARGE: usize = 2_001;
-
-/// A headless window over `service`, its first frame built.
-fn window(service: &Arc<Service>) -> Runtime<State> {
-    let mut rt = Runtime::new(State::new(service.clone()), view, (1280.0, 800.0), Env::default());
-    rt.frame(0.0);
-    rt
-}
 
 /// Hands the service's Window to the window, as its subscriber does, and builds the next frame.
 fn deliver_window_and_rebuild(rt: &mut Runtime<State>, service: &Service) {

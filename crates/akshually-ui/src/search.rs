@@ -33,7 +33,7 @@ pub(crate) struct Search {
     open: bool,
     /// Where the human is: the current match, by its place, so it survives the matches being
     /// found again.
-    current: Option<(Place, usize)>,
+    current: Option<(MatchPlace, usize)>,
 }
 
 impl Search {
@@ -44,7 +44,7 @@ impl Search {
 
 /// Where a match is, ordered as the matches are stepped through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Place {
+enum MatchPlace {
     /// A line of the diff of the `file`th file. `anchor` is the line's number on the new side,
     /// or for a removed line the new line that follows it, so a line keeps its place in the
     /// order when a hidden stretch above it is expanded.
@@ -55,7 +55,7 @@ enum Place {
 
 /// One match of the query.
 pub(crate) struct Match {
-    place: Place,
+    place: MatchPlace,
     /// Where it starts in its line, or in its Rendered column's source: it tells matches on one
     /// line apart.
     start: usize,
@@ -64,7 +64,7 @@ pub(crate) struct Match {
 }
 
 impl Match {
-    fn key(&self) -> (Place, usize) {
+    fn key(&self) -> (MatchPlace, usize) {
         (self.place, self.start)
     }
 }
@@ -99,7 +99,7 @@ pub(crate) fn highlights(
     current: Option<usize>,
     column: usize,
 ) -> Vec<(Vec<Range<usize>>, Highlight)> {
-    let in_column = found.iter().enumerate().filter(|(_, m)| m.place == Place::Column(column));
+    let in_column = found.iter().enumerate().filter(|(_, m)| m.place == MatchPlace::Column(column));
     in_column
         .map(|(i, m)| {
             let highlight = match Some(i) == current {
@@ -111,14 +111,18 @@ pub(crate) fn highlights(
         .collect()
 }
 
-/// The text of each column the Rendered view of `change` shows, in the order it shows them.
-fn rendered_columns(change: &FileChange, layout: DiffLayout) -> Vec<&str> {
+/// The columns the Rendered view of `change` shows, in the order it shows them, each as the
+/// version of the file it renders and its text. The index of a column in this list is the one
+/// [`highlights`] takes and a match's `MatchPlace::Column` holds, so the view builds its columns from
+/// it.
+pub(crate) fn rendered_columns(change: &FileChange, layout: DiffLayout) -> Vec<(diff::Side, &str)> {
+    use diff::Side::{New, Old};
     match (change.old.as_deref(), change.new.as_deref()) {
-        (None, Some(new)) => vec![new],
-        (Some(old), None) => vec![old],
+        (None, Some(new)) => vec![(New, new)],
+        (Some(old), None) => vec![(Old, old)],
         (Some(old), Some(new)) => match layout {
-            DiffLayout::SideBySide => vec![old, new],
-            DiffLayout::Stacked => vec![new],
+            DiffLayout::SideBySide => vec![(Old, old), (New, new)],
+            DiffLayout::Stacked => vec![(New, new)],
         },
         (None, None) => Vec::new(),
     }
@@ -129,10 +133,10 @@ fn rendered_matches(tab: &SessionTab, layout: DiffLayout, path: &str, query: &st
     let case = Case::Folded(Fold::default());
     let columns = rendered_columns(change, layout).into_iter().enumerate();
     columns
-        .flat_map(|(column, source)| {
+        .flat_map(|(column, (_, source))| {
             markdown::find(source, query, case).into_iter().filter_map(move |ranges| {
                 let start = ranges.first()?.start;
-                Some(Match { place: Place::Column(column), start, ranges })
+                Some(Match { place: MatchPlace::Column(column), start, ranges })
             })
         })
         .collect()
@@ -145,7 +149,7 @@ fn diff_matches(tab: &SessionTab, query: &str) -> Vec<Match> {
         let Some(diff) = tab.diff.files().get(file).filter(|_| change.binary.is_none()) else { continue };
         for (anchor, side, line, source) in searched_lines(tab, file, change, diff) {
             for range in fold.find(source, query) {
-                let place = Place::Line { file, anchor, side, line };
+                let place = MatchPlace::Line { file, anchor, side, line };
                 found.push(Match { place, start: range.start, ranges: vec![range] });
             }
         }
@@ -160,9 +164,12 @@ fn first_line(start: u32, count: u32) -> u32 {
 }
 
 /// The lines of `file`'s diff that Search looks in, as `(anchor, side, line, text)` (see
-/// [`Place::Line`]): those of its hunks, and the unchanged stretches between them that the
-/// human has expanded. A stretch expanded only partly, from both its ends, is skipped: the diff
-/// view doesn't say which of its lines are showing.
+/// [`MatchPlace::Line`]): those of its hunks, and the unchanged stretches between them that the
+/// human has expanded. A stretch before the first hunk or after the last that is expanded only
+/// partly is searched as far as it was expanded, as it grows from its hunk. A middle stretch
+/// expanded only partly is skipped, though some of its lines show: it can grow from either end,
+/// and the diff view says how many of its lines are still hidden (`DiffState::hidden`) but not
+/// which.
 fn searched_lines<'a>(
     tab: &SessionTab,
     file: usize,
@@ -287,7 +294,7 @@ impl State {
 
     /// Closes `id`'s search field, giving the keys back to the diff. The query stays for when it
     /// opens again. `false` when it wasn't open.
-    pub(crate) fn close_search(&mut self, id: &SessionId) -> bool {
+    fn close_search(&mut self, id: &SessionId) -> bool {
         let Some(tab) = self.tab_mut(id).filter(|t| t.search.open) else { return false };
         tab.search.open = false;
         tab.search.query.focused = false;
@@ -308,7 +315,7 @@ impl State {
 
     /// What `id`'s search field reads and writes. Once its tab is gone, a stale handler gets a
     /// field nothing shows, as `spare_diff` is for the diff view.
-    pub(crate) fn search_text(&mut self, id: &SessionId) -> &mut TextEdit {
+    fn search_text(&mut self, id: &SessionId) -> &mut TextEdit {
         // Not `tab_mut`: that would keep all of `self` borrowed in the `None` arm too.
         match self.tabs.iter_mut().find(|t| &t.session.id == id) {
             Some(tab) => &mut tab.search.query,
@@ -362,7 +369,7 @@ impl State {
 /// viewed mark is the service's, and stays), or the Rendered view's current highlight.
 fn go_to(tab: &mut SessionTab, m: &Match, tx: &mut Tx) {
     match m.place {
-        Place::Line { file, side, line, .. } => tab.diff.scroll_to_line(file, LineRef::new(side, line), tx),
-        Place::Column(_) => tx.scroll_center_in("rendered-scroll", CURRENT_MATCH),
+        MatchPlace::Line { file, side, line, .. } => tab.diff.scroll_to_line(file, LineRef::new(side, line), tx),
+        MatchPlace::Column(_) => tx.scroll_center_in("rendered-scroll", CURRENT_MATCH),
     }
 }

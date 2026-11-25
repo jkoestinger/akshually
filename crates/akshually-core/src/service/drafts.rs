@@ -6,7 +6,7 @@ use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, Thr
 use crate::{Changeset, Error};
 
 impl SessionView {
-    /// How many Comments and reopened Threads the next Round would carry.
+    /// How many Drafts and reopened Threads the next Round would carry.
     pub fn to_hand_over(&self) -> usize {
         let co_review = self.is_co_review();
         let comments: usize = self

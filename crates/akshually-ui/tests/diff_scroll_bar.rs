@@ -98,20 +98,29 @@ fn scrolled(rt: &Runtime<State>) -> f32 {
 }
 
 #[test]
-fn a_diff_taller_than_the_window_shows_a_scroll_bar_and_one_that_fits_shows_none() {
-    let (long, short) = (repo_with_changed_lines(400), repo_with_changed_lines(2));
+fn a_diff_taller_than_the_window_shows_a_scroll_bar() {
+    let long = repo_with_changed_lines(400);
     let service = Arc::new(Service::new());
-    let (long_id, short_id) = (open(&service, &long), open(&service, &short));
+    let long_id = open(&service, &long);
     let mut rt = window(&service);
     deliver_window(&mut rt, &service);
 
     open_tab(&mut rt, &long_id);
-    let long_shows = thumb(&rt).is_some();
-    open_tab(&mut rt, &short_id);
-    let short_shows = thumb(&rt).is_some();
 
-    assert!(long_shows, "a diff of 400 lines showed no scroll bar");
-    assert!(!short_shows, "a diff that fits showed a scroll bar");
+    assert!(thumb(&rt).is_some(), "a diff of 400 lines showed no scroll bar");
+}
+
+#[test]
+fn a_diff_that_fits_the_window_shows_no_scroll_bar() {
+    let short = repo_with_changed_lines(2);
+    let service = Arc::new(Service::new());
+    let short_id = open(&service, &short);
+    let mut rt = window(&service);
+    deliver_window(&mut rt, &service);
+
+    open_tab(&mut rt, &short_id);
+
+    assert!(thumb(&rt).is_none(), "a diff that fits showed a scroll bar");
 }
 
 #[test]
