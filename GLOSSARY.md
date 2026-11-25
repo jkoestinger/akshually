@@ -44,8 +44,16 @@ _Avoid_: Remote, host, provider
 A Forge's request to merge a branch; GitLab's merge requests are called Pull Requests here too.
 _Avoid_: MR, merge request (except when quoting GitLab)
 
+**Stack**:
+An ordered run of open Pull Requests in one repository, each asking to merge into the branch of the one below it. It is always a line: where two Pull Requests sit on the same one, the Stack stops below them. A Pull Request on its own is a Stack of one.
+_Avoid_: Stacked PRs, stacked diff (stacked is a Diff layout), chain, series
+
+**Stack Changeset**:
+Everything a Stack changes, from below its bottom Pull Request to the top of its last, shown as one Changeset. For reading only: it has no Threads, and a Stack of one has none.
+_Avoid_: Combined diff, full Changeset (that is a view of one Review)
+
 **Inbox**:
-The open Pull Requests, across every configured Forge, where the human is a requested reviewer or assignee, leaving out those already approved and those the human gave a Verdict on since their review was last requested. One with an open Session stays.
+The open Pull Requests, across every configured Forge, where the human is a requested reviewer or assignee, leaving out those already approved and those the human gave a Verdict on since their review was last requested. One with an open Session stays. The other Pull Requests of its Stack are shown with it.
 _Avoid_: Queue, dashboard
 
 **Verdict**:
@@ -67,7 +75,7 @@ The side raising Threads and giving the Verdict. The human is always a Reviewer,
 _Avoid_: Approver, critic
 
 **Session**:
-One continuous Review of one Changeset between the human and at most one agent, spanning every Round until the Verdict and the human closes it. Several Sessions can run at once.
+One continuous sitting between the human and at most one agent: the Review of one Changeset of local work, or the Reviews of the Pull Requests of one Stack, one each. It spans every Round until the human closes it. Several Sessions can run at once.
 _Avoid_: Tab, window, conversation
 
 **Turn**:
@@ -75,7 +83,7 @@ Whose move a Session is waiting on: the human's or the agent's. A Session that b
 _Avoid_: State, status
 
 **Ending**:
-How a Session ended: Approved (the Verdict on local work), Abandoned, Published, or Closed (a co-review of local work, which has no Verdict). The agent's next `review` call receives it as its outcome; a Round never ends a Session.
+How a Session ended: Approved (the Verdict on local work), Abandoned, Published (at least one Pull Request of its Stack was), or Closed (a co-review of local work, which has no Verdict). The agent's next `review` call receives it as its outcome; a Round never ends a Session.
 _Avoid_: Result, end state
 
 **Abandoned**:
