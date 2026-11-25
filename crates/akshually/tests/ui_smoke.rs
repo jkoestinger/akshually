@@ -188,6 +188,40 @@ fn a_long_publish_list_scrolls_and_keeps_the_verdict_and_buttons_in_a_short_wind
 }
 
 #[test]
+fn the_publish_line_wraps_inside_the_dialog_in_a_window_narrower_than_it() {
+    let tree = scene_tree_at("publish-gitlab", (520.0, 700.0), &[]);
+
+    let dialog = &tree.with_role("dialog")[0];
+    let line = publish_line(&tree);
+    assert!(edges(line).right <= edges(dialog).right, "the line runs past the dialog: {line:#?} in {dialog:#?}");
+    let close = tree.button("Close").expect("no close button");
+    assert!(edges(close).right <= edges(dialog).right, "the close button is outside the dialog: {close:#?}");
+}
+
+#[test]
+fn the_publish_line_of_a_long_host_and_repository_wraps_inside_the_dialog() {
+    let tree = scene_tree("publish-long", &[]);
+
+    let dialog = &tree.with_role("dialog")[0];
+    let line = publish_line(&tree);
+    assert!(edges(line).right <= edges(dialog).right, "the line runs past the dialog: {line:#?} in {dialog:#?}");
+    let close = tree.button("Close").expect("no close button");
+    assert!(edges(close).right <= edges(dialog).right, "the close button is outside the dialog: {close:#?}");
+}
+
+#[test]
+fn a_wrapped_publish_line_keeps_the_verdicts_and_buttons_in_a_short_window() {
+    let tree = scene_tree_at("publish-long", WRAPPING_WINDOW, &[]);
+
+    let publish = tree.with_role("button").into_iter().find(|b| b["name"].as_str().unwrap().starts_with("Publish"));
+    let publish = publish.expect("no Publish button");
+    assert!(edges(publish).bottom <= WRAPPING_WINDOW.1, "the Publish button is below the window: {publish:#?}");
+    let verdicts = tree.with_role("radio-button");
+    let below = verdicts.iter().any(|v| edges(v).bottom > WRAPPING_WINDOW.1);
+    assert!(!verdicts.is_empty() && !below, "a Verdict is below the window");
+}
+
+#[test]
 fn the_rendered_scene_shows_the_readme_rendered_side_by_side() {
     let tree = scene_tree("rendered", &[]);
 
@@ -301,6 +335,10 @@ fn scene_tree_at(scene: &str, (width, height): (f64, f64), script: &[Value]) -> 
 /// shrink to keep the dialog inside it.
 const SHORT_WINDOW: (f64, f64) = (1280.0, 500.0);
 
+/// A window narrow enough for the Publish dialog's line to wrap to three lines, and tall enough that the
+/// list of Drafts shrinks by its budget rather than by its minimum height.
+const WRAPPING_WINDOW: (f64, f64) = (520.0, 600.0);
+
 /// The long Draft of the `publish` scene, one paragraph at a time.
 const LONG_DRAFT_FIRST_PARAGRAPH: &str = "The snapshot is taken after the Round is built, so a Draft the agent adds while \
     the Round is being built lands in neither the old Round nor the new one, and the human never sees it.";
@@ -314,6 +352,12 @@ fn open_views() -> Value {
 /// A press on the diff layout control's side-by-side segment.
 fn pick_side_by_side() -> Value {
     json!({ "t": 0.2, "type": "click", "key": "segment1" })
+}
+
+/// The line under the Publish dialog's title, naming where the review goes.
+fn publish_line(tree: &Tree) -> &Value {
+    let labels = tree.with_role("label");
+    labels.into_iter().find(|l| l["name"].as_str().is_some_and(|n| n.starts_with("Sent to "))).expect("no line")
 }
 
 /// The right and bottom edges of `node`'s bounds, in logical pixels.
