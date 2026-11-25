@@ -245,8 +245,12 @@ struct SessionTab {
     /// The Session's Search: its query and where the human is in its matches. The UI's own, so
     /// it's lost on restart.
     search: search::Search,
-    /// The Thread `n` or `p` last went to, so the next press carries on from it. The UI's own.
-    reached: Option<thread_nav::Reached>,
+    /// Where the Thread `n` or `p` last went to is, so the next press carries on from it while it
+    /// is still in view. The UI's own.
+    reached: Option<thread_nav::Position>,
+    /// The diff view's laid-out rect `[x, y, w, h]`, in window points, once it has one: where
+    /// to read what the diff shows (see `thread_nav`).
+    viewport: Option<[f32; 4]>,
 }
 
 impl SessionTab {
@@ -265,6 +269,7 @@ impl SessionTab {
             rendered: None,
             search: search::Search::new(),
             reached: None,
+            viewport: None,
         };
         tab.annotate(None);
         tab
@@ -418,6 +423,8 @@ impl State {
                     let mut tab = old.swap_remove(at);
                     if tab.session.changeset_rev != session.changeset_rev {
                         show_files(&mut tab.diff, &session);
+                        // The Thread reached was a place in the diff just replaced.
+                        tab.reached = None;
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
@@ -1750,6 +1757,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id_mut = id.clone();
     let id_header = id.clone();
     let id_comment = id.clone();
+    let id_layout = id.clone();
     let kc = k.clone();
     DiffView::new(
         move |s: &State| s.tab(&id).map_or(&s.spare_diff, |t| &t.diff),
@@ -1804,6 +1812,11 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         }
     })
     .build(s, k)
+    .on_layout(move |s: &mut State, rect: [f32; 4]| {
+        if let Some(tab) = s.tab_mut(&id_layout) {
+            tab.viewport = Some(rect);
+        }
+    })
 }
 
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
@@ -2329,7 +2342,8 @@ pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return false;
     }
     // The Rendered view covers the diff, whose keys must not move it underneath.
-    thread_nav::on_diff_key(s, ev, tx)
+    let Some(tab) = s.displayed_tab_mut().filter(|t| t.rendered.is_none()) else { return false };
+    tab.diff.key(ev, tx) || thread_nav::on_key(s, ev, tx)
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an

@@ -278,6 +278,54 @@ fn n_and_p_typed_in_a_composer_are_text_and_move_nothing() {
     assert!(rt.find("composer").is_some(), "the composer closed");
 }
 
+/// Wheels the diff down by hand until only the last of `THREAD_LINES` is in the window.
+fn scroll_by_hand_to_the_last_thread(rt: &mut Runtime<State>) {
+    for _ in 0..80 {
+        if lines_in_view(rt) == [95] {
+            return;
+        }
+        rt.wheel(640.0, 400.0, -100.0);
+        rt.frame(0.0);
+    }
+    panic!("wheeling didn't bring the last Thread alone into view: {:?}", lines_in_view(rt));
+}
+
+#[test]
+fn n_after_scrolling_by_hand_goes_to_the_thread_below_the_top_of_the_view_not_back_to_the_one_reached() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    assert_eq!(lines_in_view(&rt), [5], "the first `n` didn't go to the first Thread");
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [95], "`n` went back up to a Thread above the view");
+}
+
+#[test]
+fn p_after_scrolling_by_hand_goes_to_the_thread_above_the_top_of_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "p");
+
+    assert_eq!(lines_in_view(&rt), [50], "`p` didn't go to the Thread above the view");
+}
+
+#[test]
+fn p_after_n_and_scrolling_by_hand_goes_to_the_thread_above_the_top_of_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    scroll_by_hand_to_the_last_thread(&mut rt);
+
+    type_text(&mut rt, "p");
+
+    assert_eq!(lines_in_view(&rt), [50], "`p` went by the Thread reached, not by the view");
+}
+
 /// Clicks the element keyed `key` with the pointer, which focuses it, then builds the next frame.
 fn click(rt: &mut Runtime<State>, key: &str) {
     let (x, y) = rt.find(key).unwrap_or_else(|| panic!("nothing to click at `{key}`"));
@@ -340,11 +388,13 @@ fn n_and_p_typed_in_the_search_field_are_text_and_move_nothing() {
     });
     rt.frame(0.0);
     assert!(rt.find("search-field").is_some(), "Ctrl+F didn't open the search field");
+    let before = lines_in_view(&rt);
 
     // No line says "pnew", but every one says "new": the keys didn't reach the field if it matches.
     type_text(&mut rt, "pnew");
 
     assert_eq!(texts_within(&rt, "search-count").join(""), "No matches", "`p` or `n` didn't reach the search field");
+    assert_eq!(lines_in_view(&rt), before, "a key moved the diff while the search field had focus");
 }
 
 /// A repository whose `README.md` and `a.txt` both changed, `a.txt` over a hundred lines.
