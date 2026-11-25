@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use akshually_core::{Anchor, Outcome, Round, Thread, fence_for};
+use akshually_core::{Anchor, MemberOutcome, Outcome, Round, Thread, fence_for};
 
 /// What `review --format markdown` prints for `outcome`; `pr` is the Pull Request the agent
 /// co-reviews, if any, which its commands must name.
@@ -10,12 +10,31 @@ pub(crate) fn outcome_markdown(outcome: &Outcome, pr: Option<&str>) -> String {
     match outcome {
         Outcome::Round(round) => round_markdown(round, pr),
         Outcome::Approved => "Approved.\n".to_owned(),
-        Outcome::Abandoned => {
+        Outcome::Abandoned { .. } => {
             "Abandoned: the human closed this Session without a Verdict. Stop working on this change.\n".to_owned()
         }
-        Outcome::Published { verdict, url } => format!("Published with the Verdict {verdict}: {url}\n"),
+        Outcome::Published { verdict, url, pull_requests } if pull_requests.is_empty() => {
+            format!("Published with the Verdict {verdict}: {url}\n")
+        }
+        Outcome::Published { pull_requests, .. } => stack_published_markdown(pull_requests),
         Outcome::Closed => "Closed: the human finished with your co-review. There is nothing left to do.\n".to_owned(),
     }
+}
+
+/// The outcome of a Stack with a Review Published: its first line says which Ending it was, and one
+/// line per Pull Request follows, in Stack order.
+fn stack_published_markdown(pull_requests: &[MemberOutcome]) -> String {
+    let mut out =
+        "Published: the human published their Review of at least one Pull Request of this Stack, as follows.\n"
+            .to_owned();
+    for pull_request in pull_requests {
+        let MemberOutcome { name, verdict, review, .. } = pull_request;
+        let _ = match (verdict, review) {
+            (Some(verdict), Some(review)) => writeln!(out, "- {name}: Published with the Verdict {verdict}: {review}"),
+            _ => writeln!(out, "- {name}: not Published"),
+        };
+    }
+    out
 }
 
 /// A Round as markdown: one section per Thread, headed by its stable ID and Anchor, with the
@@ -39,7 +58,8 @@ fn round_markdown(round: &Round, pr: Option<&str>) -> String {
 fn thread_markdown(out: &mut String, thread: &Thread) {
     let outdated = if thread.outdated { " · Outdated" } else { "" };
     let reopened = if thread.reopened { " · Reopened" } else { "" };
-    let _ = writeln!(out, "\n## {} · {}{outdated}{reopened}", thread.id, thread.anchor);
+    let pull_request = thread.pull_request.as_ref().map(|m| format!("{} · ", m.pull_request_name)).unwrap_or_default();
+    let _ = writeln!(out, "\n## {} · {pull_request}{}{outdated}{reopened}", thread.id, thread.anchor);
     if thread.reopened {
         out.push_str("\nThe human reopened this Thread: it isn't dealt with yet.\n");
     }

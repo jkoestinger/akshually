@@ -58,6 +58,9 @@ fn pull_request(author: &str) -> PullRequest {
         head_branch: "sso".into(),
         head_sha: "head1".into(),
         base_sha: "base1".into(),
+        base_branch: "main".into(),
+        from_fork: false,
+        ..Default::default()
     }
 }
 

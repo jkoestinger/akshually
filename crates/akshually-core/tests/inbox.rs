@@ -49,7 +49,10 @@ impl FakeForge {
             author: "maria".into(),
             created_at: 1_000,
             updated_at,
-            role,
+            role: Some(role),
+            head_branch: String::new(),
+            base_branch: String::new(),
+            from_fork: false,
             approved: false,
             verdict_given: false,
         }
@@ -75,6 +78,9 @@ impl ForgeAdapter for FakeForge {
             head_branch: "feature".into(),
             head_sha: "head".into(),
             base_sha: "base".into(),
+            base_branch: "main".into(),
+            from_fork: false,
+            ..Default::default()
         })
     }
 
@@ -403,7 +409,7 @@ fn a_pull_request_listed_as_assignee_and_reviewer_is_a_review_request() {
     svc.refresh_inbox();
 
     let inbox = svc.inbox();
-    assert_eq!(inbox.rows.iter().map(|r| r.item.role).collect::<Vec<_>>(), vec![InboxRole::Reviewer]);
+    assert_eq!(inbox.rows.iter().map(|r| r.item.role).collect::<Vec<_>>(), vec![Some(InboxRole::Reviewer)]);
     assert!(inbox.attention, "a new review request");
 }
 

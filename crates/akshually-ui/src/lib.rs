@@ -18,9 +18,9 @@ use rune_kit::{
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxView, NewComment, Party, PublishPlan, Role, Service, SessionActions,
-    SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage,
-    UpdateView, Verdict, VerdictAction, WindowView, fence_for,
+    HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
+    PublishPlan, Role, Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread,
+    ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -30,6 +30,11 @@ const INBOX_TAB: &str = "inbox";
 /// The Changeset view dropdown's list width in points: "Since Session base" whole, with the
 /// list's padding and check. `Select`'s own minimum (160) cuts it off.
 const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
+/// The Stack Member picker's list width in points: a reference, a title and what is said of it
+/// in one line, which wraps when it is longer.
+const MEMBER_LIST_MIN_WIDTH: f32 = 420.0;
+/// The Member picker's last entry, which shows what the whole Stack changes.
+const WHOLE_STACK: &str = "Whole Stack";
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 /// The tallest the Publish dialog's list of Drafts grows before it scrolls, in a window tall
@@ -218,6 +223,8 @@ struct SessionTab {
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
+    /// The header's Stack Member picker is open. Kept per Session, like `choosing_view`.
+    choosing_member: bool,
     /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
     /// lost on restart.
     rendered: Option<String>,
@@ -229,7 +236,15 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, &session);
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None };
+        let mut tab = SessionTab {
+            session,
+            actions,
+            diff,
+            expanded: Vec::new(),
+            choosing_view: false,
+            choosing_member: false,
+            rendered: None,
+        };
         tab.annotate(None);
         tab
     }
@@ -607,6 +622,25 @@ impl State {
         }
     }
 
+    /// Opens or closes the Stack Member picker in the header of `id`'s tab.
+    fn choose_member(&mut self, id: &SessionId, open: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
+            tab.choosing_member = open;
+        }
+    }
+
+    /// Shows the Member `pr` of the Stack in `id`'s Session.
+    fn select_member(&self, id: &SessionId, pr: &PullRequestRef) {
+        report(self.service.select_member(id, pr));
+    }
+
+    /// Shows the Stack Changeset in `id`'s Session, fetched off the UI thread (the Forge may be
+    /// slow). A failure to fetch shows in its place, not here.
+    fn select_stack_changeset(&mut self, id: &SessionId) {
+        let id = id.clone();
+        self.off_ui(move |service| service.select_stack_changeset(&id), |_, selected| report(selected));
+    }
+
     fn annotate(&mut self) {
         for tab in &mut self.tabs {
             tab.annotate(self.composer.as_ref());
@@ -869,7 +903,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(push_banner(k, tab))
             .child(general_threads(k, s, tab, agent))
             .child(outdated_threads(k, tab))
-            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab, agent))),
+            .children(stack_changeset_notice(k, &tab.session))
+            .child(col().grow(1.0).min_h(0.0).child(match tab.session.stack_changeset() {
+                Some(Err(error)) => stack_changeset_error(k, error),
+                _ => session_diff(k, s, tab, agent),
+            })),
         None => {
             let draft = theme::tokens(cx.system_dark()).color("state-draft");
             col()
@@ -976,8 +1014,25 @@ fn inbox_view(k: &Kit, s: &State, draft: Color) -> El {
         );
     let errors = s.inbox.errors.iter().map(|e| text(e.clone()).font(k.ty.small).color(k.c.danger.fg).wrap());
     let mut list = col().key("inbox-rows").w_full().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_base);
-    for inbox_row in &s.inbox.rows {
-        list = list.child(inbox_row_view(k, inbox_row, now, draft));
+    let mut rows = s.inbox.rows.iter().peekable();
+    while let Some(inbox_row) = rows.next() {
+        let Some(InboxStack { size, .. }) = inbox_row.stack else {
+            list = list.child(inbox_row_view(k, inbox_row, now, draft));
+            continue;
+        };
+        // A Stack's Members follow each other, bottom first: they are one group, set apart from
+        // the rows around it.
+        let mut group = col()
+            .key(format!("inbox-stack-{}", inbox_row.item.url))
+            .w_full()
+            .fill(k.c.layer_02)
+            .border_sides([0.0, 0.0, 1.0, 3.0], k.c.border_base)
+            .child(text(format!("Stack of {size}")).font(k.ty.small).color(k.c.text_muted).px(12.0).pt(8.0))
+            .child(inbox_row_view(k, inbox_row, now, draft));
+        for member in rows.by_ref().take(size - 1) {
+            group = group.child(inbox_row_view(k, member, now, draft));
+        }
+        list = list.child(group);
     }
     let empty = s.inbox.rows.is_empty().then(|| {
         let note = if s.inbox.refreshed_at.is_some() { "Nothing waiting for you." } else { "Not refreshed yet." };
@@ -1009,9 +1064,15 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
     };
     let unseen = matches!(inbox_row.state, InboxRowState::New | InboxRowState::Updated);
     let dot = row().w(8.0).h(8.0).radius(4.0).fill(if unseen { k.c.warning.fg } else { Color::TRANSPARENT });
-    let role = match item.role {
-        InboxRole::Reviewer => "Requested reviewer",
-        InboxRole::Assignee => "Assignee",
+    // The mark only means something next to the Members that are requested.
+    let grouped = inbox_row.stack.is_some();
+    let role = match (inbox_row.standing, item.role) {
+        (InboxStanding::NotRequested, _) if grouped => "Not requested",
+        (InboxStanding::VerdictGiven, _) if grouped => "Verdict given",
+        (InboxStanding::Approved, _) if grouped => "Approved",
+        (_, Some(InboxRole::Reviewer)) => "Requested reviewer",
+        (_, Some(InboxRole::Assignee)) => "Assignee",
+        (_, None) => "Not requested",
     };
     let url = item.url.clone();
     row()
@@ -1078,9 +1139,15 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
     row().gap(8.0).items_center().children(status).child(field)
 }
 
-/// A Pull Request Session's header. Its Drafts stay in the Session until Publish.
-fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
+/// A Pull Request Session's header. Its Drafts stay in the Session until Publish. A Stack of
+/// several Members has the picker that switches between them, whose list goes into `layer`.
+fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
+    let picker = member_picker(k, tab, layer);
+    if session.stack_changeset_selected() {
+        return stack_changeset_header(k, tab, picker);
+    }
+    let published = session.published.as_ref().map(|p| Badge::new(format!("Published · {}", verdict_label(p.verdict))));
     let base = &session.changeset.base[..session.changeset.base.len().min(SHORT_HASH)];
     let publish_id = session.id.clone();
     row()
@@ -1091,25 +1158,111 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .gap(12.0)
         .items_center()
         .fill(k.c.layer_01)
+        .children(picker)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
         .child(layout_control(k, tab))
+        .children(published.map(|badge| badge.build(k)))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
-        .child(
+        // A Published Member takes no more Drafts.
+        .children(session.published.is_none().then(|| {
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut State| s.compose_general(None))
-                .build(k),
-        )
+                .build(k)
+        }))
         .children(tab.actions.hand_over.map(|hand_over| hand_over_button(k, tab, hand_over)))
         .child(
             Button::new("Publish…")
                 .variant(ButtonVariant::Submit)
-                .disabled(session.ended.is_some())
+                .disabled(session.ended.is_some() || session.published.is_some())
                 .on_press(move |s: &mut State| s.open_publish(publish_id.clone()))
                 .build(k),
         )
+}
+
+/// The header while the Stack Changeset is shown: for reading only, so with no Drafts, Verdict
+/// or Publish.
+fn stack_changeset_header(k: &Kit, tab: &SessionTab, picker: Option<El>) -> El {
+    let session = &tab.session;
+    let members = session.members_in_stack();
+    let base = &session.shown().base[..session.shown().base.len().min(SHORT_HASH)];
+    row()
+        .key("session-header")
+        .w_full()
+        .h(56.0)
+        .px(16.0)
+        .gap(12.0)
+        .items_center()
+        .fill(k.c.layer_01)
+        .children(picker)
+        .child(text("Whole Stack").font(k.ty.ui_medium).color(k.c.text_base))
+        .child(text(format!("{members} Pull Requests → {base}")).font(k.ty.mono).color(k.c.text_muted))
+        .child(row().grow(1.0))
+        .child(layout_control(k, tab))
+}
+
+/// The picker of a Stack's Members, bottom to top; `None` for a Stack of one. Each entry says
+/// which Pull Request it is, how many Drafts its Review holds and its Verdict once Published,
+/// and when it left the Stack. A Stack of two or more ends with the Stack Changeset.
+fn member_picker(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
+    let session = &tab.session;
+    let members = session.stack();
+    if members.len() < 2 {
+        return None;
+    }
+    let mut labels: Vec<String> = members.iter().map(member_label).collect();
+    let mut current = members.iter().position(|m| m.selected).and_then(|at| labels.get(at)).cloned();
+    if session.offers_stack_changeset() {
+        labels.push(WHOLE_STACK.to_owned());
+    }
+    if session.stack_changeset_selected() {
+        current = Some(WHOLE_STACK.to_owned());
+    }
+    let open = tab.choosing_member;
+    let (toggle_id, close_id, choose_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let picker = Select::new("stack-member", &labels)
+        .label("Pull Request of the Stack")
+        .appearance(SelectAppearance::Inline)
+        .current(current.as_deref())
+        .open(open)
+        .on_toggle(move |s: &mut State| s.choose_member(&toggle_id, !open))
+        .on_close(move |s: &mut State| s.choose_member(&close_id, false))
+        .on_choose(move |s: &mut State, label: &str, _: &mut Tx| {
+            s.choose_member(&choose_id, false);
+            if label == WHOLE_STACK {
+                s.select_stack_changeset(&choose_id);
+            } else if let Some(member) = members.iter().find(|m| member_label(m) == label) {
+                s.select_member(&choose_id, &member.pull_request.id);
+            }
+        })
+        .build(k, layer);
+    // Like the view list, it would be cut off at `Select`'s own minimum width.
+    if open && let Some(list) = layer.pop() {
+        layer.push(list.min_w(MEMBER_LIST_MIN_WIDTH));
+    }
+    Some(picker)
+}
+
+/// How a Stack's Member reads in the picker.
+fn member_label(member: &MemberView) -> String {
+    let drafts = match member.drafts {
+        1 => "1 Draft".to_owned(),
+        n => format!("{n} Drafts"),
+    };
+    let mut label = format!("{} {} · {drafts}", member.pull_request.reference(), member.pull_request.title);
+    if let Some(published) = &member.published {
+        label.push_str(&format!(" · Published, {}", verdict_label(published.verdict)));
+    }
+    if !member.in_stack {
+        label.push_str(" · no longer part of the Stack");
+    }
+    // A push to a Member that isn't shown marks the tab: this says which one.
+    if member.update.is_some() {
+        label.push_str(" · updated");
+    }
+    label
 }
 
 /// Hands the next Round over: in a co-review, the human's questions on the agent's Drafts.
@@ -1359,7 +1512,7 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
-        return pull_request_header(k, tab, pr);
+        return pull_request_header(k, tab, pr, layer);
     }
     let shown = session.shown();
     let base = format!("→ {}", &shown.base[..shown.base.len().min(SHORT_HASH)]);
@@ -1580,7 +1733,9 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id_header = id.clone();
     let id_comment = id.clone();
     let kc = k.clone();
-    DiffView::new(
+    // The Stack Changeset is for reading only: no "+" on its lines, no Comment on a file.
+    let read_only = tab.session.stack_changeset_selected();
+    let diff = DiffView::new(
         move |s: &State| s.tab(&id).map_or(&s.spare_diff, |t| &t.diff),
         // Not `tab_mut`: borrowing all of `s` for the found tab would keep `spare_diff` borrowed
         // in the `None` arm too; borrowing the `tabs` field alone leaves `spare_diff` free.
@@ -1602,7 +1757,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             .items_center()
             .child(text(note).font(kc.ty.small).color(kc.c.text_muted))
             .children(rendered_button(&kc, &tab.session.id, change))
-            .child(
+            .children((!read_only).then(|| {
                 Button::new("Comment on file")
                     .variant(ButtonVariant::GhostMuted)
                     .on_press(move |s: &mut State| {
@@ -1611,21 +1766,25 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
                             s.compose_general(Some(file));
                         }
                     })
-                    .build(&kc),
-            )
-            .child(
+                    .build(&kc)
+            }))
+            // The files of the Stack Changeset are no Member's to tick.
+            .children((!read_only).then(|| {
                 Checkbox::new(viewed)
                     .label("Viewed")
                     .on_toggle(move |s: &mut State| s.mark_viewed(&id, &path, !viewed))
                     .build(&kc)
-                    .key(format!("viewed-{}", change.path)),
-            )
+                    .key(format!("viewed-{}", change.path))
+            }))
     })
     .annotation({
         let k = k.clone();
         move |s: &State, a: &Annotation| annotation(&k, s, a, agent)
-    })
-    .on_comment(move |s: &mut State, range: LineRange, _: &mut Tx| {
+    });
+    if read_only {
+        return diff.build(s, k);
+    }
+    diff.on_comment(move |s: &mut State, range: LineRange, _: &mut Tx| {
         // `compose` goes to the displayed Session; a stale "+" must not open a composer on another
         // Session at this one's lines.
         if s.displayed.is_session(&id_comment) {
@@ -1635,12 +1794,29 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     .build(s, k)
 }
 
+/// Says the Stack Changeset shown is only part of what the Stack changes, when the Forge cut it
+/// short.
+fn stack_changeset_notice(k: &Kit, session: &SessionView) -> Option<El> {
+    let reason = session.stack_changeset_cut_off()?;
+    Some(row().key("stack-changeset-cut-off").w_full().px(16.0).py(8.0).child(
+        text(format!("This Stack Changeset is cut off, not complete: {reason}.")).font(k.ty.ui).color(k.c.warning.fg),
+    ))
+}
+
+/// Where the Stack Changeset's diff would be, when fetching it failed.
+fn stack_changeset_error(k: &Kit, error: &str) -> El {
+    card(k)
+        .key("stack-changeset-error")
+        .padding(16.0)
+        .child(text(format!("Couldn't fetch the Stack Changeset: {error}")).font(k.ty.ui).color(k.c.text_base))
+}
+
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
 /// and the composer when it's writing one.
 fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     // Outdated File Threads show with the other Outdated Threads instead.
     let general = |t: &Thread| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. });
-    let threads: Vec<&Thread> = tab.session.threads.iter().filter(|t| general(t)).collect();
+    let threads: Vec<&Thread> = tab.session.threads_shown().iter().filter(|t| general(t)).collect();
     let composing = s.composer.as_ref().is_some_and(|c| c.session == tab.session.id && c.at.is_none());
     if threads.is_empty() && !composing {
         return col();
@@ -1989,7 +2165,7 @@ fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
 /// they were written against and their Comments.
 fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
     let mut list = col().key("outdated-threads").w_full().px(16.0).gap(8.0);
-    for thread in tab.session.threads.iter().filter(|t| t.outdated) {
+    for thread in tab.session.threads_shown().iter().filter(|t| t.outdated) {
         let expanded = tab.expanded.contains(&thread.id);
         let first = first_line(thread);
         let count = match thread.comments.len() {
@@ -2125,6 +2301,11 @@ fn scene_session(s: &mut State) {
         attention: false,
         changed_on_disk: Default::default(),
         pull_request_update: None,
+        members: Vec::new(),
+        selected: 0,
+        published: None,
+        opened: None,
+        stack_changeset: Default::default(),
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
@@ -2164,6 +2345,7 @@ fn scene_threads(s: &mut State) {
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     };
     let session = SessionView {
         id: SessionId::new("sample"),
@@ -2182,6 +2364,11 @@ fn scene_threads(s: &mut State) {
         attention: false,
         changed_on_disk: ["src/round.rs".to_owned(), "src/session.rs".to_owned()].into(),
         pull_request_update: None,
+        members: Vec::new(),
+        selected: 0,
+        published: None,
+        opened: None,
+        stack_changeset: Default::default(),
         round: 1,
         threads: vec![
             thread(
@@ -2283,7 +2470,10 @@ fn scene_inbox(s: &mut State) {
         author: author.into(),
         created_at: now - opened_h * 3600,
         updated_at: now - 600,
-        role,
+        role: Some(role),
+        base_branch: "main".into(),
+        head_branch: format!("pr-{number}"),
+        from_fork: false,
         approved: false,
         verdict_given: false,
     };
@@ -2310,7 +2500,10 @@ fn scene_inbox(s: &mut State) {
     scene_session(s);
     s.open_inbox();
     s.inbox = InboxView {
-        rows: rows.into_iter().map(|(item, state)| InboxRow { item, state }).collect(),
+        rows: rows
+            .into_iter()
+            .map(|(item, state)| InboxRow { item, state, standing: InboxStanding::Listed, stack: None })
+            .collect(),
         refreshed_at: Some(now - 60),
         errors: Vec::new(),
         hosts: vec!["github.com".into(), "gitlab.example.com".into()],
@@ -2328,6 +2521,10 @@ fn scene_publish(s: &mut State) {
         head_branch: "sso".into(),
         head_sha: "head1".into(),
         base_sha: "base1".into(),
+        base_branch: "main".into(),
+        from_fork: false,
+        created_at: 0,
+        updated_at: 0,
     };
     let mut suggested = sample_thread("T1", 3..=3, "Name it for what it holds.", None);
     suggested.comments[0].suggestion = Some("    let before = self.changeset.snapshot()?;\n".into());
@@ -2426,6 +2623,7 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     }
 }
 

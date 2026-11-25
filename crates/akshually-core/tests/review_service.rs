@@ -91,7 +91,7 @@ fn abandoning_returns_abandoned_to_the_waiting_review_and_ends_the_session() {
 
     svc.abandon(&id).unwrap();
 
-    assert_eq!(pending.wait_timeout(Duration::from_secs(1)), Some(Outcome::Abandoned));
+    assert_eq!(pending.wait_timeout(Duration::from_secs(1)), Some(Outcome::Abandoned { pull_requests: vec![] }));
     assert!(svc.session(&id).is_none());
 }
 
@@ -1666,7 +1666,7 @@ fn abandoning_while_no_review_waits_tells_the_next_review() {
     svc.abandon(&id).unwrap();
 
     let next = svc.review(ReviewRequest::new(repo.path())).unwrap();
-    assert_eq!(next.wait_timeout(Duration::from_secs(1)), Some(Outcome::Abandoned));
+    assert_eq!(next.wait_timeout(Duration::from_secs(1)), Some(Outcome::Abandoned { pull_requests: vec![] }));
     assert!(svc.session(&id).is_none());
 }
 

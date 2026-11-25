@@ -1,0 +1,29 @@
+[
+  {
+    "number": 482,
+    "html_url": "https://github.com/acme/web/pull/482",
+    "title": "Add SSO login",
+    "user": { "login": "maria" },
+    "state": "open",
+    "head": { "ref": "sso", "sha": "head1", "repo": { "full_name": "acme/web" } },
+    "base": { "ref": "session-store", "sha": "base1", "repo": { "full_name": "acme/web" } }
+  },
+  {
+    "number": 490,
+    "html_url": "https://github.com/acme/web/pull/490",
+    "title": "Fix typo",
+    "user": { "login": "outsider" },
+    "state": "open",
+    "head": { "ref": "typo", "sha": "headF", "repo": { "full_name": "outsider/web" } },
+    "base": { "ref": "session-store", "sha": "baseF", "repo": { "full_name": "acme/web" } }
+  },
+  {
+    "number": 491,
+    "html_url": "https://github.com/acme/web/pull/491",
+    "title": "From a deleted fork",
+    "user": { "login": "ghost" },
+    "state": "open",
+    "head": { "ref": "gone", "sha": "headG", "repo": null },
+    "base": { "ref": "session-store", "sha": "baseG", "repo": { "full_name": "acme/web" } }
+  }
+]

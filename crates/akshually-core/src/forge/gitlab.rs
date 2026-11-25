@@ -10,8 +10,9 @@ use ureq::{Body, RequestBuilder};
 use url::Url;
 
 use super::{
-    CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, epoch_seconds, fetch_files,
+    Comparison, CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole,
+    PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review, ReviewComment, epoch_seconds,
+    fetch_files,
     http::{Client, Dialect, host_matches, not_found_as},
     with_suggestion,
 };
@@ -116,6 +117,39 @@ impl GitLab {
         self.pages(&self.merge_request_url(pr, &["diffs"])).map_err(|e| not_found_as(e, pr))
     }
 
+    /// The open merge requests of the project `repo` whose `filter` (`source_branch` or
+    /// `target_branch`) is `branch`, as the list gives them: the list leaves out the diff refs, so
+    /// their `base_sha` is empty until [`GitLab::complete`] fetches the whole one.
+    fn open_merge_requests(&self, repo: &str, filter: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            iid: u64,
+            #[serde(flatten)]
+            mr: ListedMergeRequest,
+        }
+        let mut url = self.client.endpoint(&["projects", repo, "merge_requests"]);
+        url.query_pairs_mut().append_pair("state", "opened").append_pair(filter, branch).append_pair("per_page", PAGE);
+        let listed: Vec<Listed> = self.get_json(&url)?;
+        let host = self.client.host();
+        let time = |t: &str| epoch_seconds(t).unwrap_or(0);
+        Ok(listed
+            .into_iter()
+            .map(|Listed { iid, mr }| PullRequest {
+                id: PullRequestRef { host: host.to_owned(), repo: repo.to_owned(), number: iid },
+                url: mr.web_url,
+                title: mr.title,
+                author: login(mr.author),
+                head_branch: mr.source_branch,
+                head_sha: mr.sha,
+                base_sha: String::new(),
+                base_branch: mr.target_branch,
+                from_fork: matches!((mr.source_project_id, mr.target_project_id), (Some(s), Some(t)) if s != t),
+                created_at: time(&mr.created_at),
+                updated_at: time(&mr.updated_at),
+            })
+            .collect())
+    }
+
     /// Whether the human can approve `pr`, and whether they have.
     fn approvals(&self, pr: &PullRequestRef) -> Result<Approvals, ForgeError> {
         self.get_json(&self.merge_request_url(pr, &["approvals"])).map_err(|e| not_found_as(e, pr))
@@ -140,12 +174,67 @@ impl GitLab {
         }
     }
 
+    /// The Changeset of `listed` files of the project `repo`, from `base` to `head`, with their
+    /// contents on both sides read from the Forge.
+    fn diffs_changeset(&self, repo: &str, listed: Vec<Diff>, base: &str, head: &str) -> Result<Changeset, ForgeError> {
+        // Like the local Source, renames are a deletion plus an addition. GitLab takes line
+        // comments only on the lines its diff shows, so each file keeps the diff's hunks (none
+        // for a diff GitLab collapsed or found too large).
+        let mut fetches = Vec::new();
+        for diff in listed {
+            let hunks = Some(Hunk::parse_patch(&diff.diff));
+            let fetch = |path: &String, old: Option<&String>, new: Option<&String>| FileFetch {
+                path: path.clone(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks: hunks.clone(),
+            };
+            let (old, new) = (&diff.old_path, &diff.new_path);
+            if diff.new_file {
+                fetches.push(fetch(new, None, Some(new)));
+            } else if diff.deleted_file {
+                fetches.push(fetch(old, Some(old), None));
+            } else if diff.renamed_file {
+                fetches.push(fetch(old, Some(old), None));
+                fetches.push(fetch(new, None, Some(new)));
+            } else {
+                fetches.push(fetch(new, Some(old), Some(new)));
+            }
+        }
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files =
+            fetch_files(&fetches, |path, side| self.file(repo, path, if side == Side::Old { base } else { head }))?;
+        Ok(Changeset { base: base.to_owned(), files })
+    }
+
     /// A file's contents at `sha`.
-    fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
-        let mut url = self.client.endpoint(&["projects", &pr.repo, "repository", "files", path, "raw"]);
+    fn file(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
+        let mut url = self.client.endpoint(&["projects", repo, "repository", "files", path, "raw"]);
         url.query_pairs_mut().append_pair("ref", sha);
         self.client.file(self.client.agent().get(url.as_str()))
     }
+}
+
+/// A merge request as GitLab's list of them gives it, less than the one merge request does: no
+/// diff refs.
+#[derive(Deserialize)]
+struct ListedMergeRequest {
+    web_url: String,
+    title: String,
+    author: Option<User>,
+    source_branch: String,
+    target_branch: String,
+    #[serde(default)]
+    source_project_id: Option<u64>,
+    #[serde(default)]
+    target_project_id: Option<u64>,
+    /// The head commit.
+    #[serde(default)]
+    sha: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
 }
 
 /// A merge request as GitLab's REST API answers it.
@@ -155,8 +244,25 @@ struct MergeRequest {
     title: String,
     author: User,
     source_branch: String,
+    target_branch: String,
+    /// The projects of the branches: a merge request from a fork has its own source project.
+    #[serde(default)]
+    source_project_id: Option<u64>,
+    #[serde(default)]
+    target_project_id: Option<u64>,
     /// Null while GitLab is still preparing the diff.
     diff_refs: Option<DiffRefs>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+impl MergeRequest {
+    /// Its source branch is in another project than the one it asks to merge into.
+    fn is_from_fork(&self) -> bool {
+        matches!((self.source_project_id, self.target_project_id), (Some(s), Some(t)) if s != t)
+    }
 }
 
 #[derive(Deserialize)]
@@ -360,6 +466,9 @@ impl ForgeAdapter for GitLab {
 
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError> {
         let mr: MergeRequest = self.get_json(&self.merge_request_url(pr, &[])).map_err(|e| not_found_as(e, pr))?;
+        let from_fork = mr.is_from_fork();
+        let time = |t: &str| epoch_seconds(t).unwrap_or(0);
+        let (created_at, updated_at) = (time(&mr.created_at), time(&mr.updated_at));
         let refs =
             mr.diff_refs.ok_or_else(|| self.client.unexpected(format!("{pr} has no diff yet; try again shortly")))?;
         Ok(PullRequest {
@@ -371,41 +480,46 @@ impl ForgeAdapter for GitLab {
             head_sha: refs.head_sha,
             // GitLab's diff is against the merge-base, which it names.
             base_sha: refs.base_sha,
+            base_branch: mr.target_branch,
+            from_fork,
+            created_at,
+            updated_at,
         })
     }
 
+    fn complete(&self, pr: PullRequest) -> Result<PullRequest, ForgeError> {
+        // The list gave no merge-base; a merge request fetched whole has it.
+        if pr.base_sha.is_empty() { self.pull_request(&pr.id) } else { Ok(pr) }
+    }
+
+    fn open_with_head_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_merge_requests(repo, "source_branch", branch)
+    }
+
+    fn open_with_target_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_merge_requests(repo, "target_branch", branch)
+    }
+
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
-        let id = &pr.id;
-        let listed = self.diffs(id)?;
-        // Like the local Source, renames are a deletion plus an addition. GitLab takes line
-        // comments only on the lines its diff shows, so each file keeps the diff's hunks (none
-        // for a diff GitLab collapsed or found too large).
-        let mut fetches = Vec::new();
-        for diff in listed {
-            let hunks = Some(Hunk::parse_patch(&diff.diff));
-            let fetch = |path: &String, old: Option<&String>, new: Option<&String>| FileFetch {
-                path: path.clone(),
-                old: old.cloned(),
-                new: new.cloned(),
-                hunks: hunks.clone(),
-            };
-            let (old, new) = (&diff.old_path, &diff.new_path);
-            if diff.new_file {
-                fetches.push(fetch(new, None, Some(new)));
-            } else if diff.deleted_file {
-                fetches.push(fetch(old, Some(old), None));
-            } else if diff.renamed_file {
-                fetches.push(fetch(old, Some(old), None));
-                fetches.push(fetch(new, None, Some(new)));
-            } else {
-                fetches.push(fetch(new, Some(old), Some(new)));
-            }
+        let listed = self.diffs(&pr.id)?;
+        self.diffs_changeset(&pr.id.repo, listed, &pr.base_sha, &pr.head_sha)
+    }
+
+    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Comparison, ForgeError> {
+        #[derive(Deserialize)]
+        struct Answer {
+            diffs: Vec<Diff>,
+            /// The comparison hit a size limit or timed out: its diffs may be incomplete.
+            #[serde(default)]
+            compare_timeout: bool,
         }
-        fetches.sort_by(|a, b| a.path.cmp(&b.path));
-        let files = fetch_files(&fetches, |path, side| {
-            self.file(id, path, if side == Side::Old { &pr.base_sha } else { &pr.head_sha })
-        })?;
-        Ok(Changeset { base: pr.base_sha.clone(), files })
+        let mut url = self.client.endpoint(&["projects", repo, "repository", "compare"]);
+        // Straight, so the old side is `base` itself, which is the merge-base of the bottom Member.
+        url.query_pairs_mut().append_pair("from", base).append_pair("to", head).append_pair("straight", "true");
+        let answer: Answer = self.get_json(&url)?;
+        let cut_off = answer.compare_timeout.then(|| "GitLab stopped comparing before it was done".to_owned());
+        let changeset = self.diffs_changeset(repo, answer.diffs, base, head)?;
+        Ok(Comparison { changeset, cut_off })
     }
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
@@ -512,7 +626,7 @@ impl ForgeAdapter for GitLab {
             item.approved = approvals.met();
             // The only Verdict GitLab records from someone it doesn't list as a reviewer.
             item.verdict_given = approvals.user_has_approved;
-            if item.role == InboxRole::Reviewer {
+            if item.role == Some(InboxRole::Reviewer) {
                 let url = self.merge_request_url(&item.id, &["reviewers"]);
                 let reviewers: Vec<Reviewer> = self.get_json(&url).map_err(|e| not_found_as(e, &item.id))?;
                 item.verdict_given |= reviewers.iter().any(|r| r.user.username == me && r.verdict_given());
@@ -535,6 +649,14 @@ impl GitLab {
             references: References,
             created_at: String,
             updated_at: String,
+            #[serde(default)]
+            source_branch: String,
+            #[serde(default)]
+            target_branch: String,
+            #[serde(default)]
+            source_project_id: Option<u64>,
+            #[serde(default)]
+            target_project_id: Option<u64>,
         }
         #[derive(Deserialize)]
         struct References {
@@ -563,7 +685,10 @@ impl GitLab {
                     author: login(mr.author),
                     created_at: time(&mr.created_at)?,
                     updated_at: time(&mr.updated_at)?,
-                    role,
+                    role: Some(role),
+                    head_branch: mr.source_branch,
+                    base_branch: mr.target_branch,
+                    from_fork: matches!((mr.source_project_id, mr.target_project_id), (Some(s), Some(t)) if s != t),
                     approved: false,
                     verdict_given: false,
                 })

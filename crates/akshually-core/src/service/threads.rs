@@ -19,7 +19,7 @@ impl SessionKey {
     fn find(self, sessions: &[Session]) -> Result<usize, Error> {
         let found = sessions.iter().position(|s| match &self {
             SessionKey::Local { repo, branch } => s.view.is_local(repo, branch),
-            SessionKey::PullRequest(pr, _) => s.view.pull_request().is_some_and(|p| &p.id == pr),
+            SessionKey::PullRequest(pr, _) => s.view.has_member(pr),
         });
         if let Some(at) = found {
             return Ok(at);
@@ -98,10 +98,14 @@ impl Service {
     ) -> Result<(), Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let view = &mut inner.sessions[at].view;
-        offered(&view.thread_offered(thread)?)?;
-        let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`thread_offered` found it");
-        f(found);
+        let session = &mut inner.sessions[at];
+        session.at_member_of(thread, |session| {
+            let view = &mut session.view;
+            offered(&view.thread_offered(thread)?)?;
+            let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`thread_offered` found it");
+            f(found);
+            Ok::<(), Error>(())
+        })?;
         inner.notify();
         Ok(())
     }
@@ -115,15 +119,33 @@ impl Service {
         f: impl FnOnce(u32, &mut Thread),
     ) -> Result<(), Error> {
         let key = self.session_key(source)?;
+        let key_member = match &key {
+            SessionKey::PullRequest(pr, _) => Some(pr.clone()),
+            SessionKey::Local { .. } => None,
+        };
         let mut inner = self.lock();
         let at = key.find(&inner.sessions)?;
         let session = &mut inner.sessions[at];
         let round = session.view.round;
-        // Only a Round tells the agent about a Thread: one of its own Drafts nobody questioned,
-        // or one already on the Forge, isn't the agent's to answer.
-        let found =
-            session.view.threads.iter_mut().find(|t| &t.id == thread && t.comments.iter().any(|c| c.round.is_some()));
-        f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+        // The Member its URL names, which isn't the one shown, perhaps.
+        let member = match &key_member {
+            Some(pr) => session.view.member_position(pr).unwrap_or(session.view.selected),
+            None => session.view.selected,
+        };
+        session.at_member(member, |session| {
+            if session.view.is_published() {
+                return Err(Error::AlreadyPublished);
+            }
+            // Only a Round tells the agent about a Thread: one of its own Drafts nobody questioned,
+            // or one already on the Forge, isn't the agent's to answer.
+            let found = session
+                .view
+                .threads
+                .iter_mut()
+                .find(|t| &t.id == thread && t.comments.iter().any(|c| c.round.is_some()));
+            f(round, found.ok_or_else(|| Error::UnknownThread(thread.clone()))?);
+            Ok::<(), Error>(())
+        })?;
         inner.notify();
         Ok(())
     }
