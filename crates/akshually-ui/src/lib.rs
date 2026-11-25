@@ -1093,6 +1093,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .fill(k.c.layer_01)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
+        .child(changeset_totals(k, tab))
         .child(row().grow(1.0))
         .child(layout_control(k, tab))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
@@ -1110,6 +1111,26 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
                 .on_press(move |s: &mut State| s.open_publish(publish_id.clone()))
                 .build(k),
         )
+}
+
+/// The totals of the Changeset shown: its files, and the lines added and removed across them,
+/// summed from the same per-file counts the diff's file headers draw so the two always agree.
+/// Unlike a file header, it writes a zero count, so the text keeps its shape.
+fn changeset_totals(k: &Kit, tab: &SessionTab) -> El {
+    let files = tab.diff.files();
+    let (added, removed) = files.iter().fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
+    let count = files.len();
+    row()
+        .key("changeset-totals")
+        .gap(8.0)
+        .items_center()
+        .child(
+            text(format!("{count} {}", if count == 1 { "file" } else { "files" }))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        )
+        .child(text(format!("+{added}")).font(k.ty.small).color(k.c.success.fg).key("total-adds"))
+        .child(text(format!("−{removed}")).font(k.ty.small).color(k.c.danger.fg).key("total-dels"))
 }
 
 /// Hands the next Round over: in a co-review, the human's questions on the agent's Drafts.
@@ -1394,6 +1415,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .fill(k.c.layer_01)
         .child(text(session.branch().to_owned()).font(k.ty.mono).color(k.c.text_base))
         .child(text(base).font(k.ty.mono).color(k.c.text_muted))
+        .child(changeset_totals(k, tab))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
