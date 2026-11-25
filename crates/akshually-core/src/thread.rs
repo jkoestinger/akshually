@@ -135,12 +135,17 @@ pub struct Thread {
     pub pull_request: Option<PullRequestMark>,
 }
 
+/// How many Drafts `threads` hold.
+pub(crate) fn drafts_in(threads: &[Thread]) -> usize {
+    threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
+}
+
 /// The Pull Request of a Stack a Thread belongs to, as a Round tells the agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestMark {
     /// Its web page.
     pub pull_request: String,
-    /// How the agent names it: `acme/web #482`.
+    /// How the agent names it, as its Forge does: `acme/web #482`, `platform/infra !97`.
     pub pull_request_name: String,
 }
 

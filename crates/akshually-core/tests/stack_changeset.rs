@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use akshually_core::forge::{
-    ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread, Review,
+    Comparison, ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteAnchor, RemoteComment, RemoteThread,
+    Review,
 };
 use akshually_core::{Anchor, Changeset, Error, FileChange, Service, SessionId, SessionView, Side, Verdict};
 
@@ -17,6 +18,8 @@ struct World {
     pushed: HashMap<u64, String>,
     /// The Forge can't compare commits.
     broken: bool,
+    /// The Forge cuts every comparison short.
+    cut_off: bool,
     /// Every comparison asked for: base, then head.
     compared: Vec<(String, String)>,
 }
@@ -34,7 +37,7 @@ fn url(number: u64) -> String {
     format!("https://forge.test/acme/web/pull/{number}")
 }
 
-/// What the file of the Stack holds at a commit: each member adds a line to it, and the top one
+/// What the file of the Stack holds at a commit: each Member adds a line to it, and the top one
 /// takes the middle one's line out again.
 fn text_at(commit: &str) -> &'static str {
     match commit {
@@ -74,6 +77,10 @@ impl FakeForge {
         self.world.lock().unwrap().open.retain(|(n, ..)| *n != number);
     }
 
+    fn cut_comparisons_short(&self) {
+        self.world.lock().unwrap().cut_off = true;
+    }
+
     fn break_comparisons(&self, broken: bool) {
         self.world.lock().unwrap().broken = broken;
     }
@@ -103,6 +110,7 @@ impl FakeForge {
             base_sha: format!("base{number}"),
             base_branch: base,
             from_fork: false,
+            ..Default::default()
         }
     }
 }
@@ -132,20 +140,26 @@ impl ForgeAdapter for FakeForge {
 
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
         let path = format!("f{}.rs", pr.id.number);
-        let (old, new) = ("fn a() {}\n", "fn a() {\n    b();\n}\n");
-        Ok(Changeset { base: pr.base_sha.clone(), files: vec![FileChange::text(&path, Some(old), Some(new))] })
+        // A push adds a line on top, which moves the code a Thread is on.
+        let pushed = self.world.lock().unwrap().pushed.contains_key(&pr.id.number);
+        let new = if pushed { "// pushed\nfn a() {\n    b();\n}\n" } else { "fn a() {\n    b();\n}\n" };
+        Ok(Changeset {
+            base: pr.base_sha.clone(),
+            files: vec![FileChange::text(&path, Some("fn a() {}\n"), Some(new))],
+        })
     }
 
-    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Changeset, ForgeError> {
+    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Comparison, ForgeError> {
         assert_eq!(repo, "acme/web");
         let mut world = self.world.lock().unwrap();
         world.compared.push((base.into(), head.into()));
         if world.broken {
             return Err(ForgeError::Api { host: "forge.test".into(), status: 500, message: "compare is down".into() });
         }
-        // Named as the first member's file, so a Thread of that member would be placed on it.
+        // Named as the first Member's file, so a Thread of that Member would be placed on it.
         let file = FileChange::text("f1.rs", Some(text_at(base)), Some(text_at(head)));
-        Ok(Changeset { base: base.into(), files: vec![file] })
+        let changeset = Changeset { base: base.into(), files: vec![file] };
+        Ok(Comparison { changeset, cut_off: world.cut_off.then(|| "the Forge lists at most 300 files".to_owned()) })
     }
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
@@ -238,7 +252,7 @@ fn the_stack_changeset_is_fetched_when_first_selected_and_only_again_when_the_st
 }
 
 #[test]
-fn starting_a_thread_on_the_stack_changeset_is_refused_for_the_human_and_for_an_agent() {
+fn starting_a_thread_on_the_stack_changeset_is_refused_for_the_human() {
     let svc = FakeForge::stack_of_three().service();
     let id = open(&svc, 2);
     svc.select_stack_changeset(&id).unwrap();
@@ -246,12 +260,75 @@ fn starting_a_thread_on_the_stack_changeset_is_refused_for_the_human_and_for_an_
 
     let human = svc.comment(&id, lines.clone(), "Here.");
     let general = svc.comment(&id, Anchor::Review, "Overall.");
-    let agent = svc.draft(url(2).as_str(), lines, "From the agent.");
 
-    for refused in [human, general, agent] {
+    for refused in [human, general] {
         assert!(matches!(refused, Err(Error::StackChangesetReadOnly)), "{refused:?}");
     }
     assert_eq!(session(&svc, &id).drafts(), 0);
+}
+
+#[test]
+fn an_agents_draft_on_a_member_lands_in_its_review_whatever_the_human_is_looking_at() {
+    let svc = FakeForge::stack_of_three().service();
+    let id = open(&svc, 2);
+    svc.select_stack_changeset(&id).unwrap();
+    let lines = Anchor::lines(Side::New, "f3.rs", 2..=2);
+
+    let thread = svc.draft(url(3).as_str(), lines.clone(), "From the agent.").unwrap();
+
+    let shown = session(&svc, &id);
+    assert!(shown.stack_changeset_selected(), "the human still has the Stack Changeset in front of them");
+    let drafts: Vec<_> = shown.stack().iter().map(|m| m.drafts).collect();
+    assert_eq!(drafts, [0, 0, 1]);
+    svc.select_member(&id, &pr_ref(3)).unwrap();
+    let on_member = session(&svc, &id);
+    let drafted = on_member.threads.iter().find(|t| t.id == thread).expect("the Thread is in #3's Review");
+    assert_eq!(drafted.excerpt, "    b();\n", "excerpted from #3's own Changeset");
+    assert_eq!(drafted.anchor, lines);
+}
+
+#[test]
+fn a_reload_while_the_stack_changeset_is_shown_moves_the_threads_with_the_members_code() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    let id = open(&svc, 2);
+    let thread = svc.comment(&id, Anchor::lines(Side::New, "f2.rs", 2..=2), "On the call.").unwrap();
+    svc.select_stack_changeset(&id).unwrap();
+    forge.push(2, "head2b");
+
+    svc.reload(&id).unwrap();
+
+    let reloaded = session(&svc, &id);
+    assert!(reloaded.stack_changeset_selected());
+    let moved = reloaded.threads.iter().find(|t| t.id == thread).unwrap();
+    assert_eq!(moved.anchor, Anchor::lines(Side::New, "f2.rs", 3..=3), "one line down, with the code");
+    assert!(!moved.outdated);
+}
+
+#[test]
+fn a_push_found_by_a_check_fetches_the_stack_changeset_again_without_a_reload() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    let id = open(&svc, 3);
+    svc.select_stack_changeset(&id).unwrap();
+    forge.push(3, "head3b");
+
+    svc.check_pull_requests();
+
+    assert!(stack_text(&session(&svc, &id)).contains("pushed"));
+    assert_eq!(forge.compared().last().unwrap(), &("base1".to_owned(), "head3b".to_owned()));
+}
+
+#[test]
+fn ticking_a_file_as_viewed_while_the_stack_changeset_is_shown_is_refused() {
+    let svc = FakeForge::stack_of_three().service();
+    let id = open(&svc, 2);
+    svc.select_stack_changeset(&id).unwrap();
+
+    let ticked = svc.mark_viewed(&id, "f2.rs", true);
+
+    assert!(matches!(ticked, Err(Error::StackChangesetReadOnly)), "{ticked:?}");
+    assert!(session(&svc, &id).viewed.is_empty(), "no file of a Member that isn't shown was ticked");
 }
 
 #[test]
@@ -331,7 +408,7 @@ fn a_failed_fetch_shows_an_error_in_its_place_and_the_members_stay_usable() {
     let error = failed.stack_changeset().expect("an answer").expect_err("the fetch failed");
     assert!(error.contains("compare is down"), "{error}");
     assert!(failed.shown().files.is_empty());
-    // The members can be selected and Published, and the Stack Changeset fetched again.
+    // The Members can be selected and Published, and the Stack Changeset fetched again.
     svc.select_member(&id, &pr_ref(2)).unwrap();
     assert!(!session(&svc, &id).stack_changeset_selected());
     svc.publish(&id, Verdict::Feedback, "Done.").unwrap();
@@ -374,4 +451,19 @@ fn the_stack_changeset_is_no_longer_offered_when_one_member_is_left_in_the_stack
     assert!(!session.stack_changeset_selected());
     assert_eq!(session.shown().files[0].path, "f1.rs");
     assert_eq!(session.placed_threads().len(), 1);
+}
+
+#[test]
+fn a_stack_changeset_the_forge_cut_short_says_so_instead_of_passing_as_complete() {
+    let forge = FakeForge::stack_of_three();
+    forge.cut_comparisons_short();
+    let svc = forge.service();
+    let id = open(&svc, 2);
+
+    svc.select_stack_changeset(&id).unwrap();
+
+    let shown = session(&svc, &id);
+    assert_eq!(shown.stack_changeset_cut_off(), Some("the Forge lists at most 300 files"));
+    svc.select_member(&id, &pr_ref(2)).unwrap();
+    assert_eq!(session(&svc, &id).stack_changeset_cut_off(), None, "only while the Stack Changeset is shown");
 }

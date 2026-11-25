@@ -99,9 +99,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        // The Thread may be in a member that isn't shown: ids run across the Session.
-        let member = session.view.member_of(thread).unwrap_or(session.view.selected);
-        session.at_member(member, |session| {
+        session.at_member_of(thread, |session| {
             let view = &mut session.view;
             offered(&view.thread_offered(thread)?)?;
             let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`thread_offered` found it");
@@ -129,7 +127,7 @@ impl Service {
         let at = key.find(&inner.sessions)?;
         let session = &mut inner.sessions[at];
         let round = session.view.round;
-        // The member its URL names, which isn't the one shown, perhaps.
+        // The Member its URL names, which isn't the one shown, perhaps.
         let member = match &key_member {
             Some(pr) => session.view.member_position(pr).unwrap_or(session.view.selected),
             None => session.view.selected,

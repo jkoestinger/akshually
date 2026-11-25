@@ -1,29 +1,40 @@
-//! The Stack Changeset: everything a Stack changes as one Changeset, from the bottom member's
-//! base to the top member's head, for reading only (ADR 0004). It takes no Threads: a Forge
+//! The Stack Changeset: everything a Stack changes as one Changeset, from the bottom Member's
+//! base to the top Member's head, for reading only (ADR 0004). It takes no Threads: a Forge
 //! anchors a comment in one Pull Request's own diff.
 
 use super::{Service, SessionId, SessionView};
-use crate::Changeset;
-use crate::Error;
-use crate::forge::{PullRequest, PullRequestRef};
+use crate::forge::{Comparison, PullRequest, PullRequestRef};
+use crate::{Changeset, Error};
 
-/// What a Stack Changeset was fetched for: each member still in the Stack, with its base and
-/// head commit. It is fetched again when this changes.
-type Members = Vec<(PullRequestRef, String, String)>;
+/// What a Stack Changeset was fetched for: each Member still in the Stack, with the commits it
+/// covers. It is fetched again when this changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StackCommits(Vec<MemberCommits>);
+
+/// The base and head commit of one Member, as far as the Session knows: the head of a push it
+/// hasn't reloaded yet counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemberCommits {
+    pull_request: PullRequestRef,
+    base_sha: String,
+    head_sha: String,
+}
 
 /// A Session's Stack Changeset, and whether it is the one shown. Not saved: it is fetched again
 /// when first selected after a restart.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StackChangeset {
-    /// The Window shows it in place of the selected member's Changeset (see
+    /// The Window shows it in place of the selected Member's Changeset (see
     /// [`SessionView::stack_changeset_selected`]).
     selected: bool,
     /// The Stack Changeset fetched; empty until then, and after a failure.
     changeset: Changeset,
     /// Why fetching it failed, shown in its place.
     error: Option<String>,
+    /// Why what was fetched is only part of the Stack, when the Forge cut it short.
+    cut_off: Option<String>,
     /// What it was fetched for; `None` before the first fetch.
-    fetched_for: Option<Members>,
+    fetched_for: Option<StackCommits>,
 }
 
 impl StackChangeset {
@@ -35,49 +46,67 @@ impl StackChangeset {
 
 /// The Stack as a Stack Changeset is fetched for it.
 struct Fetch {
-    members: Members,
-    /// The bottom member, whose base the Changeset starts at and whose Forge serves it.
+    commits: StackCommits,
+    /// The bottom Member, whose base the Changeset starts at and whose Forge serves it.
     bottom: PullRequest,
-    /// The head commit of the top member, where it ends.
+    /// The head commit of the top Member, where it ends.
     head: String,
 }
 
 impl SessionView {
-    /// Whether the Session offers the Stack Changeset: its Stack has two or more members. A
-    /// member no longer part of the Stack is not counted.
-    pub fn offers_stack_changeset(&self) -> bool {
-        self.stack().iter().filter(|m| m.in_stack).count() >= 2
+    /// How many Members are still part of the Stack: those that left it are not counted.
+    pub fn members_in_stack(&self) -> usize {
+        self.stack().iter().filter(|m| m.in_stack).count()
     }
 
-    /// Whether the Stack Changeset is the one shown, in place of a member's Changeset.
+    /// Whether the Session offers the Stack Changeset: its Stack has two or more Members.
+    pub fn offers_stack_changeset(&self) -> bool {
+        self.members_in_stack() >= 2
+    }
+
+    /// Whether the Stack Changeset is the one shown, in place of a Member's Changeset.
     pub fn stack_changeset_selected(&self) -> bool {
-        self.whole_stack.selected && self.offers_stack_changeset()
+        self.stack_changeset.selected && self.offers_stack_changeset()
     }
 
     /// The Stack Changeset, or why it couldn't be fetched, while it is the one shown. `None`
     /// otherwise, and until it is fetched.
     pub fn stack_changeset(&self) -> Option<Result<&Changeset, &str>> {
-        if !self.stack_changeset_selected() || self.whole_stack.fetched_for.is_none() {
+        if !self.stack_changeset_selected() || self.stack_changeset.fetched_for.is_none() {
             return None;
         }
-        Some(self.whole_stack.error.as_deref().map_or(Ok(&self.whole_stack.changeset), Err))
+        Some(self.stack_changeset.error.as_deref().map_or(Ok(&self.stack_changeset.changeset), Err))
     }
 
-    /// What the Stack Changeset is fetched for now; `None` unless the Stack offers it.
+    /// Why the Stack Changeset shown is only part of what the Stack changes, when the Forge cut
+    /// it short: the Window says so instead of presenting it as complete.
+    pub fn stack_changeset_cut_off(&self) -> Option<&str> {
+        self.stack_changeset.cut_off.as_deref().filter(|_| self.stack_changeset_selected())
+    }
+
+    /// What the Stack Changeset is fetched for now; `None` unless the Stack offers it. A push the
+    /// Session hasn't reloaded yet counts, so a check that finds one fetches it again.
     fn stack_fetch(&self) -> Option<Fetch> {
-        let members: Vec<PullRequest> =
-            self.stack().into_iter().filter(|m| m.in_stack).map(|m| m.pull_request).collect();
+        let stack = self.stack();
+        let members: Vec<&PullRequest> = stack.iter().filter(|m| m.in_stack).map(|m| m.latest()).collect();
         let (bottom, top) = (members.first()?, members.last()?);
         if members.len() < 2 {
             return None;
         }
-        let key = members.iter().map(|p| (p.id.clone(), p.base_sha.clone(), p.head_sha.clone())).collect();
-        Some(Fetch { members: key, bottom: bottom.clone(), head: top.head_sha.clone() })
+        let commits = members
+            .iter()
+            .map(|p| MemberCommits {
+                pull_request: p.id.clone(),
+                base_sha: p.base_sha.clone(),
+                head_sha: p.head_sha.clone(),
+            })
+            .collect();
+        Some(Fetch { commits: StackCommits(commits), bottom: (*bottom).clone(), head: top.head_sha.clone() })
     }
 
-    /// Shows the member selected again, if the Stack Changeset was shown. Whether it was.
+    /// Shows the Member selected again, if the Stack Changeset was shown. Whether it was.
     pub(super) fn deselect_stack_changeset(&mut self) -> bool {
-        let was = std::mem::replace(&mut self.whole_stack.selected, false);
+        let was = std::mem::replace(&mut self.stack_changeset.selected, false);
         if was {
             // The diff of another Changeset: the UI must rebuild it.
             self.changeset_rev += 1;
@@ -85,13 +114,15 @@ impl SessionView {
         was
     }
 
-    /// Takes the outcome of fetching the Stack Changeset for `members`.
-    fn store_stack_changeset(&mut self, members: Members, fetched: Result<Changeset, String>) {
-        let whole = &mut self.whole_stack;
-        whole.fetched_for = Some(members);
+    /// Takes the outcome of fetching the Stack Changeset for `commits`.
+    fn store_stack_changeset(&mut self, commits: StackCommits, fetched: Result<Comparison, String>) {
+        let whole = &mut self.stack_changeset;
+        whole.fetched_for = Some(commits);
         match fetched {
-            Ok(changeset) => (whole.changeset, whole.error) = (changeset, None),
-            Err(error) => (whole.changeset, whole.error) = (Changeset::default(), Some(error)),
+            Ok(Comparison { changeset, cut_off }) => {
+                (whole.changeset, whole.error, whole.cut_off) = (changeset, None, cut_off)
+            }
+            Err(error) => (whole.changeset, whole.error, whole.cut_off) = (Changeset::default(), Some(error), None),
         }
         self.changeset_rev += 1;
     }
@@ -99,7 +130,7 @@ impl SessionView {
 
 impl Service {
     /// Human: shows the Stack Changeset of the Session's Stack, fetched from the Forge the first
-    /// time and again when the Stack's members or their heads changed since. A failure to fetch
+    /// time and again when the Stack's Members or their heads changed since. A failure to fetch
     /// is kept in the Session's view in its place, and is not an error here. Blocks on the Forge.
     pub fn select_stack_changeset(&self, id: &SessionId) -> Result<(), Error> {
         let fetch = {
@@ -117,7 +148,7 @@ impl Service {
             let mut inner = self.lock();
             let Ok(at) = inner.position(id) else { return };
             let view = &mut inner.sessions[at].view;
-            if !view.whole_stack.selected {
+            if !view.stack_changeset.selected {
                 return;
             }
             let Some(fetch) = view.stack_fetch() else {
@@ -136,8 +167,8 @@ impl Service {
     fn fetch_stack_changeset(&self, id: &SessionId, fetch: Fetch, select: bool) -> Result<(), Error> {
         let have = {
             let inner = self.lock();
-            let whole = &inner.sessions[inner.position(id)?].view.whole_stack;
-            whole.fetched_for.as_ref() == Some(&fetch.members) && (whole.error.is_none() || !select)
+            let whole = &inner.sessions[inner.position(id)?].view.stack_changeset;
+            whole.fetched_for.as_ref() == Some(&fetch.commits) && (whole.error.is_none() || !select)
         };
         // Not holding the lock: the Forge may take a while.
         let fetched = (!have).then(|| match self.forge_for(&fetch.bottom) {
@@ -149,12 +180,12 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let view = &mut inner.sessions[at].view;
-        let shown_before = view.whole_stack.selected;
+        let shown_before = view.stack_changeset.selected;
         if let Some(fetched) = fetched {
-            view.store_stack_changeset(fetch.members, fetched);
+            view.store_stack_changeset(fetch.commits, fetched);
         }
         if select && !shown_before {
-            view.whole_stack.selected = true;
+            view.stack_changeset.selected = true;
             view.changeset_rev += 1;
         }
         inner.notify();

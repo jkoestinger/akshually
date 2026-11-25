@@ -47,7 +47,7 @@ fn publish(app: &HostedApp, session: &SessionView, number: u64, verdict: Verdict
     app.service.publish(&session.id, verdict, "Looked it over.").unwrap();
 }
 
-/// The agent drafted a Thread on each member, and the human questioned both in Round 1.
+/// The agent drafted a Thread on each Member, and the human questioned both in Round 1.
 fn round_on_both(extra: &[&str]) -> Output {
     let app = hosted();
     stdout(&run(&app, &["draft", "--pr", &url(1), "--lines", "f1.rs:2", "One."]));

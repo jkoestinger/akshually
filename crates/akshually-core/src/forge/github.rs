@@ -12,8 +12,9 @@ use ureq::{Body, RequestBuilder};
 use url::Url;
 
 use super::{
-    CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review, epoch_seconds, fetch_files,
+    Comparison, CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole,
+    PullRequest, PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review, epoch_seconds,
+    fetch_files,
     http::{Client, Dialect, host_matches, not_found_as},
     with_suggestion,
 };
@@ -21,6 +22,9 @@ use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
+
+/// The most files GitHub lists for a comparison of two commits, whatever the paging.
+const COMPARE_FILE_LIMIT: usize = 300;
 
 /// The REST API version every request asks for.
 const API_VERSION: &str = "2022-11-28";
@@ -160,10 +164,7 @@ impl GitHub {
     /// The open Pull Requests of `repo` whose `filter` (`head` or `base`) is `value`: the first
     /// page of them, which is far more than one branch has.
     fn open_pull_requests(&self, repo: &str, filter: &str, value: &str) -> Result<Vec<PullRequest>, ForgeError> {
-        let mut segments = vec!["repos"];
-        segments.extend(repo.split('/'));
-        segments.push("pulls");
-        let mut url = self.client.endpoint(&segments);
+        let mut url = self.client.endpoint(&repo_segments(repo, &["pulls"]));
         url.query_pairs_mut().append_pair("state", "open").append_pair(filter, value).append_pair("per_page", PAGE);
         let pulls: Vec<Pull> = self.get_json(url.as_str())?;
         let host = self.client.host();
@@ -286,6 +287,10 @@ struct Pull {
     user: User,
     head: Ref,
     base: Ref,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +332,9 @@ impl Pull {
             base_sha: self.base.sha,
             base_branch: self.base.name,
             from_fork,
+            // A time GitHub doesn't give, or in a form not understood, is no time.
+            created_at: epoch_seconds(&self.created_at).unwrap_or(0),
+            updated_at: epoch_seconds(&self.updated_at).unwrap_or(0),
         }
     }
 }
@@ -405,23 +413,23 @@ impl ForgeAdapter for GitHub {
         self.files_changeset(&id.repo, listed, compare.merge_base_commit.sha, &pr.head_sha)
     }
 
-    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Changeset, ForgeError> {
-        /// One page of a comparison: the merge-base and some of its files.
+    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Comparison, ForgeError> {
+        /// A comparison: the merge-base and its files.
         #[derive(Deserialize)]
-        struct Page {
+        struct Answer {
             merge_base_commit: Commit,
             #[serde(default)]
             files: Vec<ChangedFile>,
         }
         let range = format!("{base}...{head}");
-        let mut url = self.client.endpoint(&repo_segments(repo, &["compare", &range]));
-        url.query_pairs_mut().append_pair("per_page", PAGE);
-        let pages: Vec<Page> = self.pages(url.as_str())?;
-        let Some(merge_base) = pages.first().map(|p| p.merge_base_commit.sha.clone()) else {
-            return Err(self.client.unexpected("a comparison without a page"));
-        };
-        let listed = pages.into_iter().flat_map(|p| p.files).collect();
-        self.files_changeset(repo, listed, merge_base, head)
+        // One request: the files come with the first page only, up to `COMPARE_FILE_LIMIT` for
+        // the whole comparison, and the pages after it only add commits.
+        let url = self.client.endpoint(&repo_segments(repo, &["compare", &range]));
+        let answer: Answer = self.get_json(url.as_str())?;
+        let cut_off = (answer.files.len() >= COMPARE_FILE_LIMIT)
+            .then(|| format!("GitHub lists at most {COMPARE_FILE_LIMIT} files of a comparison"));
+        let changeset = self.files_changeset(repo, answer.files, answer.merge_base_commit.sha, head)?;
+        Ok(Comparison { changeset, cut_off })
     }
 
     fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
@@ -581,6 +589,12 @@ impl GitHub {
             updated_at: String,
             author: Option<GqlActor>,
             repository: Repository,
+            #[serde(default)]
+            head_ref_name: String,
+            #[serde(default)]
+            base_ref_name: String,
+            #[serde(default)]
+            is_cross_repository: bool,
             /// Null when the project requires no review.
             review_decision: Option<String>,
             /// Each reviewer's latest Approve or Request changes.
@@ -629,7 +643,10 @@ impl GitHub {
                     author: pr.author.map_or_else(|| "ghost".to_owned(), |u| u.login),
                     created_at: time(&pr.created_at)?,
                     updated_at: time(&pr.updated_at)?,
-                    role,
+                    role: Some(role),
+                    head_branch: pr.head_ref_name,
+                    base_branch: pr.base_ref_name,
+                    from_fork: pr.is_cross_repository,
                     approved,
                     verdict_given: role == InboxRole::Assignee && reviewed,
                 })
@@ -736,6 +753,7 @@ const INBOX_QUERY: &str = "query($q: String!) {
     nodes {
       ... on PullRequest {
         number title url createdAt updatedAt author { login } repository { nameWithOwner }
+        headRefName baseRefName isCrossRepository
         reviewDecision
         latestOpinionatedReviews(first: 100) { nodes { state } }
         viewerDidAuthor viewerLatestReview { state }

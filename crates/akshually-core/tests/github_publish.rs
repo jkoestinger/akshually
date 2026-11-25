@@ -60,6 +60,7 @@ fn pull_request(author: &str) -> PullRequest {
         base_sha: "base1".into(),
         base_branch: "main".into(),
         from_fork: false,
+        ..Default::default()
     }
 }
 

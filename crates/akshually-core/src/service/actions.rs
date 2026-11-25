@@ -96,7 +96,7 @@ impl SessionView {
             let items = self.to_hand_over();
             HandOver { items, offered: items > 0 && yours && !ended }
         });
-        // A Published member takes no more of anything.
+        // A Published Member takes no more of anything.
         let threads = self.threads.iter().map(|t| thread_actions(t, ended || self.is_published())).collect();
         SessionActions { verdict, end, hand_over, threads }
     }

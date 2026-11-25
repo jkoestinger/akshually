@@ -21,6 +21,10 @@ struct Pr {
     head: String,
     base: String,
     from_fork: bool,
+    /// How many times it was pushed to.
+    pushes: u32,
+    /// It is a merge request on a GitLab-like Forge: its page has `/-/merge_requests/` in it.
+    gitlab: bool,
 }
 
 #[derive(Default)]
@@ -32,6 +36,10 @@ struct World {
     changesets: u32,
     /// A Forge lists this many Pull Requests at most for a branch, the first ones opened.
     page: Option<usize>,
+    /// The Forge is GitLab-like, so its Pull Requests are `!n`.
+    gitlab: bool,
+    /// Every question the Forge was asked about Pull Requests, by what it was asked.
+    asked: Vec<&'static str>,
 }
 
 /// A Forge whose open Pull Requests are the ones in `world`, which a test changes as time goes by.
@@ -51,16 +59,42 @@ fn url(number: u64) -> String {
 impl FakeForge {
     /// Opens Pull Request `number`, from branch `head` into branch `base`.
     fn open(&self, number: u64, head: &str, base: &str) -> &Self {
-        let pr = Pr { number, head: head.into(), base: base.into(), from_fork: false };
-        self.world.lock().unwrap().open.push(pr);
+        let mut world = self.world.lock().unwrap();
+        let gitlab = world.gitlab;
+        world.open.push(Pr { number, head: head.into(), base: base.into(), from_fork: false, pushes: 0, gitlab });
+        drop(world);
         self
     }
 
     /// Opens Pull Request `number` from a fork's branch `head` into branch `base`.
     fn open_from_fork(&self, number: u64, head: &str, base: &str) -> &Self {
-        let pr = Pr { number, head: head.into(), base: base.into(), from_fork: true };
+        let pr = Pr { number, head: head.into(), base: base.into(), from_fork: true, pushes: 0, gitlab: false };
         self.world.lock().unwrap().open.push(pr);
         self
+    }
+
+    /// The Forge retargets Pull Request `number` onto branch `base`, as it does when the one below merged.
+    fn retarget(&self, number: u64, base: &str) {
+        let mut world = self.world.lock().unwrap();
+        world.open.iter_mut().filter(|p| p.number == number).for_each(|p| p.base = base.into());
+    }
+
+    /// Pull Request `number` receives a push.
+    fn push(&self, number: u64) {
+        let mut world = self.world.lock().unwrap();
+        world.open.iter_mut().filter(|p| p.number == number).for_each(|p| p.pushes += 1);
+    }
+
+    /// A Forge like GitLab: its Pull Requests are merge requests, written `!n`.
+    fn gitlab() -> Self {
+        let forge = FakeForge::default();
+        forge.world.lock().unwrap().gitlab = true;
+        forge
+    }
+
+    /// How many times the Forge was asked `question` (`"head"`, `"target"` or `"pull_request"`).
+    fn asked(&self, question: &str) -> usize {
+        self.world.lock().unwrap().asked.iter().filter(|q| **q == question).count()
     }
 
     /// Pull Request `number` is merged, or closed: no longer open.
@@ -91,16 +125,25 @@ impl FakeForge {
 }
 
 fn to_pull_request(pr: &Pr) -> PullRequest {
+    let head_sha = match pr.pushes {
+        0 => format!("head{}", pr.number),
+        pushes => format!("head{}.{pushes}", pr.number),
+    };
     PullRequest {
         id: pr_ref(pr.number),
-        url: url(pr.number),
+        url: if pr.gitlab {
+            format!("https://forge.test/acme/web/-/merge_requests/{}", pr.number)
+        } else {
+            url(pr.number)
+        },
         title: format!("Pull Request {}", pr.number),
         author: "maria".into(),
         head_branch: pr.head.clone(),
-        head_sha: format!("head{}", pr.number),
+        head_sha,
         base_sha: format!("base{}", pr.number),
         base_branch: pr.base.clone(),
         from_fork: pr.from_fork,
+        ..Default::default()
     }
 }
 
@@ -110,13 +153,16 @@ impl ForgeAdapter for FakeForge {
     }
 
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
-        let number = url.strip_prefix("https://forge.test/acme/web/pull/")?;
+        let number = url
+            .strip_prefix("https://forge.test/acme/web/pull/")
+            .or_else(|| url.strip_prefix("https://forge.test/acme/web/-/merge_requests/"))?;
         Some(pr_ref(number.split(['/', '#']).next()?.parse().ok()?))
     }
 
     fn pull_request(&self, id: &PullRequestRef) -> Result<PullRequest, ForgeError> {
         // A merged Pull Request is still there to ask for.
-        let world = self.world.lock().unwrap();
+        let mut world = self.world.lock().unwrap();
+        world.asked.push("pull_request");
         let open = world.open.iter().find(|p| p.number == id.number);
         Ok(open.map_or_else(
             || {
@@ -125,6 +171,8 @@ impl ForgeAdapter for FakeForge {
                     head: format!("gone{}", id.number),
                     base: "main".into(),
                     from_fork: false,
+                    pushes: 0,
+                    gitlab: world.gitlab,
                 })
             },
             to_pull_request,
@@ -133,11 +181,13 @@ impl ForgeAdapter for FakeForge {
 
     fn open_with_head_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
         assert_eq!(repo, "acme/web");
+        self.world.lock().unwrap().asked.push("head");
         Ok(self.lookup(|p| p.head == branch))
     }
 
     fn open_with_target_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
         assert_eq!(repo, "acme/web");
+        self.world.lock().unwrap().asked.push("target");
         Ok(self.lookup(|p| p.base == branch))
     }
 
@@ -184,7 +234,10 @@ impl ForgeAdapter for FakeForge {
             author: "maria".into(),
             created_at: 0,
             updated_at: p.number as i64,
-            role: InboxRole::Reviewer,
+            role: Some(InboxRole::Reviewer),
+            head_branch: p.head.clone(),
+            base_branch: p.base.clone(),
+            from_fork: p.from_fork,
             approved: false,
             verdict_given: false,
         };
@@ -294,7 +347,7 @@ fn a_pull_request_with_no_neighbours_is_a_stack_of_one() {
     assert!(session.stack()[0].in_stack && session.stack()[0].selected);
 }
 
-// --- Opening members of a Stack that has a Session ---
+// --- Opening Members of a Stack that has a Session ---
 
 #[test]
 fn opening_another_member_shows_the_existing_session_on_that_member() {
@@ -310,7 +363,7 @@ fn opening_another_member_shows_the_existing_session_on_that_member() {
 }
 
 #[test]
-fn a_pull_request_with_its_own_session_is_not_pulled_into_another_sessions_stack() {
+fn a_pull_request_with_no_session_opened_below_a_stack_that_has_one_joins_that_session_as_a_new_member() {
     let forge = FakeForge::default();
     forge.open(2, "b", "a");
     let svc = forge.service();
@@ -320,25 +373,91 @@ fn a_pull_request_with_its_own_session_is_not_pulled_into_another_sessions_stack
 
     let below = open(&svc, 1);
 
-    assert_ne!(below, own);
+    assert_eq!(below, own, "the Stack's Session shows it");
+    assert_eq!(svc.sessions().len(), 1);
+    let session = svc.session(&own).unwrap();
+    assert_eq!(numbers(&session), [1, 2]);
+    assert_eq!(shown(&session), 1);
+}
+
+#[test]
+fn a_pull_request_opened_on_top_of_a_stack_that_has_a_session_joins_it_and_the_inbox_agrees() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main");
+    let svc = forge.service();
+    let session = open(&svc, 1);
+    forge.open(2, "b", "a");
+
+    let on_top = open(&svc, 2);
+    svc.refresh_inbox();
+
+    assert_eq!(on_top, session);
+    assert_eq!(numbers(&svc.session(&session).unwrap()), [1, 2]);
+    let sessions: Vec<_> =
+        svc.inbox().rows.iter().map(|r| matches!(r.state, InboxRowState::SessionOpen { .. })).collect();
+    assert_eq!(sessions, [true, true], "both rows show the one Session");
+}
+
+#[test]
+fn a_pull_request_between_two_sessions_joins_the_one_of_the_member_directly_below_it() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main").open(3, "c", "b");
+    let svc = forge.service();
+    let (lower, upper) = (open(&svc, 1), open(&svc, 3));
+    forge.open(2, "b", "a");
+
+    let between = open(&svc, 2);
+
+    assert_eq!(between, lower);
+    assert_eq!(numbers(&svc.session(&lower).unwrap()), [1, 2]);
+    assert_eq!(numbers(&svc.session(&upper).unwrap()), [3], "two open Sessions never merge");
+}
+
+#[test]
+fn a_pull_request_whose_only_session_is_the_one_above_it_joins_that_one() {
+    let forge = FakeForge::default();
+    forge.open(2, "b", "x");
+    let svc = forge.service();
+    let upper = open(&svc, 2);
+    forge.open(1, "x", "main");
+
+    let below = open(&svc, 1);
+
+    assert_eq!(below, upper);
+    assert_eq!(numbers(&svc.session(&upper).unwrap()), [1, 2]);
+}
+
+#[test]
+fn a_pull_request_that_has_its_own_session_stays_in_it_and_two_sessions_never_merge() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main").open(2, "b", "other");
+    let svc = forge.service();
+    let (below, own) = (open(&svc, 1), open(&svc, 2));
+    // The Forge now has #2 on top of #1.
+    forge.retarget(2, "a");
+
+    svc.check_pull_requests();
+    let reopened = open(&svc, 2);
+
+    assert_eq!(reopened, own);
     assert_eq!(numbers(&svc.session(&below).unwrap()), [1]);
     assert_eq!(numbers(&svc.session(&own).unwrap()), [2]);
 }
 
 #[test]
-fn a_session_does_not_take_a_pull_request_with_its_own_session_when_the_stack_is_refreshed() {
+fn a_session_stops_its_stack_at_the_first_pull_request_another_session_holds() {
     let forge = FakeForge::default();
-    forge.open(1, "a", "main");
+    forge.open(1, "a", "main").open(2, "b", "other");
     let svc = forge.service();
-    let below = open(&svc, 1);
-    forge.open(2, "b", "a");
-    let own = open(&svc, 2);
-    assert_ne!(own, below, "the Pull Request was not there when #1's Session opened");
+    let (a, b) = (open(&svc, 1), open(&svc, 2));
+    // #2 now sits on #1, and #3 on #2: #1's Stack would run through #2 to reach #3.
+    forge.retarget(2, "a");
+    forge.open(3, "c", "b");
 
     svc.check_pull_requests();
 
-    assert_eq!(numbers(&svc.session(&below).unwrap()), [1]);
-    assert_eq!(numbers(&svc.session(&own).unwrap()), [2]);
+    assert_eq!(numbers(&svc.session(&a).unwrap()), [1], "#3 is on the other side of #2, which B holds");
+    assert_eq!(numbers(&svc.session(&b).unwrap()), [2, 3]);
 }
 
 // --- Members keep their own state ---
@@ -397,7 +516,7 @@ fn thread_ids_are_unique_across_the_members_of_a_session() {
     svc.select_member(&id, &pr_ref(3)).unwrap();
     let other = svc.comment(&id, Anchor::Review, "Another.").unwrap();
 
-    // Each member brought one Thread from the Forge, then two Drafts.
+    // Each Member brought one Thread from the Forge, then two Drafts.
     let mut ids: Vec<ThreadId> = Vec::new();
     for member in [1, 2, 3] {
         svc.select_member(&id, &pr_ref(member)).unwrap();
@@ -670,6 +789,169 @@ fn the_session_ends_once_every_member_still_in_the_stack_is_published() {
     assert!(matches!(svc.session(&id).unwrap().ended, Some(Ending::Published { .. })));
 }
 
+#[test]
+fn a_member_whose_base_merged_stays_in_the_stack_and_keeps_getting_push_updates() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main").open(2, "b", "a");
+    let svc = forge.service();
+    let id = open(&svc, 2);
+    // #1 merges, and the Forge retargets #2 onto `main`.
+    forge.close(1);
+    forge.retarget(2, "main");
+
+    svc.check_pull_requests();
+
+    let session = svc.session(&id).unwrap();
+    assert_eq!(numbers(&session), [2]);
+    assert!(session.stack()[0].in_stack, "#2 is open: it did not leave the Stack");
+    forge.push(2);
+    svc.check_pull_requests();
+    assert!(svc.session(&id).unwrap().pull_request_update.is_some(), "#2 was polled again");
+}
+
+#[test]
+fn a_member_that_left_with_drafts_and_was_not_published_keeps_the_session_open() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main").open(2, "b", "a");
+    let svc = forge.service();
+    let id = open(&svc, 1);
+    svc.comment(&id, Anchor::Review, "Before it merged.").unwrap();
+    forge.close(1);
+    forge.retarget(2, "main");
+    svc.check_pull_requests();
+    svc.select_member(&id, &pr_ref(2)).unwrap();
+
+    svc.publish(&id, Verdict::Approve, "").unwrap();
+
+    let session = svc.session(&id).unwrap();
+    assert_eq!(session.ended, None, "#1 still holds a Draft that closing would discard");
+    assert_eq!(numbers(&session), [1, 2]);
+}
+
+#[test]
+fn the_session_ends_as_published_when_the_last_unpublished_member_leaves_without_drafts() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main").open(2, "b", "a");
+    let svc = forge.service();
+    let id = open(&svc, 1);
+    svc.publish(&id, Verdict::Approve, "").unwrap();
+    let review = "https://forge.test/acme/web/pull/1#review".to_owned();
+    forge.close(2);
+
+    svc.check_pull_requests();
+
+    let ended = svc.session(&id).unwrap().ended;
+    assert_eq!(ended, Some(Ending::Published { verdict: Verdict::Approve, url: review }));
+}
+
+#[test]
+fn the_session_stays_open_when_the_last_member_leaves_and_none_was_published() {
+    let forge = FakeForge::default();
+    forge.open(1, "a", "main");
+    let svc = forge.service();
+    let id = open(&svc, 1);
+    forge.close(1);
+
+    svc.check_pull_requests();
+
+    let session = svc.session(&id).unwrap();
+    assert_eq!(session.ended, None);
+    assert!(!session.stack()[0].in_stack, "it is shown as no longer part of the Stack");
+}
+
+#[test]
+fn the_agent_is_told_about_a_member_that_left_with_drafts_and_one_that_was_published() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    let pending = svc.review(ReviewRequest::pull_request(url(2))).unwrap();
+    let id = pending.session().clone();
+    svc.draft(url(1).as_str(), Anchor::Review, "From the agent.").unwrap();
+    svc.select_member(&id, &pr_ref(3)).unwrap();
+    svc.publish(&id, Verdict::Approve, "").unwrap();
+    forge.close(1);
+    forge.retarget(2, "main");
+    svc.check_pull_requests();
+
+    svc.close(&id).unwrap();
+
+    let review = "https://forge.test/acme/web/pull/3#review";
+    assert_eq!(
+        pending.wait_timeout(Duration::from_secs(5)),
+        Some(Outcome::Published {
+            verdict: Verdict::Approve,
+            url: review.into(),
+            pull_requests: vec![member(1, None), member(2, None), member(3, Some((Verdict::Approve, review)))],
+        })
+    );
+}
+
+#[test]
+fn the_ending_is_the_topmost_published_members_when_the_last_publish_was_a_lower_one() {
+    let svc = FakeForge::stack_of_three().service();
+    let id = open(&svc, 3);
+    svc.publish(&id, Verdict::RequestChanges, "Needs work.").unwrap();
+    for member in [1, 2] {
+        svc.select_member(&id, &pr_ref(member)).unwrap();
+        svc.publish(&id, Verdict::Approve, "").unwrap();
+    }
+
+    let ended = svc.session(&id).unwrap().ended;
+
+    let url = "https://forge.test/acme/web/pull/3#review".to_owned();
+    assert_eq!(ended, Some(Ending::Published { verdict: Verdict::RequestChanges, url }));
+}
+
+#[test]
+fn on_a_gitlab_forge_the_agent_names_merge_requests_with_a_bang() {
+    let forge = FakeForge::gitlab();
+    forge.open(1, "a", "main").open(2, "b", "a");
+    let svc = forge.service();
+    let gitlab_url = |n: u64| format!("https://forge.test/acme/web/-/merge_requests/{n}");
+    let pending = svc.review(ReviewRequest::pull_request(gitlab_url(1))).unwrap();
+    let id = pending.session().clone();
+    let thread = svc.draft(gitlab_url(2).as_str(), Anchor::Review, "On the top one.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &thread), "Why?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+
+    let round = pending.wait_timeout(Duration::from_secs(5));
+    let again = svc.review(ReviewRequest::pull_request(gitlab_url(1))).unwrap();
+    svc.close(&id).unwrap();
+    let ended = again.wait_timeout(Duration::from_secs(5));
+
+    let Some(Outcome::Round(round)) = round else { panic!("expected a Round, got {round:?}") };
+    assert_eq!(round.threads[0].pull_request.as_ref().unwrap().pull_request_name, "acme/web !2");
+    let Some(Outcome::Abandoned { pull_requests }) = ended else { panic!("expected Abandoned, got {ended:?}") };
+    let names: Vec<_> = pull_requests.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["acme/web !1", "acme/web !2"]);
+}
+
+#[test]
+fn a_check_with_no_push_and_a_recent_lookup_does_not_ask_the_forge_about_the_stack_again() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    open(&svc, 2);
+    svc.check_pull_requests();
+    let asked = (forge.asked("head"), forge.asked("target"));
+
+    svc.check_pull_requests();
+
+    assert_eq!((forge.asked("head"), forge.asked("target")), asked);
+}
+
+#[test]
+fn a_check_looks_the_stack_up_again_once_a_member_was_pushed_to() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    open(&svc, 2);
+    svc.check_pull_requests();
+    let asked = forge.asked("head");
+    forge.push(3);
+
+    svc.check_pull_requests();
+
+    assert!(forge.asked("head") > asked);
+}
+
 // --- The agent ---
 
 #[test]
@@ -761,7 +1043,7 @@ fn a_session_saved_before_stacks_is_restored_as_a_stack_of_one() {
     let dirs = TestDirs::new();
     let sessions = dirs.state().join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
-    // A Pull Request Session as saved before Stacks: no members, and no target branch.
+    // A Pull Request Session as saved before Stacks: no Members, and no target branch.
     let saved = r#"{"view":{"id":"s1","source":{"pull_request":{"id":{"host":"forge.test","repo":"acme/web","number":5},
         "url":"https://forge.test/acme/web/pull/5","title":"Old","author":"maria","head_branch":"old",
         "head_sha":"head5","base_sha":"base5"}},"round":1}}"#;

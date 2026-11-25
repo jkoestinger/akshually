@@ -24,9 +24,9 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
-    InboxStack, InboxView, Member, MemberOutcome, MemberView, Outcome, PendingReview, PlacedThread, PublishPlan,
-    PublishedReview, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark, SessionView, Source,
-    SourceRef, StackChangeset, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction,
+    InboxStack, InboxStanding, InboxView, Member, MemberOutcome, MemberView, Outcome, PendingReview, PlacedThread,
+    PublishPlan, PublishedReview, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark, SessionView,
+    Source, SourceRef, StackChangeset, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction,
     WindowView,
 };
 pub use settings::{Settings, SettingsError};

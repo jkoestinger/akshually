@@ -4,15 +4,15 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::handoff::{Call, Waiter};
-use super::stack::{detect_stack, free_run};
+use super::stack::{detect_stack, free_run, joined_session};
 use super::{
-    ChangesetView, Ending, Member, PendingReview, PublishedReview, Role, Service, Session, SessionId, SessionView,
-    Source, Turn, Verdict,
+    ChangesetView, Member, PendingReview, PublishedReview, Role, Service, Session, SessionId, SessionView, Source,
+    Turn, Verdict,
 };
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
-use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId, drafts_in};
 use crate::{Changeset, Error};
 
 impl Service {
@@ -64,7 +64,7 @@ impl Service {
     }
 
     /// The Session of the Pull Request at `url`, opened if needed, with the Stack it is in. The
-    /// human (`agent: None`) gets it displayed, on that member; an agent joins it in its `role`,
+    /// human (`agent: None`) gets it displayed, on that Member; an agent joins it in its `role`,
     /// and a Session it opens starts in the agent's Turn, out of the human's way.
     pub(super) fn open_pull_request_session(
         &self,
@@ -93,13 +93,27 @@ impl Service {
         // Not holding the lock: the Forge may take a while.
         let opened = forge.pull_request(&pr)?;
         let stack = detect_stack(forge.as_ref(), &opened)?;
-        // Two open Sessions never merge: the Stack stops at a Pull Request with a Session.
+        // Two open Sessions never merge: the Stack stops at a Pull Request with a Session, and a
+        // Pull Request next to a Stack that has one joins it.
+        let owner = |sessions: &[Session], p: &PullRequestRef| {
+            sessions.iter().find(|s| s.view.has_member(p)).map(|s| s.view.id.clone())
+        };
+        let joined = joined_session(&stack, &pr, |p| owner(&self.lock().sessions, p));
+        if let Some(session) = joined {
+            self.follow_stack(&session, true);
+            // A Stack stops below a fork: the Session may not take it after all.
+            if open(&self.lock().sessions) == Some(session.clone()) {
+                return found(session);
+            }
+        }
         let stack = {
             let inner = self.lock();
-            free_run(stack, &pr, |p| inner.sessions.iter().any(|s| s.view.has_member(p)))
+            free_run(stack, &pr, |p| owner(&inner.sessions, p).is_some())
         };
         let mut fetched = Vec::new();
         for member in stack {
+            // The listings that found the Stack's other Pull Requests leave out their commits.
+            let member = forge.complete(member)?;
             let changeset = forge.changeset(&member)?;
             let remote = forge.threads(&member)?;
             fetched.push((member, changeset, remote));
@@ -118,7 +132,7 @@ impl Service {
             .into_iter()
             .map(|(member, changeset, remote)| {
                 let threads: Vec<Thread> =
-                    remote.into_iter().map(|t| existing_thread(t, &changeset)).map(|t| session.number(t)).collect();
+                    remote.into_iter().map(|t| existing_thread(t, &changeset)).map(|t| session.numbered(t)).collect();
                 Member::new(member, changeset, threads)
             })
             .collect();
@@ -145,10 +159,10 @@ impl Service {
         Ok((id, pr))
     }
 
-    /// Human: Publishes the kept Drafts of the member shown, `summary` (markdown, may be empty)
-    /// and `verdict` to its Pull Request as one review, and returns its web page. The member
+    /// Human: Publishes the kept Drafts of the Member shown, `summary` (markdown, may be empty)
+    /// and `verdict` to its Pull Request as one review, and returns its web page. The Member
     /// then has its Verdict and takes no more Drafts; the Session goes on with the others, and
-    /// ends once every member is Published, which the human then closes. Blocks on the Forge.
+    /// ends once every Member is Published, which the human then closes. Blocks on the Forge.
     pub fn publish(&self, id: &SessionId, verdict: Verdict, summary: &str) -> Result<String, Error> {
         let (pr, drafts) = {
             let mut inner = self.lock();
@@ -169,7 +183,7 @@ impl Service {
         inner.sessions[at].publishing = false;
         let url = sent?;
         let session = &mut inner.sessions[at];
-        // The human may have shown another member meanwhile: it's this one that was sent.
+        // The human may have shown another Member meanwhile: it's this one that was sent.
         let member = session.view.member_position(&pr.id).ok_or_else(|| Error::NotInStack(pr.id.to_string()))?;
         session.at_member(member, |session| {
             let view = &mut session.view;
@@ -191,9 +205,7 @@ impl Service {
             view.published = Some(PublishedReview { verdict, url: url.clone() });
         });
         // A co-Reviewer learns what went out once the Session ends; without one, the human closes it.
-        if session.view.all_published() {
-            session.conclude(Ending::Published { verdict, url: url.clone() });
-        }
+        session.end_when_published();
         inner.reap();
         inner.inbox.published(&pr.id);
         inner.notify();
@@ -269,7 +281,7 @@ impl Service {
                 }
             }
             // Pull Requests came and went, perhaps.
-            self.follow_stack(&id);
+            self.follow_stack(&id, false);
             self.refresh_stack_changeset(&id);
         }
     }
@@ -294,7 +306,7 @@ impl Service {
         });
         inner.notify();
         drop(inner);
-        self.follow_stack(id);
+        self.follow_stack(id, false);
         self.refresh_stack_changeset(id);
         Ok(())
     }
@@ -440,13 +452,12 @@ fn forge_change(thread: &Thread) -> Option<ForgeChange> {
 impl SessionView {
     /// Whether the Session holds something not Published: a Draft (the human's, or the
     /// co-Reviewer's not kept yet), or a Thread resolved or reopened here but not on the Forge,
-    /// in a member that wasn't Published.
+    /// in a Member that wasn't Published.
     pub(super) fn has_unpublished(&self) -> bool {
         let shown = self.selected;
         let mut parked = self.members.iter().enumerate().filter(|(at, m)| *at != shown && m.published.is_none());
-        let unpublished = |threads: &[Thread]| {
-            threads.iter().any(|t| forge_change(t).is_some() || t.comments.iter().any(Comment::is_draft))
-        };
+        let unpublished =
+            |threads: &[Thread]| threads.iter().any(|t| forge_change(t).is_some()) || drafts_in(threads) > 0;
         (!self.is_published() && unpublished(&self.threads)) || parked.any(|(_, m)| unpublished(&m.threads))
     }
 }
@@ -518,8 +529,7 @@ fn merge_threads(session: &mut Session, remote: Vec<RemoteThread>) {
                 *thread = Thread { id: thread.id.clone(), comments, resolved, reopened: thread.reopened, ..now };
             }
             None => {
-                session.threads_opened += 1;
-                threads.push(Thread { id: ThreadId::new(format!("T{}", session.threads_opened)), ..now });
+                threads.push(Thread { id: session.next_thread_id(), ..now });
             }
         }
     }

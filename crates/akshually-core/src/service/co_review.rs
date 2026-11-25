@@ -35,7 +35,7 @@ impl Service {
             return Err(Error::Ended);
         }
         session.join(Role::CoReviewer)?;
-        // The Review of the Pull Request its URL names, whichever member the human shows.
+        // The Review of the Pull Request its URL names, whichever Member the human shows.
         let member = member.and_then(|pr| session.view.member_position(&pr)).unwrap_or(session.view.selected);
         let thread = session.at_member(member, |session| session.open_thread(anchor, comment, Party::Agent))?;
         inner.notify();

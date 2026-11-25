@@ -191,6 +191,9 @@ fn rotate_creds() -> PullRequest {
         base_sha: "mb1".into(),
         base_branch: "main".into(),
         from_fork: false,
+        // 2026-11-11T09:00:00Z and 2026-11-12T08:15:30Z, as `mr.json` has them.
+        created_at: 1_794_387_600,
+        updated_at: 1_794_471_330,
     }
 }
 
@@ -206,7 +209,7 @@ fn fetches_the_merge_request_by_its_project_path() {
 }
 
 #[test]
-fn finds_the_open_merge_requests_with_a_source_branch() {
+fn finds_the_open_merge_requests_with_a_source_branch_from_the_list_alone() {
     let mut h = Harness::new();
     let list = h
         .server
@@ -218,17 +221,20 @@ fn finds_the_open_merge_requests_with_a_source_branch() {
         .match_header("authorization", format!("Bearer {TOKEN}").as_str())
         .with_body(fixture("mrs-by-source.json"))
         .create();
-    // The list leaves out the diff refs, so each one found is fetched whole.
-    let one = h.get("/projects/platform%2Finfra/merge_requests/96", TOKEN, &fixture("mr-96.json"));
 
     let found = h.gitlab().open_with_head_branch("platform/infra", "vault").unwrap();
 
+    // Nothing else was asked: a request for a merge request itself would have no mock to answer it.
     list.assert();
-    one.assert();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, PullRequestRef { number: 96, ..mr_ref() });
     assert_eq!((found[0].head_branch.as_str(), found[0].base_branch.as_str()), ("vault", "main"));
-    assert_eq!((found[0].head_sha.as_str(), found[0].base_sha.as_str()), ("head0", "mb0"));
+    assert_eq!(
+        (found[0].title.as_str(), found[0].author.as_str(), found[0].head_sha.as_str()),
+        ("Vault client", "tom", "head0")
+    );
+    assert_eq!(found[0].base_sha, "", "the list leaves out the diff refs");
+    assert_eq!((found[0].created_at, found[0].updated_at), (1_794_301_200, 1_794_306_600));
 }
 
 #[test]
@@ -243,15 +249,42 @@ fn finds_the_open_merge_requests_targeting_a_branch_and_marks_those_from_forks()
         ]))
         .with_body(fixture("mrs-by-target.json"))
         .create();
-    h.get("/projects/platform%2Finfra/merge_requests/97", TOKEN, &fixture("mr-97-on-vault.json"));
-    h.get("/projects/platform%2Finfra/merge_requests/98", TOKEN, &fixture("mr-98.json"));
 
     let found = h.gitlab().open_with_target_branch("platform/infra", "vault").unwrap();
 
     list.assert();
     let forks: Vec<_> = found.iter().map(|p| (p.id.number, p.from_fork)).collect();
-    assert_eq!(forks, [(97, false), (98, true)]);
+    assert_eq!(forks, [(97, false), (98, true), (99, false)], "one whose diff isn't ready doesn't fail the others");
     assert!(found.iter().all(|p| p.base_branch == "vault"));
+}
+
+#[test]
+fn completes_a_listed_merge_request_with_its_diff_refs_by_fetching_it_whole() {
+    let mut h = Harness::new();
+    let one = h.get("/projects/platform%2Finfra/merge_requests/96", TOKEN, &fixture("mr-96.json"));
+    let list = h
+        .server
+        .mock("GET", "/projects/platform%2Finfra/merge_requests")
+        .match_query(Matcher::Any)
+        .with_body(fixture("mrs-by-source.json"))
+        .create();
+    let gitlab = h.gitlab();
+    let listed = gitlab.open_with_head_branch("platform/infra", "vault").unwrap().remove(0);
+
+    let whole = gitlab.complete(listed).unwrap();
+
+    list.assert();
+    one.assert();
+    assert_eq!((whole.head_sha.as_str(), whole.base_sha.as_str()), ("head0", "mb0"));
+}
+
+#[test]
+fn completing_a_merge_request_that_is_whole_asks_nothing() {
+    let h = Harness::new();
+
+    let kept = h.gitlab().complete(rotate_creds()).unwrap();
+
+    assert_eq!(kept, rotate_creds());
 }
 
 impl Harness {
@@ -306,10 +339,12 @@ fn fetches_the_changeset_between_two_commits_with_the_files_and_lines_a_merge_re
         h.raw("lib/b.rs", "head3", b"fn b() {}\n"),
     ];
 
-    let changeset = h.gitlab().changeset_between("platform/infra", "mb1", "head3").unwrap();
+    let comparison = h.gitlab().changeset_between("platform/infra", "mb1", "head3").unwrap();
 
     compare.assert();
     reads.iter().for_each(Mock::assert);
+    assert_eq!(comparison.cut_off, None);
+    let changeset = comparison.changeset;
     assert_eq!(changeset.base, "mb1");
     let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| FileChange {
         hunks: Some(
@@ -533,7 +568,10 @@ fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRol
         author: author.into(),
         created_at: 0,
         updated_at: 0,
-        role,
+        role: Some(role),
+        head_branch: String::new(),
+        base_branch: String::new(),
+        from_fork: false,
         approved: false,
         verdict_given: false,
     }
@@ -552,7 +590,16 @@ fn the_inbox_lists_review_requests_then_assignments_once_each() {
 
     requested.assert();
     assigned.assert();
-    let listed: Vec<_> = inbox.iter().map(|i| InboxItem { created_at: 0, updated_at: 0, ..i.clone() }).collect();
+    let listed: Vec<_> = inbox
+        .iter()
+        .map(|i| InboxItem {
+            created_at: 0,
+            updated_at: 0,
+            head_branch: String::new(),
+            base_branch: String::new(),
+            ..i.clone()
+        })
+        .collect();
     assert_eq!(
         listed,
         vec![
@@ -581,6 +628,38 @@ fn inbox_times_are_seconds_since_the_epoch() {
     assert_eq!((inbox[0].created_at, inbox[0].updated_at), (1_794_387_600, 1_794_471_330));
     // 2026-11-10T11:00:00Z.
     assert_eq!(inbox[1].created_at, 1_794_308_400);
+}
+
+#[test]
+fn a_comparison_that_timed_out_says_its_diffs_may_be_incomplete() {
+    let mut h = Harness::new();
+    h.server
+        .mock("GET", "/projects/platform%2Finfra/repository/compare")
+        .match_query(Matcher::Any)
+        .with_body(json!({ "diffs": [], "compare_timeout": true }).to_string())
+        .create();
+
+    let comparison = h.gitlab().changeset_between("platform/infra", "mb1", "head3").unwrap();
+
+    assert!(comparison.cut_off.is_some());
+}
+
+#[test]
+fn the_inbox_lists_the_branches_stack_detection_starts_from() {
+    let mut h = Harness::new();
+    let gitlab = h.gitlab();
+    h.user("me");
+    h.merge_requests(("reviewer_username", "me"), &fixture("mrs-reviewer.json"));
+    h.merge_requests(("assignee_username", "me"), "[]");
+    h.none_reviewed();
+
+    let inbox = gitlab.inbox().unwrap().unwrap();
+
+    let first = &inbox[0];
+    assert_eq!(
+        (first.head_branch.as_str(), first.base_branch.as_str(), first.from_fork),
+        ("rotate-creds", "main", false)
+    );
 }
 
 /// The Inbox of a human asked to review `platform/infra!97` alone.

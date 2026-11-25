@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use akshually_core::forge::{
     ForgeAdapter, ForgeError, ForgeKind, InboxItem, InboxRole, PullRequest, PullRequestRef, RemoteThread, Review,
 };
-use akshually_core::{Changeset, FileChange, InboxRow, InboxRowState, Service, Verdict};
+use akshually_core::{Changeset, FileChange, InboxRow, InboxRowState, InboxStanding, Service, Verdict};
 
 /// A Pull Request of the fake Forge, in `acme/web`, and how it stands in the human's Inbox.
 #[derive(Clone)]
@@ -18,6 +18,7 @@ struct Pr {
     /// `None` when the Forge doesn't list it for the human.
     listed: Option<InboxRole>,
     verdict_given: bool,
+    approved: bool,
 }
 
 #[derive(Default)]
@@ -27,6 +28,8 @@ struct World {
     lookup_fails: bool,
     /// The Forge fails to list the Inbox.
     inbox_fails: bool,
+    /// How many times the Forge was asked for a Pull Request by its number.
+    pull_requests_asked: u32,
 }
 
 #[derive(Clone, Default)]
@@ -45,7 +48,15 @@ fn url(number: u64) -> String {
 impl FakeForge {
     /// Opens Pull Request `number` from branch `head` into `base`, which the Forge doesn't list.
     fn open(&self, number: u64, head: &str, base: &str) -> &Self {
-        let pr = Pr { number, head: head.into(), base: base.into(), updated_at: 0, listed: None, verdict_given: false };
+        let pr = Pr {
+            number,
+            head: head.into(),
+            base: base.into(),
+            updated_at: 0,
+            listed: None,
+            verdict_given: false,
+            approved: false,
+        };
         self.world.lock().unwrap().open.push(pr);
         self
     }
@@ -70,6 +81,16 @@ impl FakeForge {
         self.change(number, |p| {
             p.listed = Some(InboxRole::Reviewer);
             p.verdict_given = true;
+            p.updated_at = updated_at;
+        });
+        self
+    }
+
+    /// The Forge lists `number` as one that is approved already.
+    fn approved(&self, number: u64, updated_at: i64) -> &Self {
+        self.change(number, |p| {
+            p.listed = Some(InboxRole::Reviewer);
+            p.approved = true;
             p.updated_at = updated_at;
         });
         self
@@ -106,6 +127,8 @@ fn to_pull_request(pr: &Pr) -> PullRequest {
         base_sha: format!("base{}", pr.number),
         base_branch: pr.base.clone(),
         from_fork: false,
+        created_at: 1_000,
+        updated_at: pr.updated_at,
     }
 }
 
@@ -120,7 +143,8 @@ impl ForgeAdapter for FakeForge {
     }
 
     fn pull_request(&self, id: &PullRequestRef) -> Result<PullRequest, ForgeError> {
-        let world = self.world.lock().unwrap();
+        let mut world = self.world.lock().unwrap();
+        world.pull_requests_asked += 1;
         let open = world.open.iter().find(|p| p.number == id.number);
         Ok(to_pull_request(open.expect("an open Pull Request")))
     }
@@ -168,8 +192,11 @@ impl ForgeAdapter for FakeForge {
                 author: "maria".into(),
                 created_at: 1_000,
                 updated_at: p.updated_at,
-                role: p.listed?,
-                approved: false,
+                role: Some(p.listed?),
+                head_branch: p.head.clone(),
+                base_branch: p.base.clone(),
+                from_fork: false,
+                approved: p.approved,
                 verdict_given: p.verdict_given,
             })
         };
@@ -182,7 +209,7 @@ type Shape = (u64, Option<(usize, usize)>, bool);
 
 fn shape(svc: &Service) -> Vec<Shape> {
     let place = |r: &InboxRow| r.stack.as_ref().map(|s| (s.position, s.size));
-    svc.inbox().rows.iter().map(|r| (r.item.id.number, place(r), r.qualifies)).collect()
+    svc.inbox().rows.iter().map(|r| (r.item.id.number, place(r), r.qualifies())).collect()
 }
 
 fn numbers(svc: &Service) -> Vec<u64> {
@@ -362,4 +389,72 @@ fn a_host_that_fails_to_list_keeps_its_groups_from_before() {
     let view = svc.inbox();
     assert_eq!(shape(&svc), [(1, Some((0, 3)), false), (2, Some((1, 3)), false), (3, Some((2, 3)), true)]);
     assert!(view.errors[0].contains("inbox down"), "{:?}", view.errors);
+}
+
+#[test]
+fn a_refresh_asks_the_forge_for_no_pull_request_because_the_listing_says_where_each_one_sits() {
+    let forge = FakeForge::stack_of_three();
+    forge.request(3, 300).request(1, 100);
+    let svc = forge.service();
+
+    svc.refresh_inbox();
+
+    assert_eq!(forge.world.lock().unwrap().pull_requests_asked, 0);
+    assert_eq!(numbers(&svc), [1, 2, 3], "and the Stack is grouped all the same");
+}
+
+#[test]
+fn a_member_the_forge_did_not_list_has_no_role_and_the_times_the_forge_gave() {
+    let forge = FakeForge::stack_of_three();
+    forge.request(3, 300);
+    forge.change(1, |p| p.updated_at = 150);
+    let svc = forge.service();
+
+    svc.refresh_inbox();
+
+    let rows = svc.inbox().rows;
+    let unlisted = &rows[0].item;
+    assert_eq!((unlisted.id.number, unlisted.role), (1, None));
+    assert_eq!((unlisted.created_at, unlisted.updated_at), (1_000, 150));
+    assert_eq!(rows[2].item.role, Some(InboxRole::Reviewer));
+}
+
+#[test]
+fn a_member_the_forge_did_not_list_shows_as_updated_once_the_forge_says_it_changed() {
+    let forge = FakeForge::stack_of_three();
+    forge.request(3, 300);
+    forge.change(1, |p| p.updated_at = 150);
+    let svc = forge.service();
+    svc.refresh_inbox();
+    let id = svc.open_pull_request(&url(1)).unwrap();
+    svc.close(&id).unwrap();
+    svc.refresh_inbox();
+    assert_eq!(svc.inbox().rows[0].state, InboxRowState::Seen);
+
+    forge.change(1, |p| p.updated_at = 600);
+    svc.refresh_inbox();
+
+    assert_eq!(svc.inbox().rows[0].state, InboxRowState::Updated);
+}
+
+#[test]
+fn a_row_says_why_it_does_not_qualify() {
+    let forge = FakeForge::stack_of_three();
+    forge.open(4, "d", "c").open(5, "e", "d");
+    forge.verdict_given(1, 100).approved(2, 200).request(3, 300).request(5, 50);
+    let svc = forge.service();
+
+    svc.refresh_inbox();
+
+    let standings: Vec<_> = svc.inbox().rows.iter().map(|r| (r.item.id.number, r.standing)).collect();
+    assert_eq!(
+        standings,
+        [
+            (1, InboxStanding::VerdictGiven),
+            (2, InboxStanding::Approved),
+            (3, InboxStanding::Listed),
+            (4, InboxStanding::NotRequested),
+            (5, InboxStanding::Listed),
+        ]
+    );
 }

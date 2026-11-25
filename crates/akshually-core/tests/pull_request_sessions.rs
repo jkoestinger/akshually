@@ -44,6 +44,7 @@ impl ForgeAdapter for FakeForge {
             base_sha: "basesha".into(),
             base_branch: "main".into(),
             from_fork: false,
+            ..Default::default()
         })
     }
 
@@ -322,6 +323,7 @@ fn a_gitlab_merge_request_takes_gitlabs_sigil() {
         base_sha: "b".into(),
         base_branch: "main".into(),
         from_fork: false,
+        ..Default::default()
     };
 
     assert_eq!(mr.kind(), ForgeKind::GitLab);

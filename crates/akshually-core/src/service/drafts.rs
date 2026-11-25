@@ -25,6 +25,7 @@ impl Service {
         check_comment(&anchor, &comment)?;
         let mut inner = self.lock();
         let at = inner.position(id)?;
+        inner.sessions[at].view.check_takes_threads()?;
         let thread = inner.sessions[at].open_thread(anchor, comment, Party::Human)?;
         inner.notify();
         Ok(thread)
@@ -159,9 +160,7 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        // The Thread may be in a member that isn't shown: ids run across the Session.
-        let member = session.view.member_of(thread).unwrap_or(session.view.selected);
-        let result = session.at_member(member, |session| {
+        let result = session.at_member_of(thread, |session| {
             let view = &mut session.view;
             if !view.thread_offered(thread)?.agent_draft {
                 return Err(Error::NotAnAgentDraft(thread.clone()));

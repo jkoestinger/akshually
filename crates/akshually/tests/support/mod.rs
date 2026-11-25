@@ -152,6 +152,7 @@ impl ForgeAdapter for FakeForge {
             base_sha: "basesha".into(),
             base_branch: "main".into(),
             from_fork: false,
+            ..Default::default()
         })
     }
 
@@ -222,6 +223,7 @@ impl ForgeAdapter for StackForge {
             base_sha: format!("base{}", id.number),
             base_branch: base.into(),
             from_fork: false,
+            ..Default::default()
         })
     }
 

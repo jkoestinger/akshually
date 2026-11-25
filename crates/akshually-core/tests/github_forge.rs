@@ -128,6 +128,9 @@ fn sso_pull_request() -> PullRequest {
         base_sha: "base1".into(),
         base_branch: "main".into(),
         from_fork: false,
+        // 2026-11-11T09:00:00Z and 2026-11-12T08:15:30Z, as `pull.json` has them.
+        created_at: 1_794_387_600,
+        updated_at: 1_794_471_330,
     }
 }
 
@@ -320,24 +323,18 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
 #[test]
 fn fetches_the_changeset_between_two_commits_with_the_files_and_lines_a_pull_requests_has() {
     let mut h = Harness::new();
-    // The files of the Pull Request's own Changeset, listed by the comparison itself, in pages.
-    let compare = |files: &str| {
-        let mut body: serde_json::Value = serde_json::from_str(&fixture("compare.json")).unwrap();
-        body["files"] = serde_json::from_str(files).unwrap();
-        body.to_string()
-    };
-    let page2 = format!("{}/repos/acme/web/compare/base1...head3?per_page=100&page=2", h.server.url());
-    h.server
+    // GitHub sends every file with the first page (up to 300), and no later page is asked for.
+    let mut files: Vec<serde_json::Value> = serde_json::from_str(&fixture("files-1.json")).unwrap();
+    files.extend(serde_json::from_str::<Vec<serde_json::Value>>(&fixture("files-2.json")).unwrap());
+    let mut body: serde_json::Value = serde_json::from_str(&fixture("compare.json")).unwrap();
+    body["files"] = files.into();
+    let compare = h
+        .server
         .mock("GET", "/repos/acme/web/compare/base1...head3")
-        .match_query(Matcher::Exact("per_page=100".into()))
+        .match_query(Matcher::Missing)
         .match_header("authorization", format!("Bearer {TOKEN}").as_str())
-        .with_header("link", &format!("<{page2}>; rel=\"next\", <{page2}>; rel=\"last\""))
-        .with_body(compare(&fixture("files-1.json")))
-        .create();
-    h.server
-        .mock("GET", "/repos/acme/web/compare/base1...head3")
-        .match_query(Matcher::Exact("per_page=100&page=2".into()))
-        .with_body(compare(&fixture("files-2.json")))
+        .with_body(body.to_string())
+        .expect(1)
         .create();
     let reads = [
         h.contents("src/a.rs", "mb1", "fn a() {}\n"),
@@ -348,9 +345,12 @@ fn fetches_the_changeset_between_two_commits_with_the_files_and_lines_a_pull_req
         h.contents("lib/b.rs", "head3", "fn b() {}\n"),
     ];
 
-    let changeset = h.github().changeset_between("acme/web", "base1", "head3").unwrap();
+    let comparison = h.github().changeset_between("acme/web", "base1", "head3").unwrap();
 
+    compare.assert();
     reads.iter().for_each(Mock::assert);
+    assert_eq!(comparison.cut_off, None);
+    let changeset = comparison.changeset;
     assert_eq!(changeset.base, "mb1");
     let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| {
         let hunks = hunks.iter().map(|&(old_start, old_lines, new_start, new_lines)| Hunk {
@@ -658,6 +658,9 @@ impl Harness {
             "updatedAt": "2026-11-12T09:30:00Z",
             "author": { "login": "maria" },
             "repository": { "nameWithOwner": "acme/web" },
+            "headRefName": "sso",
+            "baseRefName": "main",
+            "isCrossRepository": false,
             "reviewDecision": "REVIEW_REQUIRED",
             "latestOpinionatedReviews": { "nodes": [] },
             "viewerDidAuthor": false,
@@ -668,6 +671,30 @@ impl Harness {
         }
         self.search(filter, &serde_json::json!({ "data": { "search": { "nodes": [node] } } }).to_string())
     }
+}
+
+#[test]
+fn a_comparison_at_githubs_file_limit_says_it_is_cut_off() {
+    let mut h = Harness::new();
+    let unchanged = |n: usize| serde_json::json!({ "filename": format!("f{n}.rs"), "status": "unchanged" });
+    let mut body: serde_json::Value = serde_json::from_str(&fixture("compare.json")).unwrap();
+    body["files"] = (0..300).map(unchanged).collect::<Vec<_>>().into();
+    h.server.mock("GET", "/repos/acme/web/compare/base1...head3").with_body(body.to_string()).create();
+
+    let comparison = h.github().changeset_between("acme/web", "base1", "head3").unwrap();
+
+    let reason = comparison.cut_off.expect("300 files is GitHub's limit, so there may be more");
+    assert!(reason.contains("300"), "{reason}");
+}
+
+#[test]
+fn the_inbox_lists_the_branches_stack_detection_starts_from() {
+    let mut h = Harness::new();
+
+    let inbox = h.inbox_of_one_review_request(serde_json::json!({ "baseRefName": "vault", "isCrossRepository": true }));
+
+    let first = &inbox[0];
+    assert_eq!((first.head_branch.as_str(), first.base_branch.as_str(), first.from_fork), ("sso", "vault", true));
 }
 
 const NONE_FOUND: &str = r#"{"data":{"search":{"nodes":[]}}}"#;
@@ -681,7 +708,10 @@ fn inbox_item(repo: &str, number: u64, title: &str, author: &str, role: InboxRol
         author: author.into(),
         created_at: 0,
         updated_at: 0,
-        role,
+        role: Some(role),
+        head_branch: String::new(),
+        base_branch: String::new(),
+        from_fork: false,
         approved: false,
         verdict_given: false,
     }
@@ -698,7 +728,16 @@ fn the_inbox_lists_review_requests_then_assignments_once_each() {
 
     requested.assert();
     assigned.assert();
-    let listed: Vec<_> = inbox.iter().map(|i| InboxItem { created_at: 0, updated_at: 0, ..i.clone() }).collect();
+    let listed: Vec<_> = inbox
+        .iter()
+        .map(|i| InboxItem {
+            created_at: 0,
+            updated_at: 0,
+            head_branch: String::new(),
+            base_branch: String::new(),
+            ..i.clone()
+        })
+        .collect();
     assert_eq!(
         listed,
         vec![
@@ -770,7 +809,7 @@ fn an_assignment_the_human_reviewed_is_done() {
 
         let inbox = h.inbox_of_one_assignment(json!({ "viewerLatestReview": review }));
 
-        assert_eq!(inbox[0].role, InboxRole::Assignee);
+        assert_eq!(inbox[0].role, Some(InboxRole::Assignee));
         assert_eq!(inbox[0].verdict_given, done, "latest review {review}");
     }
 }
