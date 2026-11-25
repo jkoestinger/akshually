@@ -309,6 +309,22 @@ fn n_after_scrolling_by_hand_goes_to_the_thread_below_the_top_of_the_view_not_ba
 }
 
 #[test]
+fn n_after_wheeling_up_a_little_goes_to_the_thread_below_the_new_top_even_if_it_was_reached() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    type_text(&mut rt, "n");
+    assert_eq!(lines_in_view(&rt), [50], "the second `n` didn't go to the second Thread");
+    rt.wheel(640.0, 400.0, 200.0);
+    rt.frame(0.0);
+    assert_eq!(lines_in_view(&rt), [50], "the wheel moved the Thread out of view");
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [50], "`n` went on from the Thread reached after the human scrolled");
+}
+
+#[test]
 fn p_after_scrolling_by_hand_goes_to_the_thread_above_the_top_of_the_view() {
     let repo = repo_with_a_long_change();
     let (_service, _id, mut rt) = review_with_three_threads(&repo);
@@ -340,7 +356,7 @@ fn click(rt: &mut Runtime<State>, key: &str) {
 }
 
 #[test]
-fn n_and_p_still_move_after_a_button_was_clicked() {
+fn n_still_goes_on_after_a_button_was_clicked() {
     let repo = repo_with_a_long_change();
     let (_service, _id, mut rt) = review_with_three_threads(&repo);
     click(&mut rt, "next-thread");

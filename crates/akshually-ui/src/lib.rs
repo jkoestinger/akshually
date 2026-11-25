@@ -247,7 +247,7 @@ struct SessionTab {
     search: search::Search,
     /// Where the Thread `n` or `p` last went to is, so the next press carries on from it while it
     /// is still in view. The UI's own.
-    reached: Option<thread_nav::Position>,
+    reached: Option<thread_nav::RowOrder>,
     /// The diff view's laid-out rect `[x, y, w, h]`, in window points, once it has one: where
     /// to read what the diff shows (see `thread_nav`).
     viewport: Option<[f32; 4]>,
