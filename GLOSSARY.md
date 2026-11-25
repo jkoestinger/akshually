@@ -48,6 +48,10 @@ _Avoid_: MR, merge request (except when quoting GitLab)
 An ordered run of open Pull Requests in one repository, each asking to merge into the branch of the one below it. It is always a line: where two Pull Requests sit on the same one, the Stack stops below them. A Pull Request on its own is a Stack of one.
 _Avoid_: Stacked PRs, stacked diff (stacked is a Diff layout), chain, series
 
+**Member**:
+A Pull Request of a Stack, as its Session holds it: with its own Changeset, Threads, Drafts, Verdict and Publish. A Member Published takes no more Drafts. One that was merged, closed or retargeted away leaves the Stack, and stays in the Session while it holds Drafts or was Published there.
+_Avoid_: Stack item, layer
+
 **Stack Changeset**:
 Everything a Stack changes, from below its bottom Pull Request to the top of its last, shown as one Changeset. For reading only: it has no Threads, and a Stack of one has none.
 _Avoid_: Combined diff, full Changeset (that is a view of one Review)

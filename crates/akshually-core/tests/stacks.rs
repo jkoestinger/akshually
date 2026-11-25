@@ -676,6 +676,27 @@ fn the_agents_drafts_on_every_member_are_handed_over_with_the_questions_on_them(
     assert_eq!(round.threads[0].id, thread);
 }
 
+#[test]
+fn replying_and_resolving_through_the_url_of_a_member_reach_its_thread_while_another_is_shown() {
+    let svc = FakeForge::stack_of_three().service();
+    let id = open(&svc, 1);
+    let thread = svc.draft(url(3).as_str(), Anchor::Review, "Agent's note on the top.").unwrap();
+    svc.reply_in_thread(&ThreadRef::new(&id, &thread), "Why?").unwrap();
+    let pending = svc.review(ReviewRequest::pull_request(url(3))).unwrap();
+    svc.hand_over_round(&id).unwrap();
+    pending.wait_timeout(Duration::from_secs(5)).expect("the Round");
+
+    svc.reply(url(3).as_str(), &thread, "Because.").unwrap();
+    svc.resolve(url(3).as_str(), &thread).unwrap();
+
+    assert_eq!(shown(&svc.session(&id).unwrap()), 1);
+    svc.select_member(&id, &pr_ref(3)).unwrap();
+    let top = svc.session(&id).unwrap();
+    let found = top.threads.iter().find(|t| t.id == thread).expect("the Thread is in the top member");
+    assert_eq!(found.comments.last().map(|c| c.body.as_str()), Some("Because."));
+    assert!(found.resolved.is_some());
+}
+
 // --- The Inbox ---
 
 #[test]

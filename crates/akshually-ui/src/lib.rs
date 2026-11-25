@@ -18,9 +18,9 @@ use rune_kit::{
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxView, NewComment, Party, PublishPlan, Role, Service, SessionActions,
-    SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage,
-    UpdateView, Verdict, VerdictAction, WindowView, fence_for,
+    HandOver, InboxRow, InboxRowState, InboxView, MemberView, NewComment, Party, PublishPlan, Role, Service,
+    SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef,
+    Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -30,6 +30,9 @@ const INBOX_TAB: &str = "inbox";
 /// The Changeset view dropdown's list width in points: "Since Session base" whole, with the
 /// list's padding and check. `Select`'s own minimum (160) cuts it off.
 const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
+/// The Stack member picker's list width in points: a reference, a title and what is said of it
+/// in one line, which wraps when it is longer.
+const MEMBER_LIST_MIN_WIDTH: f32 = 420.0;
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
 /// The tallest the Publish dialog's list of Drafts grows before it scrolls, in a window tall
@@ -218,6 +221,8 @@ struct SessionTab {
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
+    /// The header's Stack member picker is open. Kept per Session, like `choosing_view`.
+    choosing_member: bool,
     /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
     /// lost on restart.
     rendered: Option<String>,
@@ -229,7 +234,15 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, &session);
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None };
+        let mut tab = SessionTab {
+            session,
+            actions,
+            diff,
+            expanded: Vec::new(),
+            choosing_view: false,
+            choosing_member: false,
+            rendered: None,
+        };
         tab.annotate(None);
         tab
     }
@@ -605,6 +618,18 @@ impl State {
         if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
             tab.choosing_view = open;
         }
+    }
+
+    /// Opens or closes the Stack member picker in the header of `id`'s tab.
+    fn choose_member(&mut self, id: &SessionId, open: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
+            tab.choosing_member = open;
+        }
+    }
+
+    /// Shows the member `pr` of the Stack in `id`'s Session.
+    fn select_member(&self, id: &SessionId, pr: &PullRequestRef) {
+        report(self.service.select_member(id, pr));
     }
 
     fn annotate(&mut self) {
@@ -1078,9 +1103,12 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
     row().gap(8.0).items_center().children(status).child(field)
 }
 
-/// A Pull Request Session's header. Its Drafts stay in the Session until Publish.
-fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest) -> El {
+/// A Pull Request Session's header. Its Drafts stay in the Session until Publish. A Stack of
+/// several members has the picker that switches between them, whose list goes into `layer`.
+fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
+    let picker = member_picker(k, tab, layer);
+    let published = session.published.as_ref().map(|p| Badge::new(format!("Published · {}", verdict_label(p.verdict))));
     let base = &session.changeset.base[..session.changeset.base.len().min(SHORT_HASH)];
     let publish_id = session.id.clone();
     row()
@@ -1091,10 +1119,12 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .gap(12.0)
         .items_center()
         .fill(k.c.layer_01)
+        .children(picker)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(row().grow(1.0))
         .child(layout_control(k, tab))
+        .children(published.map(|badge| badge.build(k)))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
         .child(
             Button::new("Comment on Review")
@@ -1106,10 +1136,60 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(
             Button::new("Publish…")
                 .variant(ButtonVariant::Submit)
-                .disabled(session.ended.is_some())
+                .disabled(session.ended.is_some() || session.published.is_some())
                 .on_press(move |s: &mut State| s.open_publish(publish_id.clone()))
                 .build(k),
         )
+}
+
+/// The picker of a Stack's members, bottom to top; `None` for a Stack of one. Each entry says
+/// which Pull Request it is, how many Drafts its Review holds and its Verdict once Published,
+/// and when it left the Stack.
+fn member_picker(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
+    let session = &tab.session;
+    let members = session.stack();
+    if members.len() < 2 {
+        return None;
+    }
+    let labels: Vec<String> = members.iter().map(member_label).collect();
+    let current = members.iter().position(|m| m.selected).and_then(|at| labels.get(at)).map(String::as_str);
+    let open = tab.choosing_member;
+    let (toggle_id, close_id, choose_id) = (session.id.clone(), session.id.clone(), session.id.clone());
+    let picker = Select::new("stack-member", &labels)
+        .label("Pull Request of the Stack")
+        .appearance(SelectAppearance::Inline)
+        .current(current)
+        .open(open)
+        .on_toggle(move |s: &mut State| s.choose_member(&toggle_id, !open))
+        .on_close(move |s: &mut State| s.choose_member(&close_id, false))
+        .on_choose(move |s: &mut State, label: &str, _: &mut Tx| {
+            s.choose_member(&choose_id, false);
+            if let Some(member) = members.iter().find(|m| member_label(m) == label) {
+                s.select_member(&choose_id, &member.pull_request.id);
+            }
+        })
+        .build(k, layer);
+    // Like the view list, it would be cut off at `Select`'s own minimum width.
+    if open && let Some(list) = layer.pop() {
+        layer.push(list.min_w(MEMBER_LIST_MIN_WIDTH));
+    }
+    Some(picker)
+}
+
+/// How a Stack's member reads in the picker.
+fn member_label(member: &MemberView) -> String {
+    let drafts = match member.drafts {
+        1 => "1 Draft".to_owned(),
+        n => format!("{n} Drafts"),
+    };
+    let mut label = format!("{} {} · {drafts}", member.pull_request.reference(), member.pull_request.title);
+    if let Some(published) = &member.published {
+        label.push_str(&format!(" · Published, {}", verdict_label(published.verdict)));
+    }
+    if !member.in_stack {
+        label.push_str(" · no longer part of the Stack");
+    }
+    label
 }
 
 /// Hands the next Round over: in a co-review, the human's questions on the agent's Drafts.
@@ -1359,7 +1439,7 @@ fn tab_status(session: &SessionView) -> Option<TabItemStatus> {
 fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     if let Some(pr) = session.pull_request() {
-        return pull_request_header(k, tab, pr);
+        return pull_request_header(k, tab, pr, layer);
     }
     let shown = session.shown();
     let base = format!("→ {}", &shown.base[..shown.base.len().min(SHORT_HASH)]);
