@@ -29,7 +29,7 @@ mod window;
 
 pub use actions::{EndAction, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use handoff::{CancelReview, PendingReview};
-pub use inbox::{InboxRow, InboxRowState, InboxView};
+pub use inbox::{InboxRow, InboxRowState, InboxStack, InboxView};
 pub use pull_request::PublishPlan;
 pub use stack::{Member, MemberView, PublishedReview};
 pub use update::{UpdateStage, UpdateView};

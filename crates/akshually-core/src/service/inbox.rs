@@ -8,13 +8,15 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use super::stack::{detect_stack, free_run};
 use super::{Inner, Service, Session, SessionId};
-use crate::forge::{InboxItem, InboxRole, PullRequestRef};
+use crate::forge::{ForgeAdapter, ForgeError, InboxItem, InboxRole, PullRequest, PullRequestRef};
 
 /// What the UI (and tests) can observe of the Inbox.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxView {
-    /// Most recently updated first.
+    /// Most recently updated first. The members of a Stack follow each other, bottom first, at
+    /// the place of the group's most recently updated listed member.
     pub rows: Vec<InboxRow>,
     /// When the last refresh finished, in seconds since the Unix epoch; `None` before the first.
     pub refreshed_at: Option<i64>,
@@ -32,6 +34,22 @@ pub struct InboxView {
 pub struct InboxRow {
     pub item: InboxItem,
     pub state: InboxRowState,
+    /// The Pull Request is in the Inbox on its own: the human is a requested reviewer or an
+    /// assignee, it isn't approved yet, and they gave no Verdict since their review was last
+    /// requested. `false` for a member shown only because its Stack is.
+    pub qualifies: bool,
+    /// Where the row sits in its Stack's group; `None` for a Stack of one, or when the Stack
+    /// couldn't be looked up.
+    pub stack: Option<InboxStack>,
+}
+
+/// A row's place in the group of its Stack's Pull Requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboxStack {
+    /// 0 for the bottom member.
+    pub position: usize,
+    /// How many members the group shows.
+    pub size: usize,
 }
 
 /// What a row tells the human, besides the Pull Request itself.
@@ -52,6 +70,10 @@ pub enum InboxRowState {
 #[serde(default)]
 pub(super) struct Inbox {
     items: Vec<InboxItem>,
+    /// The Stacks of more than one Pull Request with a listed member, each bottom to top.
+    groups: Vec<Vec<PullRequestRef>>,
+    /// The members of `groups` that aren't in `items`: shown because their Stack is.
+    others: Vec<InboxItem>,
     /// When the human last opened each listed Pull Request: its `updated_at` then.
     seen: Vec<Seen>,
     refreshed_at: Option<i64>,
@@ -73,9 +95,14 @@ impl Inbox {
         self.seen.iter().find(|s| &s.pr == pr).map(|s| s.updated_at)
     }
 
+    /// `pr` as a row of the Inbox: listed in its own right, or as a member of a group.
+    fn listed(&self, pr: &PullRequestRef) -> Option<&InboxItem> {
+        self.items.iter().chain(&self.others).find(|i| &i.id == pr)
+    }
+
     /// The human looked at `pr`: as of its last refresh, or now if the Inbox doesn't list it.
     pub(super) fn looked_at(&mut self, pr: &PullRequestRef) {
-        let updated_at = self.items.iter().find(|i| &i.id == pr).map_or_else(now, |i| i.updated_at);
+        let updated_at = self.listed(pr).map_or_else(now, |i| i.updated_at);
         self.seen.retain(|s| &s.pr != pr);
         self.seen.push(Seen { pr: pr.clone(), updated_at });
     }
@@ -93,29 +120,37 @@ impl Inbox {
     }
 
     pub(super) fn view(&self, sessions: &[Session]) -> InboxView {
-        let rows = self
-            .items
-            .iter()
-            .map(|item| {
-                // A Published Session stays open until the human closes it.
-                let session = sessions.iter().find(|s| s.view.has_member(&item.id));
-                let state = match (session, self.seen(&item.id)) {
-                    (Some(s), _) => InboxRowState::SessionOpen {
-                        session: s.view.id.clone(),
-                        drafts: s
-                            .view
-                            .stack()
-                            .into_iter()
-                            .find(|m| m.pull_request.id == item.id)
-                            .map_or(0, |m| m.drafts),
-                    },
-                    (None, None) => InboxRowState::New,
-                    (None, Some(seen)) if seen < item.updated_at => InboxRowState::Updated,
-                    (None, Some(_)) => InboxRowState::Seen,
-                };
-                InboxRow { item: item.clone(), state }
-            })
-            .collect();
+        let row = |item: &InboxItem, stack: Option<InboxStack>| {
+            // A Published Session stays open until the human closes it.
+            let session = sessions.iter().find(|s| s.view.has_member(&item.id));
+            let state = match (session, self.seen(&item.id)) {
+                (Some(s), _) => InboxRowState::SessionOpen {
+                    session: s.view.id.clone(),
+                    drafts: s.view.stack().into_iter().find(|m| m.pull_request.id == item.id).map_or(0, |m| m.drafts),
+                },
+                (None, None) => InboxRowState::New,
+                (None, Some(seen)) if seen < item.updated_at => InboxRowState::Updated,
+                (None, Some(_)) => InboxRowState::Seen,
+            };
+            let qualifies = !(item.approved || item.verdict_given) && self.items.iter().any(|i| i.id == item.id);
+            InboxRow { item: item.clone(), state, qualifies, stack }
+        };
+        let mut rows = Vec::new();
+        let mut shown = Vec::new();
+        for item in &self.items {
+            if shown.contains(&item.id) {
+                continue;
+            }
+            let Some(group) = self.groups.iter().find(|g| g.contains(&item.id)) else {
+                rows.push(row(item, None));
+                continue;
+            };
+            let members: Vec<_> = group.iter().filter_map(|id| self.listed(id)).collect();
+            for (position, member) in members.iter().enumerate() {
+                shown.push(member.id.clone());
+                rows.push(row(member, Some(InboxStack { position, size: members.len() })));
+            }
+        }
         InboxView {
             rows,
             refreshed_at: self.refreshed_at,
@@ -155,13 +190,16 @@ impl Service {
         let mut items = Vec::new();
         let mut errors = Vec::new();
         let mut hosts = Vec::new();
-        let mut inner = self.lock();
-        let before = std::mem::take(&mut inner.inbox.items);
+        // The hosts that answered, whose Stacks can be looked up.
+        let mut answering = Vec::new();
+        let inner = self.lock();
+        let before = inner.inbox.items.clone();
         for (forge, result) in fetched {
             match result {
                 Ok(None) => {}
                 Ok(Some(found)) => {
                     hosts.push(forge.host().to_owned());
+                    answering.push(forge);
                     items.extend(found);
                 }
                 Err(error) => {
@@ -181,8 +219,22 @@ impl Service {
             first
         });
         // Done with, unless the human is still reviewing it: their Session keeps it listed.
-        items.retain(|i| !(i.approved || i.verdict_given) || inner.sessions.iter().any(|s| s.view.has_member(&i.id)));
+        let held = |inner: &Inner, pr: &PullRequestRef| inner.sessions.iter().any(|s| s.view.has_member(pr));
+        let (kept, done): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|i| !(i.approved || i.verdict_given) || held(&inner, &i.id));
+        let mut items = kept;
         items.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
+        let sessions: Vec<_> = inner
+            .sessions
+            .iter()
+            .map(|s| (s.view.id.clone(), s.view.stack().into_iter().map(|m| m.pull_request.id).collect()))
+            .collect();
+        drop(inner);
+
+        // Not holding the lock: the Forges may take a while.
+        let grouped = group_stacks(&answering, &items, &done, &sessions);
+        errors.extend(grouped.errors);
+        let mut inner = self.lock();
 
         let requested = |items: &[InboxItem], pr: &PullRequestRef| {
             items.iter().any(|i| &i.id == pr && i.role == InboxRole::Reviewer)
@@ -194,8 +246,10 @@ impl Service {
             state.attention = true;
         }
         // What the human saw of a Pull Request that left the Inbox no longer matters.
-        state.seen.retain(|s| items.iter().any(|i| i.id == s.pr));
+        state.seen.retain(|s| items.iter().chain(&grouped.others).any(|i| i.id == s.pr));
         state.items = items;
+        state.groups = grouped.groups;
+        state.others = grouped.others;
         state.errors = errors;
         state.hosts = hosts;
         state.refreshed_at = Some(now());
@@ -214,6 +268,92 @@ impl Service {
                 std::thread::sleep(every);
             }
         });
+    }
+}
+
+/// The Stacks of the Inbox's Pull Requests.
+#[derive(Default)]
+struct Grouped {
+    groups: Vec<Vec<PullRequestRef>>,
+    others: Vec<InboxItem>,
+    errors: Vec<String>,
+}
+
+/// Groups the Stacks of `items`, each looked up the way a Session does it, so that the Inbox and
+/// the Session it opens agree on the members. `done` are the Forge's listed Pull Requests that
+/// the Inbox leaves out: a member of a Stack that is one of them keeps its own data. `sessions`
+/// are the open Sessions and their members: the Stack stops at a Pull Request another Session
+/// holds. Blocks on the network.
+///
+/// A host whose lookup fails leaves its rows ungrouped, and reports the failure once.
+fn group_stacks(
+    answering: &[&Box<dyn ForgeAdapter>],
+    items: &[InboxItem],
+    done: &[InboxItem],
+    sessions: &[(SessionId, Vec<PullRequestRef>)],
+) -> Grouped {
+    let mut grouped = Grouped::default();
+    let mut covered: Vec<PullRequestRef> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    for item in items {
+        if covered.contains(&item.id) {
+            continue;
+        }
+        let Some(forge) = answering.iter().find(|f| f.recognise(&item.url).is_some()) else { continue };
+        if failed.contains(&forge.host()) {
+            continue;
+        }
+        let stack = match stack_of(forge.as_ref(), &item.id, sessions) {
+            Ok(stack) => stack,
+            Err(error) => {
+                grouped.errors.push(error.to_string());
+                failed.push(forge.host());
+                continue;
+            }
+        };
+        covered.extend(stack.iter().map(|p| p.id.clone()));
+        if stack.len() < 2 {
+            continue;
+        }
+        for member in &stack {
+            if items.iter().any(|i| i.id == member.id) {
+                continue;
+            }
+            let known = done.iter().find(|i| i.id == member.id);
+            grouped.others.push(known.cloned().unwrap_or_else(|| listing_of(member)));
+        }
+        grouped.groups.push(stack.into_iter().map(|p| p.id).collect());
+    }
+    grouped
+}
+
+/// The Stack of `pr`, as a Session opening it would hold it.
+fn stack_of(
+    forge: &dyn ForgeAdapter,
+    pr: &PullRequestRef,
+    sessions: &[(SessionId, Vec<PullRequestRef>)],
+) -> Result<Vec<PullRequest>, ForgeError> {
+    let opened = forge.pull_request(pr)?;
+    let stack = detect_stack(forge, &opened)?;
+    let own = sessions.iter().find(|(_, members)| members.contains(pr)).map(|(id, _)| id);
+    let owned = |p: &PullRequestRef| sessions.iter().any(|(id, members)| Some(id) != own && members.contains(p));
+    Ok(free_run(stack, pr, owned))
+}
+
+/// A row for a member of a Stack that the Forge didn't list for the human. It knows nothing of
+/// when it was opened or last updated, so it is only ever New or Seen.
+fn listing_of(pr: &PullRequest) -> InboxItem {
+    InboxItem {
+        id: pr.id.clone(),
+        kind: pr.kind(),
+        url: pr.url.clone(),
+        title: pr.title.clone(),
+        author: pr.author.clone(),
+        created_at: 0,
+        updated_at: 0,
+        role: InboxRole::Assignee,
+        approved: false,
+        verdict_given: false,
     }
 }
 

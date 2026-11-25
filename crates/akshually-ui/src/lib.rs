@@ -18,9 +18,9 @@ use rune_kit::{
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxView, MemberView, NewComment, Party, PublishPlan, Role, Service,
-    SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId, ThreadRef,
-    Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
+    HandOver, InboxRow, InboxRowState, InboxStack, InboxView, MemberView, NewComment, Party, PublishPlan, Role,
+    Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId,
+    ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -1001,8 +1001,25 @@ fn inbox_view(k: &Kit, s: &State, draft: Color) -> El {
         );
     let errors = s.inbox.errors.iter().map(|e| text(e.clone()).font(k.ty.small).color(k.c.danger.fg).wrap());
     let mut list = col().key("inbox-rows").w_full().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_base);
-    for inbox_row in &s.inbox.rows {
-        list = list.child(inbox_row_view(k, inbox_row, now, draft));
+    let mut rows = s.inbox.rows.iter().peekable();
+    while let Some(inbox_row) = rows.next() {
+        let Some(InboxStack { size, .. }) = inbox_row.stack else {
+            list = list.child(inbox_row_view(k, inbox_row, now, draft));
+            continue;
+        };
+        // A Stack's members follow each other, bottom first: they are one group, set apart from
+        // the rows around it.
+        let mut group = col()
+            .key(format!("inbox-stack-{}", inbox_row.item.url))
+            .w_full()
+            .fill(k.c.layer_02)
+            .border_sides([0.0, 0.0, 1.0, 3.0], k.c.border_base)
+            .child(text(format!("Stack of {size}")).font(k.ty.small).color(k.c.text_muted).px(12.0).pt(8.0))
+            .child(inbox_row_view(k, inbox_row, now, draft));
+        for member in rows.by_ref().take(size - 1) {
+            group = group.child(inbox_row_view(k, member, now, draft));
+        }
+        list = list.child(group);
     }
     let empty = s.inbox.rows.is_empty().then(|| {
         let note = if s.inbox.refreshed_at.is_some() { "Nothing waiting for you." } else { "Not refreshed yet." };
@@ -1034,7 +1051,9 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
     };
     let unseen = matches!(inbox_row.state, InboxRowState::New | InboxRowState::Updated);
     let dot = row().w(8.0).h(8.0).radius(4.0).fill(if unseen { k.c.warning.fg } else { Color::TRANSPARENT });
+    // The mark only means something next to the members that are requested.
     let role = match item.role {
+        _ if inbox_row.stack.is_some() && !inbox_row.qualifies => "Not requested",
         InboxRole::Reviewer => "Requested reviewer",
         InboxRole::Assignee => "Assignee",
     };
@@ -1074,6 +1093,10 @@ fn inbox_meta(item: &InboxItem, now: i64) -> String {
     } else {
         format!("{host} · {repo} {sigil}{number}")
     };
+    // A member of a Stack that the Forge didn't list for the human has no opening time.
+    if item.created_at == 0 {
+        return format!("{forge} · {place} · {}", item.author);
+    }
     format!("{forge} · {place} · {} · opened {}", item.author, ago(now - item.created_at))
 }
 
@@ -2399,7 +2422,7 @@ fn scene_inbox(s: &mut State) {
     scene_session(s);
     s.open_inbox();
     s.inbox = InboxView {
-        rows: rows.into_iter().map(|(item, state)| InboxRow { item, state }).collect(),
+        rows: rows.into_iter().map(|(item, state)| InboxRow { item, state, qualifies: true, stack: None }).collect(),
         refreshed_at: Some(now - 60),
         errors: Vec::new(),
         hosts: vec!["github.com".into(), "gitlab.example.com".into()],
