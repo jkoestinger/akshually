@@ -73,6 +73,21 @@ impl ThreadRef {
     }
 }
 
+/// Names one Comment across Sessions: its Thread, and its position there (0 opens the Thread).
+/// A Comment has no id of its own, so the service checks under its lock that the position still
+/// holds a Draft of the human's before it edits or discards it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CommentRef {
+    pub thread: ThreadRef,
+    pub comment: usize,
+}
+
+impl CommentRef {
+    pub fn new(thread: &ThreadRef, comment: usize) -> Self {
+        CommentRef { thread: thread.clone(), comment }
+    }
+}
+
 /// What the agent's blocking `review` call receives when the human acts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]

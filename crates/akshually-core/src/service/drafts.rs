@@ -1,7 +1,7 @@
 //! Draft rules: the human's Drafts, what the next Round carries, handing it over or taking it
 //! back, and the co-Reviewer's Drafts the human keeps, edits or discards.
 
-use super::{ChangesetView, Outcome, Service, SessionId, SessionView, ThreadRef, Turn};
+use super::{ChangesetView, CommentRef, Outcome, Service, SessionId, SessionView, ThreadRef, Turn};
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Changeset, Error};
 
@@ -148,6 +148,58 @@ impl Service {
         self.agent_draft(thread, |threads, at| {
             threads.remove(at);
         })
+    }
+
+    /// Human: rewrites their own Draft `comment` as `new`, under the rules of a new Comment:
+    /// text, and a suggestion only on the Draft that opens a Thread on new-side lines. It stays
+    /// a Draft, where it was. Refused for any Comment that isn't the human's Draft.
+    pub fn edit_own_draft(&self, comment: &CommentRef, new: impl Into<NewComment>) -> Result<(), Error> {
+        let new = new.into();
+        self.own_draft(comment, |threads, thread, at| {
+            // A reply takes no suggestion: it answers in the Thread, not on its lines.
+            let anchor = if at == 0 { &threads[thread].anchor } else { &Anchor::Review };
+            check_comment(anchor, &new)?;
+            let NewComment { body, suggestion } = new;
+            let draft = &mut threads[thread].comments[at];
+            (draft.body, draft.suggestion) = (body, suggestion);
+            Ok(())
+        })?
+    }
+
+    /// Human: discards their own Draft `comment`. The Draft that opens a Thread takes the Thread
+    /// with it; a Draft reply leaves the Thread as it was. Refused for any Comment that isn't
+    /// the human's Draft.
+    pub fn discard_own_draft(&self, comment: &CommentRef) -> Result<(), Error> {
+        self.own_draft(comment, |threads, thread, at| {
+            if at == 0 {
+                threads.remove(thread);
+            } else {
+                threads[thread].comments.remove(at);
+            }
+        })
+    }
+
+    /// Runs `f` on the Session's Threads with the positions of the Thread and of the Comment
+    /// `comment` names, once the Session offers the human to edit it: that is, it's still their
+    /// Draft. A stale position is refused, never applied to another Comment.
+    fn own_draft<T>(
+        &self,
+        CommentRef { thread: ThreadRef { session: id, thread }, comment }: &CommentRef,
+        f: impl FnOnce(&mut Vec<Thread>, usize, usize) -> T,
+    ) -> Result<T, Error> {
+        let mut inner = self.lock();
+        let at = inner.position(id)?;
+        let session = &mut inner.sessions[at];
+        let result = session.at_member_of(thread, |session| {
+            let view = &mut session.view;
+            if !view.thread_offered(thread)?.own_drafts.contains(comment) {
+                return Err(Error::NotYourDraft { thread: thread.clone(), comment: *comment });
+            }
+            let found = view.threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
+            Ok(f(&mut view.threads, found, *comment))
+        })?;
+        inner.notify();
+        Ok(result)
     }
 
     /// Runs `f` on the Session's Threads with the position of `thread`, a Thread the
