@@ -82,12 +82,38 @@ pub enum Outcome {
     /// The Verdict: the human approved the agent's local work.
     Approved,
     /// The human closed the Session without a Verdict; the agent should stop.
-    Abandoned,
+    Abandoned {
+        /// What became of each Pull Request of a Stack of more than one; empty otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pull_requests: Vec<MemberOutcome>,
+    },
     /// The human Published their Review of a Pull Request with `verdict`; `url` is the review
-    /// on the Forge.
-    Published { verdict: Verdict, url: String },
+    /// on the Forge. Of a Stack, they are the topmost Published member's.
+    Published {
+        verdict: Verdict,
+        url: String,
+        /// What became of each Pull Request of a Stack of more than one, in Stack order; empty
+        /// otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pull_requests: Vec<MemberOutcome>,
+    },
     /// The human closed a co-review of local work, which has no Verdict: a normal end.
     Closed,
+}
+
+/// What became of one Pull Request of a Stack when its Session ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberOutcome {
+    /// How the agent names it: `acme/web #482`.
+    pub name: String,
+    /// Its web page.
+    pub url: String,
+    /// The Verdict of its Review, when the human Published it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    /// Its Review on the Forge, when the human Published it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
 }
 
 /// How a Session ended: the [`Outcome`]s that end it, which a Round never does. It becomes
@@ -107,12 +133,13 @@ pub enum Ending {
     Closed,
 }
 
-impl From<Ending> for Outcome {
-    fn from(ending: Ending) -> Self {
-        match ending {
+impl Ending {
+    /// What the agent receives for this Ending, with what became of each Pull Request of a Stack.
+    pub(super) fn into_outcome(self, pull_requests: Vec<MemberOutcome>) -> Outcome {
+        match self {
             Ending::Approved => Outcome::Approved,
-            Ending::Abandoned => Outcome::Abandoned,
-            Ending::Published { verdict, url } => Outcome::Published { verdict, url },
+            Ending::Abandoned => Outcome::Abandoned { pull_requests },
+            Ending::Published { verdict, url } => Outcome::Published { verdict, url, pull_requests },
             Ending::Closed => Outcome::Closed,
         }
     }
@@ -668,6 +695,7 @@ impl Session {
             outdated: false,
             reopened: false,
             forge: None,
+            pull_request: None,
         });
         Ok(thread)
     }
@@ -986,7 +1014,7 @@ impl Service {
 
         let mut inner = self.lock();
         inner.next_waiter += 1;
-        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack, member: None };
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
         let waiter_id = waiter.id;
         let existing = inner.sessions.iter().position(|s| s.view.is_local(&repo, &branch));
         let id = match existing {

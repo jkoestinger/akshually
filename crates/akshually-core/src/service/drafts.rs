@@ -40,6 +40,7 @@ impl Service {
         let number = session.view.round;
         let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
+        let marks = session.view.pull_request_marks();
         for thread in session.view.all_threads_mut() {
             let carried: Vec<bool> =
                 (0..thread.comments.len()).map(|i| carried_in_next_round(co_review, thread, i)).collect();
@@ -55,7 +56,8 @@ impl Service {
                 .collect();
             let reopened = thread.reopened && !co_review;
             if !drafts.is_empty() || reopened {
-                threads.push(Thread { comments: drafts, reopened, ..thread.clone() });
+                let pull_request = marks.get(&thread.id).cloned();
+                threads.push(Thread { comments: drafts, reopened, pull_request, ..thread.clone() });
                 thread.reopened = false;
             }
         }

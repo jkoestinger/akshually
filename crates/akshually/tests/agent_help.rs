@@ -111,6 +111,17 @@ fn co_review_published(args: &[&str]) -> Output {
     finish(child)
 }
 
+/// Runs `review --pr args` on a Stack of two Pull Requests and lets the human Publish one of them.
+fn stack_co_review_published(args: &[&str]) -> Output {
+    let app = HostedApp::with_stack();
+    let url = support::stack_url(1);
+    let child = app.akshually(&std::env::temp_dir(), &[&["review", "--pr", &url], args].concat()).spawn().unwrap();
+    let session = app.wait_for_co_reviewer();
+    app.service.publish(&session.id, Verdict::Approve, "").unwrap();
+    app.service.close(&session.id).unwrap();
+    finish(child)
+}
+
 /// Drafts on local work, runs `review args` and lets the human close the co-review.
 fn local_co_review_closed(args: &[&str]) -> Output {
     let app = HostedApp::start();
@@ -189,8 +200,14 @@ fn documented_outcomes() -> Vec<DocumentedOutcome> {
 #[test]
 fn every_outcome_the_skill_lists_is_a_first_line_and_json_outcome_the_cli_prints() {
     let documented = documented_outcomes();
-    let reach_outcome: [fn(&[&str]) -> Output; 5] =
-        [review_round_handed_over, review_approved, review_abandoned, co_review_published, local_co_review_closed];
+    let reach_outcome: [fn(&[&str]) -> Output; 6] = [
+        review_round_handed_over,
+        review_approved,
+        review_abandoned,
+        co_review_published,
+        stack_co_review_published,
+        local_co_review_closed,
+    ];
 
     let printed: Vec<(Output, Output)> =
         reach_outcome.iter().map(|reach| (reach(&[]), reach(&["--format", "json"]))).collect();
@@ -221,7 +238,7 @@ fn the_steps_branch_only_on_first_lines_the_skill_lists() {
 
     let branched = first_lines_the_steps_branch_on();
 
-    assert_eq!(branched.len(), 7, "the loop's 3 outcomes and co-reviewing's 4: {branched:?}");
+    assert_eq!(branched.len(), 8, "the loop's 3 outcomes and co-reviewing's 5: {branched:?}");
     for line in branched {
         assert!(listed.contains(&line), "a step branches on `{line}`, which What `review` prints doesn't list");
     }

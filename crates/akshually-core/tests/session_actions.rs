@@ -142,6 +142,7 @@ fn thread(id: &str, comments: Vec<Comment>) -> Thread {
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     }
 }
 

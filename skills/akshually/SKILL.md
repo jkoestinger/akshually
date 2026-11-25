@@ -66,11 +66,23 @@ You review someone else's code alongside the human: a Pull Request (`--pr <url>`
 2. Run `akshually review --pr <url>`, or `akshually review` for local work. It hands your Drafts to the human and **blocks** until they act. It exits 0 whatever the human did: branch on the first line of its stdout (see [What `review` prints](#what-review-prints)):
    - `# Round N`, a Round of questions: stdout holds the Threads of the Drafts the human questioned, with their questions. Answer each with `reply` (with the same `--pr`). To revise a Draft, add a new one with `draft` and say so in your reply; the human discards the old one. Then go back to 2.
    - `Published with the Verdict …` (Pull Request only): the human published their Review; the line has the Verdict and the review's link (`{"outcome":"published","verdict":"approve","url":"…"}` with `--format json`). Report it back. Stop.
+   - `Published: …` (a Stack of Pull Requests only): the human published their Review of at least one of them; one line per Pull Request follows. Report each back. Stop. See [Co-reviewing a Stack](#co-reviewing-a-stack).
    - `Closed: …` (local work only): the human finished with your co-review. A co-review of local work has no Verdict, so this is its normal end. Stop.
    - `Abandoned: …` (Pull Request only): the human closed it without publishing. Stop.
    - A non-zero exit is an error, explained on stderr.
 
 Run `draft` before `review` on local work: the first `draft` is what makes you this branch's co-Reviewer. A branch whose Author is another agent refuses your Drafts.
+
+### Co-reviewing a Stack
+
+A Pull Request may be part of a **Stack**: Pull Requests that each ask to merge into the branch of the one below. The human reviews the whole Stack in one Session, with a separate Review, Verdict and Publish for each Pull Request.
+
+- `draft` on each Pull Request with **that Pull Request's own URL**. A Draft goes to the Pull Request its URL names.
+- Call `review --pr <url>` **once**, with the URL of any one of them. It reaches the same Session whichever you pass.
+- Thread IDs (`T3`) are unique across the whole Stack, and a Round names each Thread's Pull Request in its heading, before the anchor: `## T3 · acme/web #482 · src/lib.rs, new lines 2-3`. With `--format json` each Thread has `pull_request`, its URL, and `pull_request_name`. Answer a Thread with `reply` and `resolve` and the URL of the Pull Request it is on.
+- The human Publishing one Pull Request doesn't return `review`: it returns for a Round, and otherwise when the Session ends.
+- The outcome's first line says which Ending it was: `Published: …` when the human published at least one Pull Request, `Abandoned: …` when none. After `Published: …`, one line per Pull Request follows, in Stack order, each `- acme/web #482: Published with the Verdict approve: <link>` or `- acme/web #483: not Published`. With `--format json`, `pull_requests` lists each one's `name` and `url`, and its `verdict` and `review` link when it was published. (`verdict` and `url` at the top are those of the topmost Pull Request published.)
+- A `draft`, `reply` or `resolve` on a Pull Request the human already published fails with exit 1 and says so.
 
 ## What `review` prints
 
@@ -80,6 +92,7 @@ Run `draft` before `review` on local work: the first `draft` is what makes you t
 - `Approved.` (JSON `approved`): the Review is over. Stop.
 - `Abandoned: …` (JSON `abandoned`): the human closed the Session without a Verdict. Stop working on this change. For `review --pr`, the human closed the Pull Request's Session without publishing.
 - `Published with the Verdict …` (JSON `published`, `review --pr` only): the human published their Review of the Pull Request; the line has the Verdict and the link. Report it back. Stop.
+- `Published: …` (JSON `published`, `review --pr` on a Stack of Pull Requests only): the human published their Review of at least one Pull Request of the Stack; one line per Pull Request follows, in Stack order, with its Verdict and link or that it was not Published. Report it back. Stop. See [Co-reviewing a Stack](#co-reviewing-a-stack).
 - `Closed: …` (JSON `closed`, co-review of local work only): the human finished with your co-review, a normal end. Stop.
 
 ## Exit codes

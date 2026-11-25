@@ -9,8 +9,8 @@ use akshually_core::forge::{
     RemoteComment, RemoteThread, Review,
 };
 use akshually_core::{
-    Anchor, Changeset, Ending, Error, FileChange, InboxRowState, Outcome, PublishedReview, ReviewRequest, Service,
-    SessionId, SessionView, Side, ThreadId, ThreadRef, Verdict,
+    Anchor, Changeset, Ending, Error, FileChange, InboxRowState, MemberOutcome, Outcome, PublishedReview,
+    ReviewRequest, Service, SessionId, SessionView, Side, ThreadId, ThreadRef, Verdict,
 };
 use akshually_testkit::TestDirs;
 
@@ -487,34 +487,36 @@ fn publishing_the_last_unpublished_member_ends_the_session_as_published() {
     assert_eq!(ended, Some(Ending::Published { verdict: Verdict::Feedback, url }));
 }
 
+fn member(number: u64, published: Option<(Verdict, &str)>) -> MemberOutcome {
+    MemberOutcome {
+        name: format!("acme/web #{number}"),
+        url: url(number),
+        verdict: published.map(|(verdict, _)| verdict),
+        review: published.map(|(_, review)| review.to_owned()),
+    }
+}
+
 #[test]
-fn the_agent_is_told_abandoned_when_the_pull_request_its_url_names_was_not_published() {
+fn the_agent_is_told_what_became_of_each_member_whichever_members_url_it_named() {
     let svc = FakeForge::stack_of_three().service();
     let pending = svc.review(ReviewRequest::pull_request(url(2))).unwrap();
     let id = pending.session().clone();
     svc.select_member(&id, &pr_ref(1)).unwrap();
     svc.publish(&id, Verdict::Approve, "").unwrap();
-
-    svc.close(&id).unwrap();
-
-    let outcome = pending.wait_timeout(Duration::from_secs(5));
-    assert_eq!(outcome, Some(Outcome::Abandoned), "#2, the Pull Request the call named, wasn't Published");
-}
-
-#[test]
-fn the_agent_is_told_the_outcome_of_the_pull_request_its_url_names() {
-    let svc = FakeForge::stack_of_three().service();
-    let pending = svc.review(ReviewRequest::pull_request(url(1))).unwrap();
-    let id = pending.session().clone();
-    svc.publish(&id, Verdict::RequestChanges, "Needs work.").unwrap();
-    svc.select_member(&id, &pr_ref(2)).unwrap();
     assert_eq!(pending.wait_timeout(Duration::from_millis(200)), None, "a member was Published, not the Session");
 
     svc.close(&id).unwrap();
 
     let outcome = pending.wait_timeout(Duration::from_secs(5));
-    let url = "https://forge.test/acme/web/pull/1#review".to_owned();
-    assert_eq!(outcome, Some(Outcome::Published { verdict: Verdict::RequestChanges, url }));
+    let review = "https://forge.test/acme/web/pull/1#review";
+    assert_eq!(
+        outcome,
+        Some(Outcome::Published {
+            verdict: Verdict::Approve,
+            url: review.into(),
+            pull_requests: vec![member(1, Some((Verdict::Approve, review))), member(2, None), member(3, None)],
+        })
+    );
 }
 
 #[test]
@@ -524,7 +526,10 @@ fn closing_with_no_member_published_ends_the_session_as_abandoned_for_its_agent(
 
     svc.close(pending.session()).unwrap();
 
-    assert_eq!(pending.wait_timeout(Duration::from_secs(5)), Some(Outcome::Abandoned));
+    assert_eq!(
+        pending.wait_timeout(Duration::from_secs(5)),
+        Some(Outcome::Abandoned { pull_requests: vec![member(1, None), member(2, None), member(3, None)] })
+    );
 }
 
 #[test]
