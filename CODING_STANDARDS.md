@@ -11,8 +11,8 @@ Read [`GLOSSARY.md`](GLOSSARY.md) and the ADRs in [`docs/adr/`](docs/adr/) first
 - **`Service` is the single entry point.** The UI calls it in-process. The CLI reaches it through the local channel in `ipc` ([ADR 0002](docs/adr/0002-persistent-window-blocking-cli.md)). Don't add a second path into the state.
 - **The core is blocking.** There is no async runtime: HTTP goes through `ureq`, and slow work runs on its own thread. The UI never blocks its thread on the network or on `git`.
 - **Forge details stay in the Forge adapters.** `forge::github` and `forge::gitlab` map their Forge's API to Forge-neutral core types (`PullRequest`, `Changeset`, `RemoteThread`, `Review`). The service never sees GitHub or GitLab shapes.
-- **Shell out to `git`** through `crate::git` rather than linking a git library, so akshually gives the same answers as the user's git.
-- **akshually never launches agents.** Agents call the CLI, and the CLI stays agent-agnostic.
+- **Shell out to `git`** through `crate::git` rather than linking a git library, so Akshually gives the same answers as the user's git.
+- **Akshually never launches agents.** Agents call the CLI, and the CLI stays agent-agnostic.
 - **Hold the service lock briefly.** Callbacks run under the lock (`Notifier`, subscribers, `show_window`): they must return quickly and never call back into the service. Network calls happen outside the lock.
 
 ## Domain language
