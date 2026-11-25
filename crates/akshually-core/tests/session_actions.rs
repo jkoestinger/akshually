@@ -350,7 +350,7 @@ fn thread_actions(session: SessionView, thread: Thread) -> ThreadActions {
 }
 
 fn offered(id: &str, reply: bool, resolve: bool, reopen: bool, agent_draft: bool) -> ThreadActions {
-    ThreadActions { thread: ThreadId::new(id), reply, resolve, reopen, agent_draft }
+    ThreadActions { thread: ThreadId::new(id), reply, resolve, reopen, agent_draft, own_drafts: Vec::new() }
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn a_thread_still_all_drafts_offers_nothing_yet() {
 
     let actions = thread_actions(local(Role::Author, Turn::Human, None), draft);
 
-    assert_eq!(actions, offered("T1", false, false, false, false));
+    assert_eq!(actions, ThreadActions { own_drafts: vec![0], ..offered("T1", false, false, false, false) });
 }
 
 #[test]

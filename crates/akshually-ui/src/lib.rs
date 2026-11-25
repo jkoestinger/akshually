@@ -19,8 +19,8 @@ use rune_kit::{
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, CommentRef, DiffLayout, Displayed, EndAction, Ending,
+    FileChange, HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
     PublishPlan, Role, Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread,
     ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
@@ -183,6 +183,9 @@ pub struct State {
     reply_text: TextEdit,
     /// The co-Reviewer's Draft being edited, at most one in the window.
     editing: Option<ThreadRef>,
+    /// One of the human's own Drafts being edited, in the same editor, which is open for at most
+    /// one of this and `editing` (#108).
+    editing_own: Option<CommentRef>,
     edit_text: TextEdit,
     /// The Publish dialog, while it's open.
     publish: Option<Publish>,
@@ -398,6 +401,7 @@ impl State {
             reply: None,
             reply_text: TextEdit::new(""),
             editing: None,
+            editing_own: None,
             edit_text: TextEdit::new(""),
             publish: None,
             summary: TextEdit::new(""),
@@ -813,20 +817,57 @@ impl State {
         let Some(draft) = draft else { return };
         let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
         self.edit_text = focused_edit(written.to_markdown());
+        self.editing_own = None;
         self.editing = Some(thread);
+    }
+
+    /// Opens the editor on the human's own Draft `at`, with what it says now.
+    fn open_edit_own(&mut self, at: CommentRef) {
+        let tab = self.tab(&at.thread.session);
+        let thread = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == at.thread.thread));
+        let Some(draft) = thread.and_then(|t| t.comments.get(at.comment)) else { return };
+        let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
+        self.edit_text = focused_edit(written.to_markdown());
+        self.editing = None;
+        self.editing_own = Some(at);
     }
 
     fn close_edit(&mut self) {
         self.editing = None;
+        self.editing_own = None;
         self.edit_text = TextEdit::new("");
     }
 
     /// Saves the edited co-Reviewer's Draft, which keeps it as the human's.
     fn save_edit(&mut self) {
+        if let Some(at) = &self.editing_own {
+            match self.service.edit_own_draft(at, NewComment::from_markdown(&self.edit_text.text)) {
+                Ok(()) => self.close_edit(),
+                error => report(error),
+            }
+            return;
+        }
         let Some(thread) = &self.editing else { return };
         match self.service.edit_draft(thread, NewComment::from_markdown(&self.edit_text.text)) {
             Ok(()) => self.close_edit(),
             error => report(error),
+        }
+    }
+
+    /// Discards the human's own Draft `at`. Comments after it move up a place, so an editor open
+    /// on one of them follows it, and one open on `at` itself closes with it.
+    fn discard_own(&mut self, at: &CommentRef) {
+        if let Err(error) = self.service.discard_own_draft(at) {
+            report(Err(error));
+            return;
+        }
+        let Some(open) = self.editing_own.as_mut().filter(|open| open.thread == at.thread) else { return };
+        // The Draft that opens a Thread takes the Thread, and so every editor in it, with it.
+        match open.comment.cmp(&at.comment) {
+            _ if at.comment == 0 => self.close_edit(),
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => self.close_edit(),
+            std::cmp::Ordering::Greater => open.comment -= 1,
         }
     }
 
@@ -2096,13 +2137,13 @@ fn agent_draft_card(
     }
     let at = ThreadRef::new(session, &thread.id);
     if s.editing.as_ref() == Some(&at) {
-        return card.child(edit_composer(k, s));
+        return card.child(edit_composer(k, s, false));
     }
     card = card.child(Markdown::new(draft.body.clone()).selectable(true).build(k));
     if let Some(suggestion) = &draft.suggestion {
         card = card.child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
     }
-    card = comments(k, card, thread, &thread.comments[1..]);
+    card = comments(k, card, thread, 1, Some((s, session, offered)));
     if s.reply.as_ref() == Some(&at) {
         return card.child(reply_composer(k, s));
     }
@@ -2139,8 +2180,14 @@ fn agent_draft_card(
     )
 }
 
-/// The editor of a co-Reviewer's Draft; saving keeps it as the human's.
-fn edit_composer(k: &Kit, s: &State) -> El {
+/// The editor of a co-Reviewer's Draft, where saving keeps it as the human's, or of one of the
+/// human's own Drafts (`own`), which saving leaves a Draft.
+fn edit_composer(k: &Kit, s: &State, own: bool) -> El {
+    let hint = if own {
+        "Markdown · a Draft until you hand over the Round"
+    } else {
+        "Markdown · saving keeps it as your Draft"
+    };
     col()
         .key("edit-composer")
         .w_full()
@@ -2158,19 +2205,21 @@ fn edit_composer(k: &Kit, s: &State) -> El {
                 .w_full()
                 .gap(8.0)
                 .items_center()
-                .child(text("Markdown · saving keeps it as your Draft").font(k.ty.small).color(k.c.text_faint))
+                .child(text(hint).font(k.ty.small).color(k.c.text_faint))
                 .child(row().grow(1.0))
                 .child(
                     Button::new("Cancel")
                         .variant(ButtonVariant::Ghost)
                         .on_press(|s: &mut State| s.close_edit())
-                        .build(k),
+                        .build(k)
+                        .key("cancel-edit"),
                 )
                 .child(
-                    Button::new("Save and keep")
+                    Button::new(if own { "Save" } else { "Save and keep" })
                         .variant(ButtonVariant::Submit)
                         .on_press(|s: &mut State| s.save_edit())
-                        .build(k),
+                        .build(k)
+                        .key("save-edit"),
                 ),
         )
 }
@@ -2258,7 +2307,7 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId, &T
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    card = comments(k, card, thread, &thread.comments);
+    card = comments(k, card, thread, 0, actions);
     if thread.reopened {
         card = card.child(text("Reopened · goes out with your next Round").font(k.ty.small).color(k.c.text_faint));
     }
@@ -2287,9 +2336,17 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId, &T
     card
 }
 
-/// `comments` of `thread` added to `card`, each under who wrote it and when.
-fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El {
-    for comment in comments {
+/// The Comments of `thread` from position `first` on, added to `card`, each under who wrote it
+/// and when. With `actions` (the Session, and what it offers in the Thread), each of the human's
+/// own Drafts has Edit and Discard, and an editor in place of the one being edited.
+fn comments(
+    k: &Kit,
+    mut card: El,
+    thread: &Thread,
+    first: usize,
+    actions: Option<(&State, &SessionId, &ThreadActions)>,
+) -> El {
+    for (at, comment) in thread.comments.iter().enumerate().skip(first) {
         let who = match &comment.author {
             Party::Human => "You",
             Party::Agent => "Agent",
@@ -2300,22 +2357,53 @@ fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El 
             None => "on the Pull Request".to_owned(),
             Some(round) => format!("Round {round}"),
         };
-        card = card
-            .child(
-                row()
-                    .gap(8.0)
-                    .items_center()
-                    .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
-                    .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
-            )
-            .child(Markdown::new(comment.body.clone()).selectable(true).build(k));
+        card = card.child(
+            row()
+                .gap(8.0)
+                .items_center()
+                .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
+                .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
+        );
+        let own = actions.filter(|(_, _, offered)| offered.own_drafts.contains(&at));
+        let this = own.map(|(s, session, _)| (s, CommentRef::new(&ThreadRef::new(session, &thread.id), at)));
+        if let Some((s, _)) = this.as_ref().filter(|(s, this)| s.editing_own.as_ref() == Some(this)) {
+            card = card.child(edit_composer(k, s, true));
+            continue;
+        }
+        card = card.child(Markdown::new(comment.body.clone()).selectable(true).build(k));
         if let Some(suggestion) = &comment.suggestion {
             card = card
                 .child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
                 .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
         }
+        if let Some((_, this)) = this {
+            card = card.child(own_draft_buttons(k, thread, at, this));
+        }
     }
     card
+}
+
+/// Discard and Edit under one of the human's own Drafts, the `at`th Comment of `thread`.
+fn own_draft_buttons(k: &Kit, thread: &Thread, at: usize, this: CommentRef) -> El {
+    let (edit, discard) = (this.clone(), this);
+    row()
+        .w_full()
+        .gap(8.0)
+        .child(row().grow(1.0))
+        .child(
+            Button::new("Discard")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.discard_own(&discard))
+                .build(k)
+                .key(format!("discard-{}-{at}", thread.id)),
+        )
+        .child(
+            Button::new("Edit")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.open_edit_own(edit.clone()))
+                .build(k)
+                .key(format!("edit-{}-{at}", thread.id)),
+        )
 }
 
 /// Whether `key` is Escape in a Comment field whose `text` is empty or whitespace only: the
