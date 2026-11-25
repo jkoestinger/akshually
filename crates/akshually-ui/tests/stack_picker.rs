@@ -1,8 +1,9 @@
 //! UI: a Stack in the Pull Request Session's header, in Rune's headless `Runtime` against a real
-//! Session in the core service: the tab's title, and the picker that lists the members bottom to
+//! Session in the core service: the tab's title, and the picker that lists the Members bottom to
 //! top and switches between them (ADR 0004).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rune::accesskit::Action;
 use rune::{Env, Runtime};
@@ -22,6 +23,10 @@ fn url(number: u64) -> String {
     format!("https://forge.test/acme/web/pull/{number}")
 }
 
+/// Whether the top Member `#3` was pushed to since the Session opened: only the test of that
+/// push sets it, and no other test polls.
+static TOP_PUSHED: AtomicBool = AtomicBool::new(false);
+
 fn pull_request(number: u64) -> PullRequest {
     let (head, base) = [("a", "main"), ("b", "a"), ("c", "b")][number as usize - 1];
     PullRequest {
@@ -30,10 +35,15 @@ fn pull_request(number: u64) -> PullRequest {
         title: ["Add the store", "Add SSO login", "Add the audit log"][number as usize - 1].into(),
         author: "maria".into(),
         head_branch: head.into(),
-        head_sha: format!("head{number}"),
+        head_sha: if number == 3 && TOP_PUSHED.load(Ordering::SeqCst) {
+            "head3b".to_owned()
+        } else {
+            format!("head{number}")
+        },
         base_sha: format!("base{number}"),
         base_branch: base.into(),
         from_fork: false,
+        ..Default::default()
     }
 }
 
@@ -81,7 +91,7 @@ impl ForgeAdapter for StackForge {
     }
 }
 
-/// The Stack's Session, opened on its middle member, with the Drafts and Verdict the picker shows.
+/// The Stack's Session, opened on its middle Member, with the Drafts and Verdict the picker shows.
 fn stack_session() -> (Arc<Service>, SessionId) {
     let service = Arc::new(Service::new().with_forges(vec![Box::new(StackForge)]));
     let id = service.open_pull_request(&url(2)).unwrap();
@@ -240,4 +250,19 @@ fn a_published_members_header_says_so() {
     let header = texts_within(&rt, "session-header");
     assert!(header.contains(&"Published · Approve".to_owned()), "{header:?}");
     assert!(rt.find("stack-member-trigger").is_some());
+}
+
+#[test]
+fn a_member_that_was_pushed_to_while_another_is_shown_says_so_in_the_picker() {
+    let (service, id) = stack_session();
+    TOP_PUSHED.store(true, Ordering::SeqCst);
+    service.check_pull_requests();
+    let mut rt = window(&service);
+    press(&mut rt, "stack-member-trigger");
+
+    let listed = texts_within(&rt, "stack-member-content");
+    let updated: Vec<_> = listed.iter().filter(|t| t.contains("updated")).collect();
+    assert_eq!(updated.len(), 1, "{listed:?}");
+    assert!(updated[0].contains("Add the audit log"), "the entry of #3: {listed:?}");
+    assert!(service.session(&id).unwrap().mark().is_some(), "the tab is marked, which the entry explains");
 }

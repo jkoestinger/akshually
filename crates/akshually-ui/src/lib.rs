@@ -18,9 +18,9 @@ use rune_kit::{
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
     Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxStack, InboxView, MemberView, NewComment, Party, PublishPlan, Role,
-    Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread, ThreadActions, ThreadId,
-    ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
+    HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
+    PublishPlan, Role, Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread,
+    ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
 
 /// The annotation id of the Comment composer (Thread ids are `T1`, `T2`, …).
@@ -30,10 +30,10 @@ const INBOX_TAB: &str = "inbox";
 /// The Changeset view dropdown's list width in points: "Since Session base" whole, with the
 /// list's padding and check. `Select`'s own minimum (160) cuts it off.
 const VIEW_LIST_MIN_WIDTH: f32 = 200.0;
-/// The Stack member picker's list width in points: a reference, a title and what is said of it
+/// The Stack Member picker's list width in points: a reference, a title and what is said of it
 /// in one line, which wraps when it is longer.
 const MEMBER_LIST_MIN_WIDTH: f32 = 420.0;
-/// The member picker's last entry, which shows what the whole Stack changes.
+/// The Member picker's last entry, which shows what the whole Stack changes.
 const WHOLE_STACK: &str = "Whole Stack";
 /// How much of a base commit's hash headers show: enough to tell commits apart at a glance.
 const SHORT_HASH: usize = 8;
@@ -223,7 +223,7 @@ struct SessionTab {
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
-    /// The header's Stack member picker is open. Kept per Session, like `choosing_view`.
+    /// The header's Stack Member picker is open. Kept per Session, like `choosing_view`.
     choosing_member: bool,
     /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
     /// lost on restart.
@@ -622,14 +622,14 @@ impl State {
         }
     }
 
-    /// Opens or closes the Stack member picker in the header of `id`'s tab.
+    /// Opens or closes the Stack Member picker in the header of `id`'s tab.
     fn choose_member(&mut self, id: &SessionId, open: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| &t.session.id == id) {
             tab.choosing_member = open;
         }
     }
 
-    /// Shows the member `pr` of the Stack in `id`'s Session.
+    /// Shows the Member `pr` of the Stack in `id`'s Session.
     fn select_member(&self, id: &SessionId, pr: &PullRequestRef) {
         report(self.service.select_member(id, pr));
     }
@@ -903,6 +903,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(push_banner(k, tab))
             .child(general_threads(k, s, tab, agent))
             .child(outdated_threads(k, tab))
+            .children(stack_changeset_notice(k, &tab.session))
             .child(col().grow(1.0).min_h(0.0).child(match tab.session.stack_changeset() {
                 Some(Err(error)) => stack_changeset_error(k, error),
                 _ => session_diff(k, s, tab, agent),
@@ -1019,7 +1020,7 @@ fn inbox_view(k: &Kit, s: &State, draft: Color) -> El {
             list = list.child(inbox_row_view(k, inbox_row, now, draft));
             continue;
         };
-        // A Stack's members follow each other, bottom first: they are one group, set apart from
+        // A Stack's Members follow each other, bottom first: they are one group, set apart from
         // the rows around it.
         let mut group = col()
             .key(format!("inbox-stack-{}", inbox_row.item.url))
@@ -1063,11 +1064,15 @@ fn inbox_row_view(k: &Kit, inbox_row: &InboxRow, now: i64, draft: Color) -> El {
     };
     let unseen = matches!(inbox_row.state, InboxRowState::New | InboxRowState::Updated);
     let dot = row().w(8.0).h(8.0).radius(4.0).fill(if unseen { k.c.warning.fg } else { Color::TRANSPARENT });
-    // The mark only means something next to the members that are requested.
-    let role = match item.role {
-        _ if inbox_row.stack.is_some() && !inbox_row.qualifies => "Not requested",
-        InboxRole::Reviewer => "Requested reviewer",
-        InboxRole::Assignee => "Assignee",
+    // The mark only means something next to the Members that are requested.
+    let grouped = inbox_row.stack.is_some();
+    let role = match (inbox_row.standing, item.role) {
+        (InboxStanding::NotRequested, _) if grouped => "Not requested",
+        (InboxStanding::VerdictGiven, _) if grouped => "Verdict given",
+        (InboxStanding::Approved, _) if grouped => "Approved",
+        (_, Some(InboxRole::Reviewer)) => "Requested reviewer",
+        (_, Some(InboxRole::Assignee)) => "Assignee",
+        (_, None) => "Not requested",
     };
     let url = item.url.clone();
     row()
@@ -1105,10 +1110,6 @@ fn inbox_meta(item: &InboxItem, now: i64) -> String {
     } else {
         format!("{host} · {repo} {sigil}{number}")
     };
-    // A member of a Stack that the Forge didn't list for the human has no opening time.
-    if item.created_at == 0 {
-        return format!("{forge} · {place} · {}", item.author);
-    }
     format!("{forge} · {place} · {} · opened {}", item.author, ago(now - item.created_at))
 }
 
@@ -1139,7 +1140,7 @@ fn pull_request_opener(k: &Kit, s: &State) -> El {
 }
 
 /// A Pull Request Session's header. Its Drafts stay in the Session until Publish. A Stack of
-/// several members has the picker that switches between them, whose list goes into `layer`.
+/// several Members has the picker that switches between them, whose list goes into `layer`.
 fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::PullRequest, layer: &mut Vec<El>) -> El {
     let session = &tab.session;
     let picker = member_picker(k, tab, layer);
@@ -1164,7 +1165,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(layout_control(k, tab))
         .children(published.map(|badge| badge.build(k)))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
-        // A Published member takes no more Drafts.
+        // A Published Member takes no more Drafts.
         .children(session.published.is_none().then(|| {
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
@@ -1185,7 +1186,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
 /// or Publish.
 fn stack_changeset_header(k: &Kit, tab: &SessionTab, picker: Option<El>) -> El {
     let session = &tab.session;
-    let members = session.stack().iter().filter(|m| m.in_stack).count();
+    let members = session.members_in_stack();
     let base = &session.shown().base[..session.shown().base.len().min(SHORT_HASH)];
     row()
         .key("session-header")
@@ -1202,7 +1203,7 @@ fn stack_changeset_header(k: &Kit, tab: &SessionTab, picker: Option<El>) -> El {
         .child(layout_control(k, tab))
 }
 
-/// The picker of a Stack's members, bottom to top; `None` for a Stack of one. Each entry says
+/// The picker of a Stack's Members, bottom to top; `None` for a Stack of one. Each entry says
 /// which Pull Request it is, how many Drafts its Review holds and its Verdict once Published,
 /// and when it left the Stack. A Stack of two or more ends with the Stack Changeset.
 fn member_picker(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
@@ -1244,7 +1245,7 @@ fn member_picker(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> Option<El> {
     Some(picker)
 }
 
-/// How a Stack's member reads in the picker.
+/// How a Stack's Member reads in the picker.
 fn member_label(member: &MemberView) -> String {
     let drafts = match member.drafts {
         1 => "1 Draft".to_owned(),
@@ -1256,6 +1257,10 @@ fn member_label(member: &MemberView) -> String {
     }
     if !member.in_stack {
         label.push_str(" · no longer part of the Stack");
+    }
+    // A push to a Member that isn't shown marks the tab: this says which one.
+    if member.update.is_some() {
+        label.push_str(" · updated");
     }
     label
 }
@@ -1763,13 +1768,14 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
                     })
                     .build(&kc)
             }))
-            .child(
+            // The files of the Stack Changeset are no Member's to tick.
+            .children((!read_only).then(|| {
                 Checkbox::new(viewed)
                     .label("Viewed")
                     .on_toggle(move |s: &mut State| s.mark_viewed(&id, &path, !viewed))
                     .build(&kc)
-                    .key(format!("viewed-{}", change.path)),
-            )
+                    .key(format!("viewed-{}", change.path))
+            }))
     })
     .annotation({
         let k = k.clone();
@@ -1788,6 +1794,15 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     .build(s, k)
 }
 
+/// Says the Stack Changeset shown is only part of what the Stack changes, when the Forge cut it
+/// short.
+fn stack_changeset_notice(k: &Kit, session: &SessionView) -> Option<El> {
+    let reason = session.stack_changeset_cut_off()?;
+    Some(row().key("stack-changeset-cut-off").w_full().px(16.0).py(8.0).child(
+        text(format!("This Stack Changeset is cut off, not complete: {reason}.")).font(k.ty.ui).color(k.c.warning.fg),
+    ))
+}
+
 /// Where the Stack Changeset's diff would be, when fetching it failed.
 fn stack_changeset_error(k: &Kit, error: &str) -> El {
     card(k)
@@ -1799,13 +1814,9 @@ fn stack_changeset_error(k: &Kit, error: &str) -> El {
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
 /// and the composer when it's writing one.
 fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
-    // The Stack Changeset is for reading only: the members' Threads aren't shown on it.
-    if tab.session.stack_changeset_selected() {
-        return col();
-    }
     // Outdated File Threads show with the other Outdated Threads instead.
     let general = |t: &Thread| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. });
-    let threads: Vec<&Thread> = tab.session.threads.iter().filter(|t| general(t)).collect();
+    let threads: Vec<&Thread> = tab.session.threads_shown().iter().filter(|t| general(t)).collect();
     let composing = s.composer.as_ref().is_some_and(|c| c.session == tab.session.id && c.at.is_none());
     if threads.is_empty() && !composing {
         return col();
@@ -2154,10 +2165,7 @@ fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
 /// they were written against and their Comments.
 fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
     let mut list = col().key("outdated-threads").w_full().px(16.0).gap(8.0);
-    if tab.session.stack_changeset_selected() {
-        return list;
-    }
-    for thread in tab.session.threads.iter().filter(|t| t.outdated) {
+    for thread in tab.session.threads_shown().iter().filter(|t| t.outdated) {
         let expanded = tab.expanded.contains(&thread.id);
         let first = first_line(thread);
         let count = match thread.comments.len() {
@@ -2297,7 +2305,7 @@ fn scene_session(s: &mut State) {
         selected: 0,
         published: None,
         opened: None,
-        whole_stack: Default::default(),
+        stack_changeset: Default::default(),
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
@@ -2360,7 +2368,7 @@ fn scene_threads(s: &mut State) {
         selected: 0,
         published: None,
         opened: None,
-        whole_stack: Default::default(),
+        stack_changeset: Default::default(),
         round: 1,
         threads: vec![
             thread(
@@ -2462,7 +2470,10 @@ fn scene_inbox(s: &mut State) {
         author: author.into(),
         created_at: now - opened_h * 3600,
         updated_at: now - 600,
-        role,
+        role: Some(role),
+        base_branch: "main".into(),
+        head_branch: format!("pr-{number}"),
+        from_fork: false,
         approved: false,
         verdict_given: false,
     };
@@ -2489,7 +2500,10 @@ fn scene_inbox(s: &mut State) {
     scene_session(s);
     s.open_inbox();
     s.inbox = InboxView {
-        rows: rows.into_iter().map(|(item, state)| InboxRow { item, state, qualifies: true, stack: None }).collect(),
+        rows: rows
+            .into_iter()
+            .map(|(item, state)| InboxRow { item, state, standing: InboxStanding::Listed, stack: None })
+            .collect(),
         refreshed_at: Some(now - 60),
         errors: Vec::new(),
         hosts: vec!["github.com".into(), "gitlab.example.com".into()],
@@ -2509,6 +2523,8 @@ fn scene_publish(s: &mut State) {
         base_sha: "base1".into(),
         base_branch: "main".into(),
         from_fork: false,
+        created_at: 0,
+        updated_at: 0,
     };
     let mut suggested = sample_thread("T1", 3..=3, "Name it for what it holds.", None);
     suggested.comments[0].suggestion = Some("    let before = self.changeset.snapshot()?;\n".into());

@@ -12,8 +12,11 @@ use akshually_core::{Changeset, Service, Verdict};
 use akshually_ui::{State, view};
 
 /// A Forge whose open Pull Requests make a Stack `#1 <- #2 <- #3`, and a lone `#4`. The human's
-/// review is requested on `#3` and `#4`.
-struct Forge;
+/// review is requested on `#3` and `#4`; with `done`, it also lists `#1` as one the human gave a
+/// Verdict on, and `#2` as approved already.
+struct Forge {
+    done: bool,
+}
 
 fn pr_ref(number: u64) -> PullRequestRef {
     PullRequestRef { host: "forge.test".into(), repo: "acme/web".into(), number }
@@ -31,6 +34,7 @@ fn pull_request(number: u64) -> PullRequest {
         base_sha: format!("base{number}"),
         base_branch: base.into(),
         from_fork: false,
+        ..Default::default()
     }
 }
 
@@ -86,17 +90,25 @@ impl ForgeAdapter for Forge {
                 author: pr.author,
                 created_at: 1_000,
                 updated_at: number as i64,
-                role: InboxRole::Reviewer,
-                approved: false,
-                verdict_given: false,
+                role: Some(InboxRole::Reviewer),
+                head_branch: pr.head_branch,
+                base_branch: pr.base_branch,
+                from_fork: false,
+                approved: self.done && number == 2,
+                verdict_given: self.done && number == 1,
             }
         };
-        Ok(Some(vec![item(3), item(4)]))
+        let listed = if self.done { vec![1, 2, 3, 4] } else { vec![3, 4] };
+        Ok(Some(listed.into_iter().map(item).collect()))
     }
 }
 
 fn inbox_window() -> Runtime<State> {
-    let service = Arc::new(Service::new().with_forges(vec![Box::new(Forge)]));
+    window_of(Forge { done: false })
+}
+
+fn window_of(forge: Forge) -> Runtime<State> {
+    let service = Arc::new(Service::new().with_forges(vec![Box::new(forge)]));
     service.refresh_inbox();
     let mut rt = Runtime::new(State::new(service), view, (1280.0, 800.0), Env::default());
     rt.frame(0.0);
@@ -147,4 +159,24 @@ fn a_lone_pull_request_is_a_plain_row_outside_any_group() {
         !texts_within(&rt, "inbox-stack-https://forge.test/acme/web/pull/4").iter().any(|t| t == "Pull Request 4"),
         "a group of one"
     );
+}
+
+#[test]
+fn a_member_that_does_not_qualify_says_why_it_does_not() {
+    let rt = window_of(Forge { done: true });
+
+    let group = texts_within(&rt, "inbox-stack-https://forge.test/acme/web/pull/1");
+
+    assert!(group.contains(&"Verdict given".to_owned()), "{group:?}");
+    assert!(group.contains(&"Approved".to_owned()), "{group:?}");
+    assert!(!group.contains(&"Not requested".to_owned()), "{group:?}");
+}
+
+#[test]
+fn a_member_the_forge_did_not_list_has_an_opening_time_like_any_row() {
+    let rt = inbox_window();
+
+    let group = texts_within(&rt, "inbox-stack-https://forge.test/acme/web/pull/1");
+
+    assert_eq!(group.iter().filter(|t| t.contains("opened")).count(), 3, "{group:?}");
 }

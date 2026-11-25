@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rune::accesskit::Action;
 use rune::{Env, Runtime};
 
-use akshually_core::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
+use akshually_core::forge::{Comparison, ForgeAdapter, ForgeError, PullRequest, PullRequestRef, RemoteThread, Review};
 use akshually_core::{Anchor, Changeset, FileChange, Service, SessionId, Verdict};
 use akshually_ui::{State, view};
 
@@ -15,6 +15,8 @@ use akshually_ui::{State, view};
 struct StackForge {
     /// Comparing two commits fails.
     broken: bool,
+    /// The Forge cuts the comparison short.
+    cut_off: bool,
 }
 
 fn pr_ref(number: u64) -> PullRequestRef {
@@ -37,6 +39,7 @@ fn pull_request(number: u64) -> PullRequest {
         base_sha: format!("base{number}"),
         base_branch: base.into(),
         from_fork: false,
+        ..Default::default()
     }
 }
 
@@ -67,13 +70,14 @@ impl ForgeAdapter for StackForge {
         Ok(Changeset { base: pr.base_sha.clone(), files: vec![FileChange::text(&path, Some("a\n"), Some("b\n"))] })
     }
 
-    fn changeset_between(&self, _: &str, base: &str, _: &str) -> Result<Changeset, ForgeError> {
+    fn changeset_between(&self, _: &str, base: &str, _: &str) -> Result<Comparison, ForgeError> {
         if self.broken {
             let message = "compare is down".to_owned();
             return Err(ForgeError::Api { host: "forge.test".into(), status: 500, message });
         }
         let file = FileChange::text("whole.rs", Some("a\n"), Some("added by the whole Stack\n"));
-        Ok(Changeset { base: base.into(), files: vec![file] })
+        let cut_off = self.cut_off.then(|| "GitHub lists at most 300 files of a comparison".to_owned());
+        Ok(Comparison { changeset: Changeset { base: base.into(), files: vec![file] }, cut_off })
     }
 
     fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
@@ -101,13 +105,13 @@ impl ForgeAdapter for OneAlone {
         "forge.test"
     }
     fn recognise(&self, url: &str) -> Option<PullRequestRef> {
-        StackForge { broken: false }.recognise(url)
+        StackForge { broken: false, cut_off: false }.recognise(url)
     }
     fn pull_request(&self, id: &PullRequestRef) -> Result<PullRequest, ForgeError> {
         Ok(pull_request(id.number))
     }
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
-        StackForge { broken: false }.changeset(pr)
+        StackForge { broken: false, cut_off: false }.changeset(pr)
     }
     fn open_with_head_branch(&self, _: &str, _: &str) -> Result<Vec<PullRequest>, ForgeError> {
         Ok(Vec::new())
@@ -129,7 +133,7 @@ impl ForgeAdapter for OneAlone {
     }
 }
 
-/// The Stack's Session on its middle member, which holds a General Thread.
+/// The Stack's Session on its middle Member, which holds a General Thread.
 fn stack_session(forge: StackForge) -> (Arc<Service>, SessionId) {
     let service = Arc::new(Service::new().with_forges(vec![Box::new(forge)]));
     let id = service.open_pull_request(&url(2)).unwrap();
@@ -188,7 +192,7 @@ fn has_text(rt: &Runtime<State>, key: &str, text: &str) -> bool {
 
 #[test]
 fn the_picker_ends_with_the_whole_stack_for_a_stack_of_three() {
-    let (service, _) = stack_session(StackForge { broken: false });
+    let (service, _) = stack_session(StackForge { broken: false, cut_off: false });
     let mut rt = window(&service);
 
     press(&mut rt, "stack-member-trigger");
@@ -210,11 +214,12 @@ fn a_stack_of_one_has_no_picker_to_offer_the_whole_stack_in() {
 
 #[test]
 fn choosing_the_whole_stack_shows_its_diff_for_reading_only() {
-    let (service, id) = stack_session(StackForge { broken: false });
+    let (service, id) = stack_session(StackForge { broken: false, cut_off: false });
     let mut rt = window(&service);
     assert!(has_text(&rt, "session-header", "Publish…"), "the member's header offers Publish");
     assert!(rt.find("general-threads").is_some(), "the member's General Thread shows");
     assert!(rt.find("plus").is_some(), "the member's lines take a Comment");
+    assert!(has_text(&rt, &format!("diff-{id}"), "Viewed"), "the member's files can be ticked");
 
     choose(&mut rt, &service, 3);
 
@@ -232,11 +237,24 @@ fn choosing_the_whole_stack_shows_its_diff_for_reading_only() {
     assert!(rt.find("changeset-view-trigger").is_none(), "no Changeset view picker");
     assert!(rt.find("plus").is_none(), "no way to start a Thread on a line");
     assert!(!has_text(&rt, &format!("diff-{id}"), "Comment on file"), "none on a file either");
+    assert!(!has_text(&rt, &format!("diff-{id}"), "Viewed"), "no file of the Stack Changeset is a Member's to tick");
+}
+
+#[test]
+fn a_stack_changeset_the_forge_cut_short_says_it_is_not_complete() {
+    let (service, _) = stack_session(StackForge { broken: false, cut_off: true });
+    let mut rt = window(&service);
+    assert!(rt.find("stack-changeset-cut-off").is_none(), "nothing is cut off on a member");
+
+    choose(&mut rt, &service, 3);
+
+    let notice = texts_within(&rt, "stack-changeset-cut-off");
+    assert!(notice.iter().any(|t| t.contains("cut off") && t.contains("300 files")), "{notice:?}");
 }
 
 #[test]
 fn choosing_a_member_again_brings_back_its_header_and_its_threads() {
-    let (service, _) = stack_session(StackForge { broken: false });
+    let (service, _) = stack_session(StackForge { broken: false, cut_off: false });
     let mut rt = window(&service);
     choose(&mut rt, &service, 3);
 
@@ -249,7 +267,7 @@ fn choosing_a_member_again_brings_back_its_header_and_its_threads() {
 
 #[test]
 fn a_failed_fetch_shows_the_error_in_place_of_the_diff_and_the_members_stay_choosable() {
-    let (service, id) = stack_session(StackForge { broken: true });
+    let (service, id) = stack_session(StackForge { broken: true, cut_off: false });
     let mut rt = window(&service);
 
     choose(&mut rt, &service, 3);
