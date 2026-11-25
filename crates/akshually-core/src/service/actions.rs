@@ -13,9 +13,10 @@ pub struct SessionActions {
     /// The Verdict, or what stands in for it; `None` when neither applies: a Pull Request takes
     /// its Verdict at Publish, a co-review of local work has none, and an ended Session is done.
     pub verdict: Option<VerdictAction>,
-    /// How many unsent Comments and reopened Threads approving now would discard (the count
-    /// `to_hand_over` gives), so the human confirms first; 0 where `verdict` isn't
-    /// `VerdictAction::Approve` or there's nothing unsent. The service still approves either way.
+    /// How many unsent items approving now would discard: the Drafts and reopened Threads the
+    /// next Round would carry (the count `to_hand_over` gives), so the human confirms first.
+    /// 0 where `verdict` isn't `VerdictAction::Approve` or there's nothing unsent. The service
+    /// still approves either way.
     pub discarded_by_approving: usize,
     /// How the human ends the Session.
     pub end: EndAction,
@@ -56,7 +57,7 @@ pub enum EndAction {
 /// Handing the next Round over to the Session's agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandOver {
-    /// How many Comments and reopened Threads the Round would carry (`to_hand_over`).
+    /// How many Drafts and reopened Threads the Round would carry (`to_hand_over`).
     pub items: usize,
     /// Whether it can be handed over now: in the human's Turn, before the Session ended, with
     /// something to carry.
