@@ -73,6 +73,32 @@ impl ThreadRef {
     }
 }
 
+/// Names one Comment across Sessions: its Thread, and its position there (0 opens the Thread).
+/// A Comment has no id of its own, so the service checks under its lock that the position still
+/// holds a Draft of the human's before it edits or discards it. A position alone can't tell
+/// which Draft is meant once Comments came and went (a Pull Request reload puts the Forge's
+/// new Comments before the human's Drafts), so a caller that knows what the Draft said
+/// names that too (`saying`), and the service refuses the reference if it says something else.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CommentRef {
+    pub thread: ThreadRef,
+    pub comment: usize,
+    /// The text the caller believes the Comment has; `None` to name the position only.
+    pub says: Option<String>,
+}
+
+impl CommentRef {
+    pub fn new(thread: &ThreadRef, comment: usize) -> Self {
+        CommentRef { thread: thread.clone(), comment, says: None }
+    }
+
+    /// This reference, refused unless the Comment's text is still `body`.
+    pub fn saying(mut self, body: impl Into<String>) -> Self {
+        self.says = Some(body.into());
+        self
+    }
+}
+
 /// What the agent's blocking `review` call receives when the human acts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]

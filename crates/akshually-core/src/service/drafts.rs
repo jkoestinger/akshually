@@ -1,7 +1,7 @@
 //! Draft rules: the human's Drafts, what the next Round carries, handing it over or taking it
 //! back, and the co-Reviewer's Drafts the human keeps, edits or discards.
 
-use super::{ChangesetView, Outcome, Service, SessionId, SessionView, ThreadRef, Turn};
+use super::{ChangesetView, CommentRef, Outcome, Service, SessionId, SessionView, ThreadActions, ThreadRef, Turn};
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::{Changeset, Error};
 
@@ -150,27 +150,64 @@ impl Service {
         })
     }
 
+    /// Human: rewrites their own Draft `comment` as `new`, under the rules of a new Comment:
+    /// text, and a suggestion only on the Draft that opens a Thread on new-side lines. It stays
+    /// a Draft, where it was. Refused for any Comment that isn't the human's Draft.
+    pub fn edit_own_draft(&self, comment: &CommentRef, new: impl Into<NewComment>) -> Result<(), Error> {
+        let new = new.into();
+        self.own_draft(comment, |threads, thread, at| {
+            // A reply takes no suggestion: it answers in the Thread, not on its lines.
+            let anchor = if at == 0 { &threads[thread].anchor } else { &Anchor::Review };
+            check_comment(anchor, &new)?;
+            let NewComment { body, suggestion } = new;
+            let draft = &mut threads[thread].comments[at];
+            (draft.body, draft.suggestion) = (body, suggestion);
+            Ok(())
+        })?
+    }
+
+    /// Human: discards their own Draft `comment`. The Draft that opens a Thread takes the Thread
+    /// with it; a Draft reply leaves the Thread as it was. Refused for any Comment that isn't
+    /// the human's Draft.
+    pub fn discard_own_draft(&self, comment: &CommentRef) -> Result<(), Error> {
+        self.own_draft(comment, |threads, thread, at| {
+            if at == 0 {
+                threads.remove(thread);
+            } else {
+                threads[thread].comments.remove(at);
+            }
+        })
+    }
+
+    /// Runs `f` on the Session's Threads with the positions of the Thread and of the Comment
+    /// `comment` names, once the Session offers the human to edit it: that is, it's still their
+    /// Draft, and says what the caller expects if it named that (`CommentRef::saying`). A
+    /// position that holds no such Draft any more is refused, and so is one that holds a
+    /// Draft saying something else: a caller that names what it expects never has its
+    /// reference applied to another Comment.
+    fn own_draft<T>(
+        &self,
+        comment: &CommentRef,
+        f: impl FnOnce(&mut Vec<Thread>, usize, usize) -> T,
+    ) -> Result<T, Error> {
+        let CommentRef { thread: ThreadRef { thread, .. }, comment: at, says } = comment;
+        let not_yours = || Error::NotYourDraft { thread: thread.clone(), comment: *at };
+        let offered = |offered: &ThreadActions| offered.own_drafts.contains(at).then_some(()).ok_or_else(not_yours);
+        self.with_thread(&comment.thread, offered, |threads, found| {
+            if says.as_ref().is_some_and(|says| *says != threads[found].comments[*at].body) {
+                return Err(not_yours());
+            }
+            Ok(f(threads, found, *at))
+        })?
+    }
+
     /// Runs `f` on the Session's Threads with the position of `thread`, a Thread the
     /// co-Reviewer opened whose Draft the human hasn't kept, questioned or not.
-    fn agent_draft<T>(
-        &self,
-        ThreadRef { session: id, thread }: &ThreadRef,
-        f: impl FnOnce(&mut Vec<Thread>, usize) -> T,
-    ) -> Result<T, Error> {
-        let mut inner = self.lock();
-        let at = inner.position(id)?;
-        let session = &mut inner.sessions[at];
-        let result = session.at_member_of(thread, |session| {
-            let view = &mut session.view;
-            if !view.thread_offered(thread)?.agent_draft {
-                return Err(Error::NotAnAgentDraft(thread.clone()));
-            }
-            let threads = &mut view.threads;
-            let found = threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
-            Ok(f(threads, found))
-        })?;
-        inner.notify();
-        Ok(result)
+    fn agent_draft<T>(&self, thread: &ThreadRef, f: impl FnOnce(&mut Vec<Thread>, usize) -> T) -> Result<T, Error> {
+        let offered = |offered: &ThreadActions| {
+            offered.agent_draft.then_some(()).ok_or_else(|| Error::NotAnAgentDraft(thread.thread.clone()))
+        };
+        self.with_thread(thread, offered, f)
     }
 }
 

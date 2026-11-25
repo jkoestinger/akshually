@@ -25,11 +25,11 @@ pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
-    CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
-    InboxStack, InboxStanding, InboxView, Member, MemberOutcome, MemberView, Outcome, PendingReview, PlacedThread,
-    PublishPlan, PublishedReview, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark, SessionView,
-    Source, SourceRef, StackChangeset, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction,
-    WindowView,
+    CancelReview, ChangesetView, CommentRef, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow,
+    InboxRowState, InboxStack, InboxStanding, InboxView, Member, MemberOutcome, MemberView, Outcome, PendingReview,
+    PlacedThread, PublishPlan, PublishedReview, ReviewRequest, Role, Service, SessionActions, SessionId, SessionMark,
+    SessionView, Source, SourceRef, StackChangeset, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView, Verdict,
+    VerdictAction, WindowView,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{
@@ -93,6 +93,8 @@ pub enum Error {
     NotSent,
     #[error("{0} isn't an agent Draft")]
     NotAnAgentDraft(ThreadId),
+    #[error("Comment {} of {thread} isn't a Draft of yours: only those can be edited or discarded", comment + 1)]
+    NotYourDraft { thread: ThreadId, comment: usize },
     #[error("this Session is being published")]
     Publishing,
     #[error(

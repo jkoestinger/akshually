@@ -3,7 +3,7 @@
 
 use super::{Role, SessionView, Source, Turn};
 use crate::Error;
-use crate::thread::{Comment, Thread, ThreadId};
+use crate::thread::{Comment, Party, Thread, ThreadId};
 
 /// What the human can do in a Session now, worked out from its Source, agent role, Turn,
 /// whether it has ended and, for a Pull Request, whether it holds something unpublished. The
@@ -76,6 +76,9 @@ pub struct ThreadActions {
     pub reopen: bool,
     /// Keep, edit or discard the co-Reviewer's Draft that opens it.
     pub agent_draft: bool,
+    /// Edit or discard these of its Comments, by position: the human's own Drafts, whoever's
+    /// Turn it is (a co-Reviewer's Draft the human kept counts, one not yet kept doesn't).
+    pub own_drafts: Vec<usize>,
 }
 
 impl SessionView {
@@ -175,6 +178,7 @@ fn thread_actions(thread: &Thread, ended: bool) -> ThreadActions {
         resolve: open && sent && thread.resolved.is_none(),
         reopen: open && thread.resolved.is_some(),
         agent_draft: open && agent_draft,
+        own_drafts: if open { own_drafts(thread) } else { Vec::new() },
     }
 }
 
@@ -182,4 +186,10 @@ fn thread_actions(thread: &Thread, ended: bool) -> ThreadActions {
 /// the next Round, so there's nothing to reply to or resolve yet.
 fn is_sent(thread: &Thread) -> bool {
     thread.comments.iter().any(|c| !c.is_draft())
+}
+
+/// The positions of `thread`'s Comments that are the human's Drafts.
+fn own_drafts(thread: &Thread) -> Vec<usize> {
+    let own = |c: &Comment| c.is_draft() && c.author == Party::Human;
+    thread.comments.iter().enumerate().filter(|(_, c)| own(c)).map(|(at, _)| at).collect()
 }

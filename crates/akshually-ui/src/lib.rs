@@ -19,8 +19,8 @@ use rune_kit::{
 
 use akshually_core::forge::{ForgeKind, InboxItem, InboxRole, PullRequestRef};
 use akshually_core::{
-    Anchor, Changeset, ChangesetView, Collapsed, Comment, DiffLayout, Displayed, EndAction, Ending, FileChange,
-    HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
+    Anchor, Changeset, ChangesetView, Collapsed, Comment, CommentRef, DiffLayout, Displayed, EndAction, Ending,
+    FileChange, HandOver, InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView, MemberView, NewComment, Party,
     PublishPlan, Role, Service, SessionActions, SessionId, SessionMark, SessionView, Side, Source, Thread,
     ThreadActions, ThreadId, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView, fence_for,
 };
@@ -74,6 +74,7 @@ pub const WINDOW_CHROME: Chrome = Chrome {
     drag_regions: true,
 };
 
+mod highlight;
 mod mono_font;
 mod notifier;
 mod rendered;
@@ -82,6 +83,7 @@ mod search;
 mod theme;
 mod thread_nav;
 
+pub use highlight::changeset_highlighter;
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
 use rendered::{rendered_button, rendered_view};
@@ -181,8 +183,8 @@ pub struct State {
     /// The Thread a reply is being written in, at most one in the window.
     reply: Option<ThreadRef>,
     reply_text: TextEdit,
-    /// The co-Reviewer's Draft being edited, at most one in the window.
-    editing: Option<ThreadRef>,
+    /// The Draft being edited, at most one in the window.
+    editing: Option<Editing>,
     edit_text: TextEdit,
     /// The Publish dialog, while it's open.
     publish: Option<Publish>,
@@ -201,6 +203,20 @@ pub struct State {
     spare_diff: DiffState,
     /// What a search field reads and writes once its tab is gone, as `spare_diff` is for the diff view.
     spare_search: TextEdit,
+}
+
+/// The Draft the editor is open on.
+enum Editing {
+    /// The co-Reviewer's Draft opening a Thread, which saving keeps as the human's.
+    AgentDraft(ThreadRef),
+    /// One of the human's own Drafts (#108), which saving leaves a Draft.
+    Own {
+        at: CommentRef,
+        /// What it said when the editor opened. A Comment has no id, so this is how the Window
+        /// finds the Draft again when its position moves, and how the service refuses to apply
+        /// the save to another one.
+        said: String,
+    },
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -345,6 +361,7 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
 /// collapsed (#78).
 fn show_files(diff: &mut DiffState, session: &SessionView) {
     let changeset = session.shown();
+    diff.set_highlighter(highlight::changeset_highlighter(changeset));
     diff.set_files(file_diffs(changeset));
     for (at, file) in changeset.files.iter().enumerate() {
         if file.collapsed.is_some() || session.viewed.contains(&file.path) {
@@ -466,6 +483,7 @@ impl State {
         if self.reply.as_ref().is_some_and(|r| !self.tabs.iter().any(|t| t.session.id == r.session)) {
             self.close_reply();
         }
+        self.follow_editor();
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
         }
@@ -811,9 +829,23 @@ impl State {
         let tab = self.tab(&thread.session);
         let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread.thread)?.comments.first());
         let Some(draft) = draft else { return };
-        let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
-        self.edit_text = focused_edit(written.to_markdown());
-        self.editing = Some(thread);
+        self.open_editor(Editing::AgentDraft(thread), written(draft).to_markdown());
+    }
+
+    /// Opens the editor on the human's own Draft `at`, with what it says now. A reply says what
+    /// was typed, as it is saved; the Draft that opens a Thread, its text and suggestion as markdown.
+    fn open_edit_own(&mut self, at: CommentRef) {
+        let tab = self.tab(&at.thread.session);
+        let thread = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == at.thread.thread));
+        let Some(draft) = thread.and_then(|t| t.comments.get(at.comment)) else { return };
+        let text = if at.comment == 0 { written(draft).to_markdown() } else { draft.body.clone() };
+        let said = draft.body.clone();
+        self.open_editor(Editing::Own { at, said }, text);
+    }
+
+    fn open_editor(&mut self, editing: Editing, text: String) {
+        self.edit_text = focused_edit(text);
+        self.editing = Some(editing);
     }
 
     fn close_edit(&mut self) {
@@ -821,12 +853,47 @@ impl State {
         self.edit_text = TextEdit::new("");
     }
 
-    /// Saves the edited co-Reviewer's Draft, which keeps it as the human's.
+    /// Saves what the editor holds: a co-Reviewer's Draft is kept as the human's, one of their
+    /// own stays a Draft.
     fn save_edit(&mut self) {
-        let Some(thread) = &self.editing else { return };
-        match self.service.edit_draft(thread, NewComment::from_markdown(&self.edit_text.text)) {
+        let text = &self.edit_text.text;
+        let saved = match &self.editing {
+            None => return,
+            Some(Editing::AgentDraft(thread)) => self.service.edit_draft(thread, NewComment::from_markdown(text)),
+            Some(Editing::Own { at, said }) => {
+                // A reply takes no suggestion, so it's saved as typed, as `reply_in_thread` does.
+                let new = if at.comment == 0 { NewComment::from_markdown(text) } else { NewComment::new(text) };
+                self.service.edit_own_draft(&at.clone().saying(said), new)
+            }
+        };
+        match saved {
             Ok(()) => self.close_edit(),
             error => report(error),
+        }
+    }
+
+    /// Discards the human's own Draft `at`. An editor open on a later Comment of the Thread
+    /// follows it to its new place when the service's update arrives (`follow_editor`).
+    fn discard_own(&mut self, at: &CommentRef) {
+        report(self.service.discard_own_draft(at));
+    }
+
+    /// Keeps the editor on the Draft it was opened on, however the Session changed: a Comment
+    /// before it came or went (a Pull Request reload puts the Forge's new ones before the
+    /// human's Drafts), or it left, handed over with a Round or discarded, and the editor
+    /// closes. Among identical Drafts, the one nearest where it was.
+    fn follow_editor(&mut self) {
+        let Some(Editing::Own { at, said }) = &self.editing else { return };
+        let tab = self.tab(&at.thread.session);
+        let thread = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == at.thread.thread));
+        let offered = tab.zip(thread).and_then(|(tab, thread)| Some((thread, tab.actions.thread(&thread.id)?)));
+        let now = offered.and_then(|(thread, offered)| {
+            let same = offered.own_drafts.iter().copied().filter(|&place| thread.comments[place].body == *said);
+            same.min_by_key(|place| place.abs_diff(at.comment))
+        });
+        match (now, &mut self.editing) {
+            (Some(place), Some(Editing::Own { at, .. })) => at.comment = place,
+            _ => self.close_edit(),
         }
     }
 
@@ -986,7 +1053,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
             .child(general_threads(k, s, tab, agent))
-            .child(outdated_threads(k, tab))
+            .child(outdated_threads(k, s, tab))
             .children(stack_changeset_notice(k, &tab.session))
             .child(
                 col()
@@ -2059,16 +2126,44 @@ fn annotation(k: &Kit, s: &State, a: &Annotation, agent: Color) -> El {
 /// expanded it, with the actions the Session offers in it. A co-Reviewer's Draft the human
 /// hasn't kept shows in the `agent` colour.
 fn thread_view(k: &Kit, s: &State, thread: &Thread, tab: &SessionTab, agent: Color) -> El {
-    let session = &tab.session.id;
+    let session = &tab.session;
     // `actions` is worked out from the same Session, so it has every Thread.
-    let Some(offered) = tab.actions.thread(&thread.id) else { return col() };
+    let Some(actions) = tab.actions.thread(&thread.id) else { return col() };
     if thread.resolved.is_some() {
-        resolved_row(k, thread, tab, offered)
+        resolved_row(k, s, thread, tab, actions)
     } else if thread.comments.first().is_some_and(Comment::is_agent_draft) {
-        agent_draft_card(k, s, thread, session, offered, agent)
+        agent_draft_card(k, s, thread, session, actions, agent)
     } else {
-        thread_card(k, thread, Some((s, session, offered)))
+        thread_card(k, thread, Some(Offered { s, session, actions }))
     }
+}
+
+/// What a Thread's card needs to offer the human's actions in it: the window's state, the
+/// Session, and what the Session offers in the Thread.
+#[derive(Clone, Copy)]
+struct Offered<'a> {
+    s: &'a State,
+    session: &'a SessionView,
+    actions: &'a ThreadActions,
+}
+
+/// What the Session offers in a Resolved or an Outdated `thread`, as its card shows it: only
+/// to edit and discard the human's own Drafts, wherever the Thread's Comments are shown. Replying
+/// and resolving are done from the row, and a Resolved Thread is reopened to reply in it.
+fn own_drafts_only(offered: &ThreadActions) -> ThreadActions {
+    ThreadActions {
+        thread: offered.thread.clone(),
+        reply: false,
+        resolve: false,
+        reopen: false,
+        agent_draft: false,
+        own_drafts: offered.own_drafts.clone(),
+    }
+}
+
+/// What `draft` says, as the human writes it.
+fn written(draft: &Comment) -> NewComment {
+    NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() }
 }
 
 /// A co-Reviewer's Draft, dashed in the `agent` colour until the human keeps it, with Discard,
@@ -2078,7 +2173,7 @@ fn agent_draft_card(
     k: &Kit,
     s: &State,
     thread: &Thread,
-    session: &SessionId,
+    session: &SessionView,
     offered: &ThreadActions,
     agent: Color,
 ) -> El {
@@ -2094,15 +2189,15 @@ fn agent_draft_card(
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    let at = ThreadRef::new(session, &thread.id);
-    if s.editing.as_ref() == Some(&at) {
-        return card.child(edit_composer(k, s));
+    let at = ThreadRef::new(&session.id, &thread.id);
+    if matches!(&s.editing, Some(Editing::AgentDraft(editing)) if *editing == at) {
+        return card.child(edit_composer(k, s, session));
     }
     card = card.child(Markdown::new(draft.body.clone()).selectable(true).build(k));
     if let Some(suggestion) = &draft.suggestion {
         card = card.child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
     }
-    card = comments(k, card, thread, &thread.comments[1..]);
+    card = comments(k, card, thread, 1, Some(Offered { s, session, actions: offered }));
     if s.reply.as_ref() == Some(&at) {
         return card.child(reply_composer(k, s));
     }
@@ -2139,8 +2234,16 @@ fn agent_draft_card(
     )
 }
 
-/// The editor of a co-Reviewer's Draft; saving keeps it as the human's.
-fn edit_composer(k: &Kit, s: &State) -> El {
+/// The editor of a co-Reviewer's Draft, where saving keeps it as the human's, or of one of the
+/// human's own Drafts, which saving leaves a Draft until the Round goes out, or for a Pull
+/// Request `session`, until Publish.
+fn edit_composer(k: &Kit, s: &State, session: &SessionView) -> El {
+    let own = matches!(s.editing, Some(Editing::Own { .. }));
+    let hint = match (own, session.pull_request()) {
+        (false, _) => "Markdown · saving keeps it as your Draft",
+        (true, None) => "Markdown · a Draft until you hand over the Round",
+        (true, Some(_)) => "Markdown · a Draft until you Publish",
+    };
     col()
         .key("edit-composer")
         .w_full()
@@ -2158,19 +2261,21 @@ fn edit_composer(k: &Kit, s: &State) -> El {
                 .w_full()
                 .gap(8.0)
                 .items_center()
-                .child(text("Markdown · saving keeps it as your Draft").font(k.ty.small).color(k.c.text_faint))
+                .child(text(hint).font(k.ty.small).color(k.c.text_faint))
                 .child(row().grow(1.0))
                 .child(
                     Button::new("Cancel")
                         .variant(ButtonVariant::Ghost)
                         .on_press(|s: &mut State| s.close_edit())
-                        .build(k),
+                        .build(k)
+                        .key("cancel-edit"),
                 )
                 .child(
-                    Button::new("Save and keep")
+                    Button::new(if own { "Save" } else { "Save and keep" })
                         .variant(ButtonVariant::Submit)
                         .on_press(|s: &mut State| s.save_edit())
-                        .build(k),
+                        .build(k)
+                        .key("save-edit"),
                 ),
         )
 }
@@ -2201,8 +2306,9 @@ fn resolved_by(thread: &Thread) -> String {
 }
 
 /// A Resolved Thread: one line with a way to reopen it, and once the human expands it, its
-/// Comments read-only below. To reply, the human reopens it first.
-fn resolved_row(k: &Kit, thread: &Thread, tab: &SessionTab, offered: &ThreadActions) -> El {
+/// Comments below, which they can edit and discard their own Drafts in. To reply, the human
+/// reopens it first.
+fn resolved_row(k: &Kit, s: &State, thread: &Thread, tab: &SessionTab, offered: &ThreadActions) -> El {
     let first = first_line(thread);
     let count = thread.comments.len();
     let expanded = tab.expanded.contains(&thread.id);
@@ -2231,7 +2337,9 @@ fn resolved_row(k: &Kit, thread: &Thread, tab: &SessionTab, offered: &ThreadActi
         .child(toggle_button(k, &at, expanded));
     let mut view = col().key(format!("resolved-{}", thread.id)).w_full().max_w(720.0).gap(8.0).child(summary);
     if expanded {
-        view = view.child(thread_card(k, thread, None).key(format!("resolved-comments-{}", thread.id)));
+        let own = own_drafts_only(offered);
+        let card = thread_card(k, thread, Some(Offered { s, session: &tab.session, actions: &own }));
+        view = view.child(card.key(format!("resolved-comments-{}", thread.id)));
     }
     view
 }
@@ -2253,17 +2361,17 @@ fn card(k: &Kit) -> El {
 
 /// A Thread's Comments, with the Reply and Resolve controls its Session offers when `actions`
 /// gives the Session and what it offers.
-fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId, &ThreadActions)>) -> El {
+fn thread_card(k: &Kit, thread: &Thread, actions: Option<Offered>) -> El {
     let mut card = card(k);
     if let Some(label) = general_label(&thread.anchor) {
         card = card.child(text(label).font(k.ty.mono).color(k.c.text_muted));
     }
-    card = comments(k, card, thread, &thread.comments);
+    card = comments(k, card, thread, 0, actions);
     if thread.reopened {
         card = card.child(text("Reopened · goes out with your next Round").font(k.ty.small).color(k.c.text_faint));
     }
-    if let Some((s, session, offered)) = actions.filter(|(_, _, offered)| offered.reply || offered.resolve) {
-        let at = ThreadRef::new(session, &thread.id);
+    if let Some(Offered { s, session, actions: offered }) = actions.filter(|o| o.actions.reply || o.actions.resolve) {
+        let at = ThreadRef::new(&session.id, &thread.id);
         card = if s.reply.as_ref() == Some(&at) {
             card.child(reply_composer(k, s))
         } else {
@@ -2280,16 +2388,18 @@ fn thread_card(k: &Kit, thread: &Thread, actions: Option<(&State, &SessionId, &T
                             .build(k)
                             .key(key)
                     }))
-                    .children(resolve_button(k, thread, session, offered)),
+                    .children(resolve_button(k, thread, &session.id, offered)),
             )
         };
     }
     card
 }
 
-/// `comments` of `thread` added to `card`, each under who wrote it and when.
-fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El {
-    for comment in comments {
+/// The Comments of `thread` from position `first` on, added to `card`, each under who wrote it
+/// and when. With `actions` (the Session, and what it offers in the Thread), each of the human's
+/// own Drafts has Edit and Discard, and an editor in place of the one being edited.
+fn comments(k: &Kit, mut card: El, thread: &Thread, first: usize, actions: Option<Offered>) -> El {
+    for (at, comment) in thread.comments.iter().enumerate().skip(first) {
         let who = match &comment.author {
             Party::Human => "You",
             Party::Agent => "Agent",
@@ -2300,22 +2410,57 @@ fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El 
             None => "on the Pull Request".to_owned(),
             Some(round) => format!("Round {round}"),
         };
-        card = card
-            .child(
-                row()
-                    .gap(8.0)
-                    .items_center()
-                    .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
-                    .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
-            )
-            .child(Markdown::new(comment.body.clone()).selectable(true).build(k));
+        card = card.child(
+            row()
+                .gap(8.0)
+                .items_center()
+                .child(text(who).font(k.ty.ui_medium).color(k.c.text_base))
+                .child(text(format!("{} · {when}", thread.id)).font(k.ty.small).color(k.c.text_faint)),
+        );
+        let own = actions.filter(|o| o.actions.own_drafts.contains(&at));
+        let this = own.map(|o| (o, CommentRef::new(&ThreadRef::new(&o.session.id, &thread.id), at)));
+        let editing =
+            |(o, this): &(Offered, CommentRef)| matches!(&o.s.editing, Some(Editing::Own { at, .. }) if at == this);
+        if let Some((o, _)) = this.as_ref().filter(|this| editing(this)) {
+            card = card.child(edit_composer(k, o.s, o.session));
+            continue;
+        }
+        card = card.child(Markdown::new(comment.body.clone()).selectable(true).build(k));
         if let Some(suggestion) = &comment.suggestion {
             card = card
                 .child(text("Suggested change").font(k.ty.small).color(k.c.text_faint))
                 .child(Markdown::new(suggestion_diff(&thread.excerpt, suggestion)).build(k));
         }
+        if let Some((_, this)) = this {
+            card = card.child(own_draft_buttons(k, thread, at, this));
+        }
     }
     card
+}
+
+/// Discard and Edit under one of the human's own Drafts, the `at`th Comment of `thread`.
+fn own_draft_buttons(k: &Kit, thread: &Thread, at: usize, this: CommentRef) -> El {
+    // The Draft is refused if it moved meanwhile, never discarded in place of another.
+    let discard = this.clone().saying(&thread.comments[at].body);
+    let edit = this;
+    row()
+        .w_full()
+        .gap(8.0)
+        .child(row().grow(1.0))
+        .child(
+            Button::new("Discard")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.discard_own(&discard))
+                .build(k)
+                .key(format!("discard-{}-{at}", thread.id)),
+        )
+        .child(
+            Button::new("Edit")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.open_edit_own(edit.clone()))
+                .build(k)
+                .key(format!("edit-{}-{at}", thread.id)),
+        )
 }
 
 /// Whether `key` is Escape in a Comment field whose `text` is empty or whitespace only: the
@@ -2405,7 +2550,7 @@ fn suggestion_diff(excerpt: &str, suggestion: &str) -> String {
 
 /// The Session's Outdated Threads, collapsed to one line each until expanded to show the code
 /// they were written against and their Comments.
-fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
+fn outdated_threads(k: &Kit, s: &State, tab: &SessionTab) -> El {
     let mut list = col().key("outdated-threads").w_full().px(16.0).gap(8.0);
     for thread in tab.session.threads_shown().iter().filter(|t| t.outdated) {
         let expanded = tab.expanded.contains(&thread.id);
@@ -2416,7 +2561,9 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
         };
         let at = ThreadRef::new(&tab.session.id, &thread.id);
         // `actions` is worked out from the same Session, so it has every Thread.
-        let resolve = tab.actions.thread(&thread.id).and_then(|o| resolve_button(k, thread, &tab.session.id, o));
+        let offered = tab.actions.thread(&thread.id);
+        let resolve = offered.and_then(|o| resolve_button(k, thread, &tab.session.id, o));
+        let own = offered.map(own_drafts_only);
         let summary = row()
             .w_full()
             .gap(8.0)
@@ -2446,7 +2593,9 @@ fn outdated_threads(k: &Kit, tab: &SessionTab) -> El {
                         .child(text(thread.excerpt.trim_end().to_owned()).font(k.ty.mono).color(k.c.text_muted)),
                 );
             }
-            card = card.child(thread_card(k, thread, None).key(format!("outdated-comments-{}", thread.id)));
+            let comments =
+                thread_card(k, thread, own.as_ref().map(|actions| Offered { s, session: &tab.session, actions }));
+            card = card.child(comments.key(format!("outdated-comments-{}", thread.id)));
         }
         list = list.child(card).pb(8.0);
     }

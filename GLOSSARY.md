@@ -109,7 +109,7 @@ A single message inside a Thread.
 _Avoid_: Remark, annotation
 
 **Draft**:
-A Comment not yet Published to a Forge, whether the human or a co-Reviewer agent wrote it; only the human can keep it for Publish.
+A Comment not yet Published to a Forge, whether the human or a co-Reviewer agent wrote it; only the human can keep it for Publish. The human can edit or discard their own Drafts until a Round carries them or they are Published.
 _Avoid_: Suggestion, pending comment
 
 **Anchor**:
