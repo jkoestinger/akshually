@@ -643,6 +643,7 @@ impl State {
         let fallback = tab.session.fallback_anchor(&anchor);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at, error, fallback });
         self.composer_text = TextEdit::new("");
+        self.composer_text.focused = true;
         self.annotate();
     }
 
@@ -673,6 +674,8 @@ impl State {
         composer.anchor = anchor;
         composer.at = None;
         composer.error = None;
+        // The press on "Comment on the file" took focus off the text area.
+        self.composer_text.focused = true;
         self.annotate();
     }
 
@@ -680,6 +683,7 @@ impl State {
     fn open_reply(&mut self, thread: ThreadRef) {
         self.reply = Some(thread);
         self.reply_text = TextEdit::new("");
+        self.reply_text.focused = true;
     }
 
     fn close_reply(&mut self) {
@@ -703,6 +707,7 @@ impl State {
         let Some(draft) = draft else { return };
         let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
         self.edit_text = TextEdit::new(written.to_markdown());
+        self.edit_text.focused = true;
         self.editing = Some(thread);
     }
 
