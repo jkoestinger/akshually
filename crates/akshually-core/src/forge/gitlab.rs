@@ -116,6 +116,25 @@ impl GitLab {
         self.pages(&self.merge_request_url(pr, &["diffs"])).map_err(|e| not_found_as(e, pr))
     }
 
+    /// The open merge requests of the project `repo` whose `filter` (`source_branch` or
+    /// `target_branch`) is `branch`, each fetched whole: the list leaves out the diff refs.
+    fn open_merge_requests(&self, repo: &str, filter: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            iid: u64,
+        }
+        let mut url = self.client.endpoint(&["projects", repo, "merge_requests"]);
+        url.query_pairs_mut().append_pair("state", "opened").append_pair(filter, branch).append_pair("per_page", PAGE);
+        let listed: Vec<Listed> = self.get_json(&url)?;
+        let host = self.client.host();
+        listed
+            .into_iter()
+            .map(|mr| {
+                self.pull_request(&PullRequestRef { host: host.to_owned(), repo: repo.to_owned(), number: mr.iid })
+            })
+            .collect()
+    }
+
     /// Whether the human can approve `pr`, and whether they have.
     fn approvals(&self, pr: &PullRequestRef) -> Result<Approvals, ForgeError> {
         self.get_json(&self.merge_request_url(pr, &["approvals"])).map_err(|e| not_found_as(e, pr))
@@ -155,6 +174,12 @@ struct MergeRequest {
     title: String,
     author: User,
     source_branch: String,
+    target_branch: String,
+    /// The projects of the branches: a merge request from a fork has its own source project.
+    #[serde(default)]
+    source_project_id: Option<u64>,
+    #[serde(default)]
+    target_project_id: Option<u64>,
     /// Null while GitLab is still preparing the diff.
     diff_refs: Option<DiffRefs>,
 }
@@ -371,7 +396,17 @@ impl ForgeAdapter for GitLab {
             head_sha: refs.head_sha,
             // GitLab's diff is against the merge-base, which it names.
             base_sha: refs.base_sha,
+            base_branch: mr.target_branch,
+            from_fork: matches!((mr.source_project_id, mr.target_project_id), (Some(s), Some(t)) if s != t),
         })
+    }
+
+    fn open_with_head_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_merge_requests(repo, "source_branch", branch)
+    }
+
+    fn open_with_target_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_merge_requests(repo, "target_branch", branch)
     }
 
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {

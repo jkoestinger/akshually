@@ -50,6 +50,19 @@ pub trait ForgeAdapter: Send + Sync {
     /// returns its web page. On failure nothing is left half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError>;
 
+    /// The open Pull Requests of `repo` (`owner/repo`) whose head branch is `branch`, which the
+    /// Stack of one asking to merge into `branch` is built from. Those from a fork are included,
+    /// marked `from_fork`. A Forge with no way to ask has none. Blocks on the network.
+    fn open_with_head_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(Vec::new())
+    }
+
+    /// The open Pull Requests of `repo` asking to merge into `branch`, those from a fork
+    /// included, marked `from_fork`. A Forge with no way to ask has none. Blocks on the network.
+    fn open_with_target_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        Ok(Vec::new())
+    }
+
     /// What was pushed to the Pull Request since `pr` was fetched: `None` while its head is
     /// still `pr.head_sha`. Cheap enough to poll; adapters may answer from a conditional request.
     fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
@@ -212,6 +225,14 @@ pub struct PullRequest {
     /// The target branch's commit the Pull Request was compared against when fetched: its tip
     /// on GitHub, the merge-base on GitLab (`diff_refs.base_sha`).
     pub base_sha: String,
+    /// The branch it asks to merge into, which a Pull Request on top of it has as its head
+    /// branch (ADR 0004). Empty in a Session saved before Stacks.
+    #[serde(default)]
+    pub base_branch: String,
+    /// Its head branch lives in another repository (a fork), so no other Pull Request of this
+    /// repository is stacked on it through that branch's name.
+    #[serde(default)]
+    pub from_fork: bool,
 }
 
 impl PullRequest {

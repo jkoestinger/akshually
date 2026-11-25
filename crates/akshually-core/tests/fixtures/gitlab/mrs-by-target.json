@@ -1,0 +1,8 @@
+[
+  { "iid": 97, "title": "Rotate database credentials", "source_branch": "rotate-creds", "target_branch": "vault",
+    "source_project_id": 42, "target_project_id": 42,
+    "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/97" },
+  { "iid": 98, "title": "Fork fix", "source_branch": "fix", "target_branch": "vault",
+    "source_project_id": 77, "target_project_id": 42,
+    "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/98" }
+]

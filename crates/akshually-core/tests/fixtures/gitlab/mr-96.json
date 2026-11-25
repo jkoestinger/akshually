@@ -1,0 +1,13 @@
+{
+  "iid": 96,
+  "project_id": 42,
+  "title": "Vault client",
+  "state": "opened",
+  "target_branch": "main",
+  "source_branch": "vault",
+  "source_project_id": 42,
+  "target_project_id": 42,
+  "author": { "id": 8, "username": "ana", "name": "Ana" },
+  "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/96",
+  "diff_refs": { "base_sha": "mb0", "head_sha": "head0", "start_sha": "target0" }
+}

@@ -1,0 +1,5 @@
+[
+  { "iid": 96, "title": "Vault client", "source_branch": "vault", "target_branch": "main",
+    "source_project_id": 42, "target_project_id": 42,
+    "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/96" }
+]

@@ -157,6 +157,25 @@ impl GitHub {
         Ok(())
     }
 
+    /// The open Pull Requests of `repo` whose `filter` (`head` or `base`) is `value`: the first
+    /// page of them, which is far more than one branch has.
+    fn open_pull_requests(&self, repo: &str, filter: &str, value: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        let mut segments = vec!["repos"];
+        segments.extend(repo.split('/'));
+        segments.push("pulls");
+        let mut url = self.client.endpoint(&segments);
+        url.query_pairs_mut().append_pair("state", "open").append_pair(filter, value).append_pair("per_page", PAGE);
+        let pulls: Vec<Pull> = self.get_json(url.as_str())?;
+        let host = self.client.host();
+        Ok(pulls
+            .into_iter()
+            .map(|pull| {
+                let id = PullRequestRef { host: host.to_owned(), repo: repo.to_owned(), number: pull.number };
+                pull.into_pull_request(&id)
+            })
+            .collect())
+    }
+
     fn lock_polls(&self) -> std::sync::MutexGuard<'_, HashMap<PullRequestRef, Polled>> {
         self.polls.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -181,6 +200,9 @@ impl GitHub {
 /// A Pull Request as GitHub's REST API answers it.
 #[derive(Deserialize)]
 struct Pull {
+    /// Only the list answers it; the one Pull Request is asked for by its number.
+    #[serde(default)]
+    number: u64,
     html_url: String,
     title: String,
     user: User,
@@ -198,10 +220,25 @@ struct Ref {
     #[serde(rename = "ref")]
     name: String,
     sha: String,
+    /// The repository the branch is in; null once a fork was deleted.
+    #[serde(default)]
+    repo: Option<Repo>,
+}
+
+#[derive(Deserialize)]
+struct Repo {
+    full_name: String,
 }
 
 impl Pull {
     fn into_pull_request(self, pr: &PullRequestRef) -> PullRequest {
+        // A head repository other than the base's, or none left, is a fork. An answer that
+        // names neither says nothing, so it isn't one.
+        let from_fork = match (&self.head.repo, &self.base.repo) {
+            (Some(head), Some(base)) => !head.full_name.eq_ignore_ascii_case(&base.full_name),
+            (None, Some(_)) => true,
+            _ => false,
+        };
         PullRequest {
             id: pr.clone(),
             url: self.html_url,
@@ -210,6 +247,8 @@ impl Pull {
             head_branch: self.head.name,
             head_sha: self.head.sha,
             base_sha: self.base.sha,
+            base_branch: self.base.name,
+            from_fork,
         }
     }
 }
@@ -261,6 +300,16 @@ impl ForgeAdapter for GitHub {
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError> {
         let pull: Pull = self.get_json(self.pull_url(pr).as_str()).map_err(|e| not_found_as(e, pr))?;
         Ok(pull.into_pull_request(pr))
+    }
+
+    fn open_with_head_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        // `head` takes `owner:branch`, which leaves out the same branch name in other owners' forks.
+        let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+        self.open_pull_requests(repo, "head", &format!("{owner}:{branch}"))
+    }
+
+    fn open_with_target_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_pull_requests(repo, "base", branch)
     }
 
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {

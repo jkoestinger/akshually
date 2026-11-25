@@ -189,6 +189,8 @@ fn rotate_creds() -> PullRequest {
         head_branch: "rotate-creds".into(),
         head_sha: "head1".into(),
         base_sha: "mb1".into(),
+        base_branch: "main".into(),
+        from_fork: false,
     }
 }
 
@@ -201,6 +203,55 @@ fn fetches_the_merge_request_by_its_project_path() {
 
     mock.assert();
     assert_eq!(pr, rotate_creds());
+}
+
+#[test]
+fn finds_the_open_merge_requests_with_a_source_branch() {
+    let mut h = Harness::new();
+    let list = h
+        .server
+        .mock("GET", "/projects/platform%2Finfra/merge_requests")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("state".into(), "opened".into()),
+            Matcher::UrlEncoded("source_branch".into(), "vault".into()),
+        ]))
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .with_body(fixture("mrs-by-source.json"))
+        .create();
+    // The list leaves out the diff refs, so each one found is fetched whole.
+    let one = h.get("/projects/platform%2Finfra/merge_requests/96", TOKEN, &fixture("mr-96.json"));
+
+    let found = h.gitlab().open_with_head_branch("platform/infra", "vault").unwrap();
+
+    list.assert();
+    one.assert();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, PullRequestRef { number: 96, ..mr_ref() });
+    assert_eq!((found[0].head_branch.as_str(), found[0].base_branch.as_str()), ("vault", "main"));
+    assert_eq!((found[0].head_sha.as_str(), found[0].base_sha.as_str()), ("head0", "mb0"));
+}
+
+#[test]
+fn finds_the_open_merge_requests_targeting_a_branch_and_marks_those_from_forks() {
+    let mut h = Harness::new();
+    let list = h
+        .server
+        .mock("GET", "/projects/platform%2Finfra/merge_requests")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("state".into(), "opened".into()),
+            Matcher::UrlEncoded("target_branch".into(), "vault".into()),
+        ]))
+        .with_body(fixture("mrs-by-target.json"))
+        .create();
+    h.get("/projects/platform%2Finfra/merge_requests/97", TOKEN, &fixture("mr-97-on-vault.json"));
+    h.get("/projects/platform%2Finfra/merge_requests/98", TOKEN, &fixture("mr-98.json"));
+
+    let found = h.gitlab().open_with_target_branch("platform/infra", "vault").unwrap();
+
+    list.assert();
+    let forks: Vec<_> = found.iter().map(|p| (p.id.number, p.from_fork)).collect();
+    assert_eq!(forks, [(97, false), (98, true)]);
+    assert!(found.iter().all(|p| p.base_branch == "vault"));
 }
 
 impl Harness {

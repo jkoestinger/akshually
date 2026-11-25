@@ -75,6 +75,8 @@ impl ForgeAdapter for FakeForge {
             head_branch: "feature".into(),
             head_sha: "head".into(),
             base_sha: "base".into(),
+            base_branch: "main".into(),
+            from_fork: false,
         })
     }
 

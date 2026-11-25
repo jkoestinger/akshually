@@ -126,6 +126,8 @@ fn sso_pull_request() -> PullRequest {
         head_branch: "sso".into(),
         head_sha: "head1".into(),
         base_sha: "base1".into(),
+        base_branch: "main".into(),
+        from_fork: false,
     }
 }
 
@@ -218,6 +220,50 @@ fn fetches_the_pull_request() {
 
     mock.assert();
     assert_eq!(pr, sso_pull_request());
+}
+
+#[test]
+fn finds_the_open_pull_requests_with_a_head_branch() {
+    let mut h = Harness::new();
+    let mock = h
+        .server
+        .mock("GET", "/repos/acme/web/pulls")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("state".into(), "open".into()),
+            Matcher::UrlEncoded("head".into(), "acme:session-store".into()),
+        ]))
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .with_body(fixture("pulls-by-head.json"))
+        .create();
+
+    let found = h.github().open_with_head_branch("acme/web", "session-store").unwrap();
+
+    mock.assert();
+    let numbers: Vec<_> = found.iter().map(|p| (p.id.number, p.head_branch.as_str(), p.base_branch.as_str())).collect();
+    assert_eq!(numbers, [(481, "session-store", "main")]);
+    assert_eq!(found[0].id, PullRequestRef { number: 481, ..pr_ref() });
+    assert_eq!((found[0].head_sha.as_str(), found[0].base_sha.as_str()), ("headA", "baseA"));
+}
+
+#[test]
+fn finds_the_open_pull_requests_targeting_a_branch_and_marks_those_from_forks() {
+    let mut h = Harness::new();
+    let mock = h
+        .server
+        .mock("GET", "/repos/acme/web/pulls")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("state".into(), "open".into()),
+            Matcher::UrlEncoded("base".into(), "session-store".into()),
+        ]))
+        .with_body(fixture("pulls-by-base.json"))
+        .create();
+
+    let found = h.github().open_with_target_branch("acme/web", "session-store").unwrap();
+
+    mock.assert();
+    let forks: Vec<_> = found.iter().map(|p| (p.id.number, p.from_fork)).collect();
+    assert_eq!(forks, [(482, false), (490, true), (491, true)], "a fork whose head repository is gone is a fork");
+    assert!(found.iter().all(|p| p.base_branch == "session-store"));
 }
 
 #[test]

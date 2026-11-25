@@ -2328,6 +2328,8 @@ fn scene_publish(s: &mut State) {
         head_branch: "sso".into(),
         head_sha: "head1".into(),
         base_sha: "base1".into(),
+        base_branch: "main".into(),
+        from_fork: false,
     };
     let mut suggested = sample_thread("T1", 3..=3, "Name it for what it holds.", None);
     suggested.comments[0].suggestion = Some("    let before = self.changeset.snapshot()?;\n".into());
