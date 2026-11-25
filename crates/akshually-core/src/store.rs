@@ -91,7 +91,7 @@ impl Store {
         let json = serde_json::to_string(bases).map_err(std::io::Error::from)?;
         let hash = hash(&json);
         if self.bases_written != Some(hash) {
-            write_atomically(&self.bases, &json)?;
+            write_atomically(&self.bases, json.as_bytes())?;
             self.bases_written = Some(hash);
         }
         Ok(())
@@ -110,7 +110,7 @@ impl Store {
         let json = serde_json::to_string(inbox).map_err(std::io::Error::from)?;
         let hash = hash(&json);
         if self.inbox_written != Some(hash) {
-            write_atomically(&self.inbox, &json)?;
+            write_atomically(&self.inbox, json.as_bytes())?;
             self.inbox_written = Some(hash);
         }
         Ok(())
@@ -124,7 +124,8 @@ impl Store {
     /// Saves the diff layout.
     pub(crate) fn save_diff_layout<L: Serialize>(&self, layout: &L) -> Result<(), Error> {
         let json = serde_json::to_string(layout).map_err(std::io::Error::from)?;
-        write_atomically(&self.diff_layout, &json)
+        write_atomically(&self.diff_layout, json.as_bytes())?;
+        Ok(())
     }
 
     /// Makes the files match `sessions`: writes new and changed ones, deletes ended ones.
@@ -158,7 +159,8 @@ impl Store {
     }
 
     fn write(&self, id: &SessionId, json: &str) -> Result<(), Error> {
-        write_atomically(&self.path(id), json)
+        write_atomically(&self.path(id), json.as_bytes())?;
+        Ok(())
     }
 }
 
@@ -183,15 +185,18 @@ fn load_or_default<T: DeserializeOwned + Default>(path: &Path) -> (T, Option<Str
     }
 }
 
-/// Writes through a temporary file, so a crash leaves either the old file or the new one.
-fn write_atomically(path: &Path, json: &str) -> Result<(), Error> {
+/// Writes `bytes` through a temporary file beside `path`, so a crash leaves either the old file
+/// or the new one. The directory must exist.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let mut file = fs::File::create(&tmp)?;
-    file.write_all(json.as_bytes())?;
+    file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    fs::rename(&tmp, path).inspect_err(|_| {
+        // Best-effort: the rename's error is the one to report, and a leftover is overwritten next time.
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 fn hash(json: &str) -> u64 {

@@ -1,12 +1,13 @@
-//! Seam C: self-update at its HTTP boundary: which release is offered, looking releases up and
-//! downloading them from a `mockito` GitHub, and replacing a throwaway install with one.
+//! Self-update through the core crate's public interface, against a `mockito` GitHub and a
+//! throwaway directory: which release is offered, looking releases up and downloading them, and
+//! replacing an install with one.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use akshually_core::update::{
-    Archive, Asset, Release, Releases, Target, UpdateError, Updater, Version, release_offered,
+    Archive, Asset, Release, Releases, Target, UpdateError, Updater, Version, installed_exe, release_offered,
 };
 use akshually_testkit::{FakeRelease, FakeReleases, TestDirs, tar_gz, write_executable, zip};
 
@@ -123,10 +124,16 @@ fn linux_asset(binary: &str) -> (String, Vec<u8>) {
     (format!("{stem}.tar.gz"), archive)
 }
 
-/// A macOS release asset, as `packaging/package.sh macos` makes it: `akshually.app` in a `.zip`,
+/// A macOS release asset, as `packaging/package.sh macos` makes it: `Akshually.app` in a `.zip`,
 /// its binary and `Info.plist` holding `binary`.
 fn macos_asset(binary: &str) -> (String, Vec<u8>) {
-    let archive = zip("akshually.app", &[("Contents/MacOS/akshually", binary), ("Contents/Info.plist", binary)]);
+    macos_asset_holding("Akshually.app", binary)
+}
+
+/// A macOS release asset holding the bundle `bundle`, as releases from before the rename did with
+/// `akshually.app`.
+fn macos_asset_holding(bundle: &str, binary: &str) -> (String, Vec<u8>) {
+    let archive = zip(bundle, &[("Contents/MacOS/akshually", binary), ("Contents/Info.plist", binary)]);
     (format!("akshually-{TAG}-{MACOS}.zip"), archive)
 }
 
@@ -167,7 +174,7 @@ fn installing_a_release_replaces_a_macos_bundle_as_a_whole() {
     let (name, archive) = macos_asset("new binary");
     let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
     let apps = TestDirs::new();
-    let app = apps.path().join("akshually.app");
+    let app = apps.path().join("Akshually.app");
     let exe = write_bundle(&app, "old binary");
     fs::write(app.join("Contents/stale"), "only in the old bundle").unwrap();
     let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
@@ -178,7 +185,77 @@ fn installing_a_release_replaces_a_macos_bundle_as_a_whole() {
     assert_eq!(fs::read_to_string(app.join("Contents/Info.plist")).unwrap(), "new binary");
     assert!(!app.join("Contents/stale").exists(), "the old bundle's files outlived the update");
     let left: Vec<_> = fs::read_dir(apps.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(left, ["akshually.app"], "the update left files beside the bundle");
+    assert_eq!(left, ["Akshually.app"], "the update left files beside the bundle");
+}
+
+/// An `akshually.app` install, as a version from before the rename made it, with `~/.local/bin`'s
+/// symlink into it, in `apps` and `bin`.
+fn old_named_install(apps: &TestDirs, bin: &TestDirs) -> (PathBuf, PathBuf) {
+    let exe = write_bundle(&apps.path().join("akshually.app"), "old binary");
+    let link = bin.path().join("akshually");
+    std::os::unix::fs::symlink(&exe, &link).unwrap();
+    (exe, link)
+}
+
+#[test]
+fn installing_a_release_renames_an_old_named_bundle_and_keeps_the_path_symlink_working() {
+    let (name, archive) = macos_asset("new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let (apps, bin) = (TestDirs::new(), TestDirs::new());
+    let (exe, link) = old_named_install(&apps, &bin);
+    let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
+
+    updater.path_link(link.clone()).install(&release).unwrap();
+
+    let left: Vec<_> = fs::read_dir(apps.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["Akshually.app"], "the old named bundle is still there, or the new one isn't");
+    assert_eq!(fs::read_to_string(&link).unwrap(), "new binary", "the PATH symlink doesn't resolve to the new binary");
+    assert_eq!(installed_exe(&exe), apps.path().join("Akshually.app/Contents/MacOS/akshually"));
+    assert_eq!(fs::read_to_string(installed_exe(&exe)).unwrap(), "new binary");
+}
+
+#[test]
+fn installing_a_release_still_unpacks_a_zip_holding_the_old_named_bundle() {
+    let (name, archive) = macos_asset_holding("akshually.app", "new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let (apps, bin) = (TestDirs::new(), TestDirs::new());
+    let (exe, link) = old_named_install(&apps, &bin);
+    let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
+
+    updater.path_link(link.clone()).install(&release).unwrap();
+
+    let left: Vec<_> = fs::read_dir(apps.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["Akshually.app"]);
+    assert_eq!(fs::read_to_string(&link).unwrap(), "new binary");
+}
+
+#[test]
+fn an_install_whose_bundle_has_any_name_is_replaced_as_a_bundle() {
+    let (name, archive) = macos_asset("new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let apps = TestDirs::new();
+    let exe = write_bundle(&apps.path().join("Review.app"), "old binary");
+    let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
+
+    updater.install(&release).unwrap();
+
+    let left: Vec<_> = fs::read_dir(apps.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["Akshually.app"]);
+}
+
+#[test]
+fn a_contents_macos_binary_outside_an_app_directory_is_replaced_as_a_plain_binary() {
+    let (name, archive) = linux_asset("new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let dirs = TestDirs::new();
+    let exe = write_bundle(&dirs.path().join("Review"), "old binary");
+    let (release, updater) = release_and_updater(&github, Target::new(LINUX, Archive::TarGz), &exe);
+
+    updater.install(&release).unwrap();
+
+    assert_eq!(fs::read_to_string(&exe).unwrap(), "new binary");
+    let left: Vec<_> = fs::read_dir(dirs.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["Review"], "the update treated a directory without `.app` as a bundle");
 }
 
 #[test]

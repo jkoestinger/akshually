@@ -5,7 +5,7 @@ description: Get a human's review of your local code changes with the `akshually
 
 # akshually
 
-akshually is a desktop review app. Usually you are the **Author**: you ask the human to review your local work, they hand you **Rounds** of **Threads** (comments anchored to lines, a file, or the whole Review), and you answer each Thread, until they give the **Verdict**. Run every command from inside the repository, on the branch you are working on: the repository and branch pick the **Session**.
+Akshually is a desktop review app. Usually you are the **Author**: you ask the human to review your local work, they hand you **Rounds** of **Threads** (comments anchored to lines, a file, or the whole Review), and you answer each Thread, until they give the **Verdict**. Run every command from inside the repository, on the branch you are working on: the repository and branch pick the **Session**.
 
 When you are asked to review a Pull Request or someone's local changes instead, you are the human's **co-Reviewer**: see [Co-reviewing](#co-reviewing). A Session has at most one agent, in one role.
 

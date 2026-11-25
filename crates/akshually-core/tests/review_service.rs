@@ -1318,6 +1318,30 @@ fn since_the_last_round_threads_on_the_old_side_are_not_placed_in_the_diff() {
 }
 
 #[test]
+fn unresolved_placed_threads_leave_out_resolved_outdated_and_unplaced_ones_and_count_drafts() {
+    let repo = agent_branch();
+    let svc = Service::new();
+    let pending = svc.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 1..=1), "Why a?").unwrap();
+    svc.hand_over_round(&id).unwrap();
+    round(pending.wait_timeout(Duration::from_secs(1)));
+    svc.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 2..=2), "Why b2?").unwrap();
+    svc.comment(&id, Anchor::lines(Side::New, "lib.rs", 3..=3), "Why c2?").unwrap();
+    svc.comment(&id, Anchor::file("lib.rs"), "On the whole file.").unwrap();
+    svc.comment(&id, Anchor::Review, "The Review.").unwrap();
+    repo.write("lib.rs", "fn a() {}\nfn b3() {}\nfn c2() {}\nfn d() {}\n");
+    svc.reload(&id).unwrap();
+    assert!(svc.session(&id).unwrap().threads[1].outdated, "T2 didn't become Outdated");
+
+    let unresolved = svc.session(&id).unwrap().unresolved_placed_threads();
+
+    let threads: Vec<_> = unresolved.iter().map(|p| p.thread.as_str()).collect();
+    assert_eq!(threads, ["T3"], "only the Draft on a line the diff shows is unresolved and placed");
+}
+
+#[test]
 fn a_selection_anchors_to_its_lines_or_across_sides_to_its_last_line() {
     let repo = agent_branch();
     let svc = Service::new();

@@ -9,6 +9,7 @@ mod changeset;
 pub mod forge;
 pub mod git;
 pub mod ipc;
+mod launcher;
 mod notifier;
 mod paths;
 mod reanchor;
@@ -19,6 +20,7 @@ mod thread;
 pub mod update;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, Hunk, LocalOptions};
+pub use launcher::{LauncherError, repair_launcher};
 pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;

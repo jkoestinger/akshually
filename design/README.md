@@ -1,14 +1,14 @@
 # Design
 
-`akshually.figcraft` is the visual reference for akshually's screens and interaction states. Issues point here. Open it in FigCraft. `png/` holds exports for viewing on GitHub; re-export them when the file changes.
+`akshually.figcraft` is the visual reference for Akshually's screens and interaction states. Issues point here. Open it in FigCraft. `png/` holds exports for viewing on GitHub; re-export them when the file changes.
 
 | Page | Frame | Shows |
 | --- | --- | --- |
-| Screens | 1 · Session — your Turn (Round 2) | Tabs with attention markers, Session header, since-last-Round toggle, viewed ticks, an inline Thread, a Draft being written, an Outdated Thread, a collapsed generated file |
-| Screens | 2 · Session — agent's Turn (Light theme) | Waiting banner, drafting during the agent's Turn, Take Turn back |
+| Screens | 1 · Session — your Turn (Round 2) | Tabs with attention markers, Session header (changeset totals, Thread navigation buttons), since-last-Round toggle, viewed ticks, an inline Thread, a Draft being written, an Outdated Thread, a collapsed generated file, the scroll bar over the diff |
+| Screens | 2 · Session — agent's Turn (Light theme) | Waiting banner, drafting during the agent's Turn, Take Turn back, header totals and Thread navigation buttons, scroll bar |
 | Screens | 3 · Inbox | Pull Requests across Forges, new / updated / Session-open states, open by URL |
-| Screens | 4 · Publish dialog | Kept and discarded Drafts, reply on an existing Thread, Verdict choice |
-| States & interactions | States | Tab states, reload banners, agent Draft with a suggestion, Resolved Thread, interaction rules |
+| Screens | 4 · Publish dialog | The "Sent to …" line as wrapped muted text under the title, kept and discarded Drafts, reply on an existing Thread, Verdict choice |
+| States & interactions | States | Tab states, reload banners, agent Draft with a suggestion, Resolved Thread, search field (with a count, no match, in a Rendered view's header), General Threads header row (expanded, collapsed), the Approve confirm question, interaction rules |
 
 ## Design tokens
 

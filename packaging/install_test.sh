@@ -3,6 +3,9 @@
 # throwaway `HOME`, with a fake `uname` on `PATH` to pick the platform. Asserts on exit codes, output
 # and the files left under `HOME`. Never touches the network or the real `HOME`.
 #
+# Also exercises `packaging/package.sh` as a process (the `package_*` tests), asserting on the
+# contents of the assets it makes.
+#
 #   packaging/install_test.sh            runs every test
 #   packaging/install_test.sh <name>…    runs the named tests
 #
@@ -47,10 +50,7 @@ publish() {
     "$root/packaging/package.sh" linux "$build/bin/akshually" "akshually-$tag-x86_64-unknown-linux-gnu" "$dir" \
         >/dev/null 2>&1
     for target in aarch64-apple-darwin x86_64-apple-darwin; do
-        rm -rf "$build/app"
-        mkdir -p "$build/app/akshually.app/Contents/MacOS"
-        cp "$build/bin/akshually" "$build/app/akshually.app/Contents/MacOS/akshually"
-        (cd "$build/app" && python3 -m zipfile -c "$dir/akshually-$tag-$target.zip" akshually.app)
+        "$root/packaging/package.sh" macos "$build/bin/akshually" "akshually-$tag-$target" "$dir" >/dev/null 2>&1
     done
     (cd "$dir" && sha256 akshually-* >SHA256SUMS)
 
@@ -81,7 +81,7 @@ EOF
 # does: on macOS that is bash 3.2.
 run_install() {
     set +e
-    output=$(env HOME="$home" PATH="$work/fakebin:$PATH" AKSHUALLY_RELEASES_URL="file://$releases" "$@" \
+    output=$(env -u XDG_DATA_HOME HOME="$home" PATH="$work/fakebin:$PATH" AKSHUALLY_RELEASES_URL="file://$releases" "$@" \
         /bin/bash "$root/install.sh" 2>&1)
     status=$?
     set -e
@@ -147,7 +147,7 @@ test_an_unsupported_platform_is_refused_with_the_releases_page() {
 # Checks a macOS install of `version` into `home`: the bundle, and the symlink into it.
 assert_macos_install() {
     local version=$1
-    local app="$home/Applications/akshually.app" link="$home/.local/bin/akshually"
+    local app="$home/Applications/Akshually.app" link="$home/.local/bin/akshually"
     [[ -x $app/Contents/MacOS/akshually ]] || fail "no app bundle"
     [[ -L $link ]] || fail "$link isn't a symlink"
     [[ $(readlink "$link") == "$app/Contents/MacOS/akshually" ]] || fail "$link points at $(readlink "$link")"
@@ -211,7 +211,7 @@ test_rerunning_on_macos_upgrades_the_app_in_place() {
 
     [[ $status -eq 0 ]] || fail "install exited $status: $output"
     assert_macos_install 1.3.0
-    [[ $(ls -A "$home/Applications") == akshually.app ]] || fail "left extra bundles: $(ls -A "$home/Applications")"
+    [[ $(ls -A "$home/Applications") == Akshually.app ]] || fail "left extra bundles: $(ls -A "$home/Applications")"
 }
 
 test_prints_the_path_line_when_the_bin_dir_isnt_on_path() {
@@ -260,6 +260,130 @@ test_explains_a_release_without_sha256sums() {
     [[ ! -e $home/.local ]] || fail "installed something: $(find "$home/.local")"
 }
 
+# Checks that the data home `$1` holds the launcher entry naming the icon, and every icon size
+# `packaging/` ships, byte for byte.
+assert_launcher_and_icons() {
+    local data=$1 icon size
+    grep -qx 'Icon=akshually' "$data/applications/akshually.desktop" || fail "the launcher entry names no icon"
+    grep -qx 'Name=Akshually' "$data/applications/akshually.desktop" || fail "the launcher entry isn't named Akshually"
+    for icon in "$root"/packaging/icons/hicolor/*/apps/akshually.png; do
+        size=$(basename "$(dirname "$(dirname "$icon")")")
+        cmp -s "$icon" "$data/icons/hicolor/$size/apps/akshually.png" || fail "the $size icon isn't installed"
+    done
+}
+
+test_installs_the_icon_into_the_hicolor_theme_on_linux() {
+    fake_platform Linux x86_64
+    publish v1.2.3 latest
+
+    run_install
+
+    [[ $status -eq 0 ]] || fail "install exited $status: $output"
+    assert_launcher_and_icons "$home/.local/share"
+}
+
+test_installs_the_launcher_entry_and_icon_under_xdg_data_home() {
+    fake_platform Linux x86_64
+    publish v1.2.3 latest
+
+    run_install XDG_DATA_HOME="$home/xdg-data"
+
+    [[ $status -eq 0 ]] || fail "install exited $status: $output"
+    assert_launcher_and_icons "$home/xdg-data"
+    [[ ! -e $home/.local/share ]] || fail "wrote under the default data home too"
+}
+
+# Replaces the release `v1.2.3` with one as made before the icon: a tarball (or a zip) holding the
+# old launcher entry, no icons and, on macOS, `akshually.app`.
+publish_before_the_icon() {
+    local platform=$1 dir="$releases/download/v1.2.3" old="$work/old-release"
+    rm -rf "$old" "$dir" && mkdir -p "$old" "$dir"
+    if [[ $platform == linux ]]; then
+        local stem=akshually-v1.2.3-x86_64-unknown-linux-gnu
+        mkdir "$old/$stem"
+        fake_binary "$old/$stem/akshually" 1.2.3
+        printf '[Desktop Entry]\nName=akshually\n' >"$old/$stem/akshually.desktop"
+        tar -C "$old" -czf "$dir/$stem.tar.gz" "$stem"
+    else
+        mkdir -p "$old/akshually.app/Contents/MacOS"
+        fake_binary "$old/akshually.app/Contents/MacOS/akshually" 1.2.3
+        (cd "$old" && python3 -m zipfile -c "$dir/akshually-v1.2.3-aarch64-apple-darwin.zip" akshually.app)
+    fi
+    (cd "$dir" && sha256 akshually-* >SHA256SUMS)
+    rm -rf "$releases/latest" && mkdir "$releases/latest" && cp -R "$dir" "$releases/latest/download"
+}
+
+test_installs_a_linux_release_from_before_the_icon() {
+    fake_platform Linux x86_64
+    publish_before_the_icon linux
+
+    run_install
+
+    [[ $status -eq 0 ]] || fail "install exited $status: $output"
+    [[ -f $home/.local/share/applications/akshually.desktop ]] || fail "no launcher entry"
+}
+
+test_installs_a_macos_release_holding_the_old_named_bundle_as_akshually_app() {
+    fake_platform Darwin arm64
+    publish_before_the_icon macos
+
+    run_install
+
+    [[ $status -eq 0 ]] || fail "install exited $status: $output"
+    assert_macos_install 1.2.3
+    [[ $(ls -A "$home/Applications") == Akshually.app ]] || fail "left: $(ls -A "$home/Applications")"
+}
+
+test_installing_on_macos_leaves_no_old_named_bundle() {
+    fake_platform Darwin arm64
+    publish v1.2.3 latest
+    mkdir -p "$home/Applications/akshually.app/Contents/MacOS"
+    fake_binary "$home/Applications/akshually.app/Contents/MacOS/akshually" 0.0.7
+
+    run_install
+
+    [[ $status -eq 0 ]] || fail "install exited $status: $output"
+    assert_macos_install 1.2.3
+    [[ $(ls -A "$home/Applications") == Akshually.app ]] || fail "left: $(ls -A "$home/Applications")"
+}
+
+# Packages with a stand-in binary for `$1` (`linux` or `macos`) and leaves the asset's path in `asset`.
+package() {
+    local build="$work/build/package"
+    mkdir -p "$build"
+    fake_binary "$build/akshually" 1.2.3
+    asset=$("$root/packaging/package.sh" "$1" "$build/akshually" akshually-v1.2.3-test "$work/package" 2>/dev/null)
+}
+
+test_package_linux_holds_the_icons_and_a_launcher_entry_naming_them() {
+    package linux
+
+    mkdir "$work/unpacked"
+    tar -C "$work/unpacked" -xzf "$asset"
+    local dir="$work/unpacked/akshually-v1.2.3-test" icon size
+    grep -qx 'Icon=akshually' "$dir/akshually.desktop" || fail "the launcher entry names no icon"
+    grep -qx 'Name=Akshually' "$dir/akshually.desktop" || fail "the launcher entry isn't named Akshually"
+    for icon in "$root"/packaging/icons/hicolor/*/apps/akshually.png; do
+        size=$(basename "$(dirname "$(dirname "$icon")")")
+        cmp -s "$icon" "$dir/icons/hicolor/$size/apps/akshually.png" || fail "the tarball lacks the $size icon"
+    done
+}
+
+test_package_macos_holds_akshually_app_with_the_icon_its_plist_names() {
+    package macos
+
+    mkdir "$work/unpacked"
+    unzip -q "$asset" -d "$work/unpacked"
+    local contents="$work/unpacked/Akshually.app/Contents" icon
+    [[ $(ls -A "$work/unpacked") == Akshually.app ]] || fail "the zip holds: $(ls -A "$work/unpacked")"
+    [[ -x $contents/MacOS/akshually ]] || fail "no binary in the bundle"
+    icon=$(awk '/<key>CFBundleIconFile<\/key>/ { getline; gsub(/<\/?string>|[ \t]/, ""); print }' "$contents/Info.plist")
+    [[ -n $icon ]] || fail "Info.plist names no icon file"
+    [[ -f $contents/Resources/${icon%.icns}.icns ]] || fail "Info.plist names $icon, which isn't in Resources"
+    cmp -s "$root/packaging/icons/akshually.icns" "$contents/Resources/${icon%.icns}.icns" || fail "not the .icns"
+    [[ $(grep -c '<string>Akshually</string>' "$contents/Info.plist") -eq 2 ]] || fail "the bundle names aren't Akshually"
+}
+
 test_installs_a_real_build() {
     if [[ -z ${AKSHUALLY_BINARY:-} ]]; then
         echo "skip (set AKSHUALLY_BINARY to a built akshually)"
@@ -283,7 +407,7 @@ else
     while read -r name; do tests+=("$name"); done < <(declare -F | awk '$3 ~ /^test_/ { sub(/^test_/, "", $3); print $3 }')
 fi
 for name in "${tests[@]}"; do
-    rm -rf "$work/fakebin" "$work/build"
+    rm -rf "$work/fakebin" "$work/build" "$work/package" "$work/unpacked" "$work/old-release"
     home="$work/home-$name" releases="$work/releases-$name"
     mkdir -p "$home" "$releases"
     if ("test_$name"); then

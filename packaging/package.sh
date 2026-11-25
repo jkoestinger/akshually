@@ -2,7 +2,7 @@
 # Packages a built `akshually` binary into a release asset, and prints the asset's path.
 #
 #   packaging/package.sh linux <binary> <asset-stem> <out-dir>   -> <asset-stem>.tar.gz
-#   packaging/package.sh macos <binary> <asset-stem> <out-dir>   -> <asset-stem>.zip (akshually.app)
+#   packaging/package.sh macos <binary> <asset-stem> <out-dir>   -> <asset-stem>.zip (Akshually.app)
 #
 # Runs `<binary> --version` first, as the smoke test, and takes the bundle version from it.
 # The release workflow calls this; run it locally to check an asset by hand.
@@ -31,25 +31,28 @@ linux)
     install -m 755 "$binary" "$dir/akshually"
     install -m 644 "$root/packaging/linux/akshually.desktop" "$root/README.md" \
         "$root/LICENSE-MIT" "$dir/"
+    # The `hicolor` theme's layout, so install.sh copies the tree as it is.
+    mkdir -p "$dir/icons"
+    cp -R "$root/packaging/icons/hicolor" "$dir/icons/"
     asset="$out/$stem.tar.gz"
     tar -C "$work" -czf "$asset" "$stem"
     ;;
 macos)
-    app="$work/akshually.app/Contents"
+    app="$work/Akshually.app/Contents"
     mkdir -p "$app/MacOS" "$app/Resources"
     install -m 755 "$binary" "$app/MacOS/akshually"
     sed "s/@VERSION@/$version/g" "$root/packaging/macos/Info.plist" >"$app/Info.plist"
-    install -m 644 "$root/LICENSE-MIT" "$app/Resources/"
+    install -m 644 "$root/LICENSE-MIT" "$root/packaging/icons/akshually.icns" "$app/Resources/"
     # Ad-hoc signature (no Developer ID): seals the bundle so Gatekeeper sees one consistent app.
     if command -v codesign >/dev/null; then
-        codesign --force --sign - "$work/akshually.app"
+        codesign --force --sign - "$work/Akshually.app"
     fi
     asset="$out/$stem.zip"
     rm -f "$asset"
     if command -v ditto >/dev/null; then
-        ditto -c -k --keepParent "$work/akshually.app" "$asset"
+        ditto -c -k --keepParent "$work/Akshually.app" "$asset"
     else
-        (cd "$work" && zip -qry "$asset" akshually.app)
+        (cd "$work" && zip -qry "$asset" Akshually.app)
     fi
     ;;
 *)

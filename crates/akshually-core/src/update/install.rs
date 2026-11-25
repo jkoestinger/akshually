@@ -1,5 +1,5 @@
 //! Replacing the install the running executable belongs to with a release's asset: a Linux
-//! binary by an atomic rename, a macOS `akshually.app` bundle as a whole.
+//! binary by an atomic rename, a macOS app bundle as a whole.
 
 use std::fs;
 use std::io;
@@ -23,7 +23,7 @@ pub struct Target {
 pub enum Archive {
     /// Linux: `akshually-<tag>-<target>/akshually` in a `.tar.gz`.
     TarGz,
-    /// macOS: `akshually.app` in a `.zip`.
+    /// macOS: `Akshually.app` (`akshually.app` before the rename) in a `.zip`.
     Zip,
 }
 
@@ -54,6 +54,13 @@ impl Target {
     }
 }
 
+/// The name a macOS bundle has after an update, whatever it was called before.
+const BUNDLE: &str = "Akshually.app";
+/// The name releases from before the rename give the bundle in their zip.
+const OLD_BUNDLE: &str = "akshually.app";
+/// The binary's path inside a bundle.
+const BUNDLE_BINARY: &str = "Contents/MacOS/akshually";
+
 /// What an update replaces: the binary itself, or the macOS bundle it is inside.
 enum Install {
     Binary(PathBuf),
@@ -62,13 +69,14 @@ enum Install {
 
 impl Install {
     /// The install `exe` (a real path, symlinks resolved) belongs to: the `.app` bundle when it
-    /// is a bundle's `Contents/MacOS` binary, else the binary.
+    /// is a bundle's `Contents/MacOS` binary, else the binary. The bundle may have any name, but
+    /// it is a directory with the `.app` extension.
     fn containing(exe: &Path) -> Install {
         let bundle = exe
             .parent()
             .filter(|d| d.ends_with("Contents/MacOS"))
             .and_then(|d| d.parent()?.parent())
-            .filter(|app| app.extension().is_some_and(|e| e == "app"));
+            .filter(|app| app.extension().is_some_and(|ext| ext == "app"));
         match bundle {
             Some(app) => Install::Bundle(app.to_owned()),
             None => Install::Binary(exe.to_owned()),
@@ -88,6 +96,16 @@ impl Install {
             Install::Binary(_) => None,
             Install::Bundle(app) => Some(app),
         }
+    }
+}
+
+/// Where the running executable `exe` is after an Update has replaced its install: the same
+/// path for a binary, and for a bundle the binary inside `Akshually.app`, which an Update names
+/// so whatever the bundle was called before. The restart launches this.
+pub fn installed_exe(exe: &Path) -> PathBuf {
+    match Install::containing(exe) {
+        Install::Binary(exe) => exe,
+        Install::Bundle(app) => app.with_file_name(BUNDLE).join(BUNDLE_BINARY),
     }
 }
 
@@ -111,6 +129,9 @@ pub struct Updater {
     /// The running executable's real path, symlinks resolved.
     exe: PathBuf,
     running: Version,
+    /// The `akshually` symlink on `PATH` that points into a bundle, which an Update that renames
+    /// the bundle repoints. `None` without a home directory.
+    path_link: Option<PathBuf>,
 }
 
 impl Updater {
@@ -118,12 +139,20 @@ impl Updater {
     /// it at startup, as `/proc/self/exe` names a replaced binary "(deleted)"), from
     /// `releases`, for this platform, as the version this binary was built as.
     pub fn new(releases: Releases, exe: PathBuf) -> Self {
-        Updater { releases, target: Target::current(), exe, running: Version::running() }
+        // The install script's contract (ADR 0003): it links `~/.local/bin/akshually` into the bundle.
+        let path_link = dirs::home_dir().map(|home| home.join(".local/bin/akshually"));
+        Updater { releases, target: Target::current(), exe, running: Version::running(), path_link }
     }
 
     /// Installs `target`'s assets instead of this platform's.
     pub fn target(mut self, target: Target) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    /// Repoints `link`, not `~/.local/bin/akshually`, when an Update renames the bundle it links to.
+    pub fn path_link(mut self, link: PathBuf) -> Self {
+        self.path_link = Some(link);
         self
     }
 
@@ -180,27 +209,57 @@ impl Updater {
                 fs::rename(&binary, exe).map_err(io_at(exe))
             }
             Install::Bundle(app) => {
-                let new = unpacked.join("akshually.app");
-                if !new.join("Contents/MacOS/akshually").is_file() {
-                    return Err(UpdateError::Unpack { name, message: "it holds no akshually.app".into() });
+                let Some(new) = [BUNDLE, OLD_BUNDLE]
+                    .into_iter()
+                    .map(|bundle| unpacked.join(bundle))
+                    .find(|new| new.join(BUNDLE_BINARY).is_file())
+                else {
+                    return Err(UpdateError::Unpack { name, message: format!("it holds no {BUNDLE}") });
+                };
+                let renamed = app.with_file_name(BUNDLE);
+                swap_bundle(app, &renamed, &new, &staging.path().join("old.app"))?;
+                if &renamed != app {
+                    self.repoint_path_link(app, &renamed);
                 }
-                swap_bundle(app, &new, &staging.path().join("old.app"))
+                Ok(())
             }
         }
     }
 }
 
-/// Puts the bundle `new` at `app`, moving the old one to `old` (inside the work dir, which goes
-/// with it). Two renames: if the second fails, the old bundle goes back, so `app` is never
-/// half-written.
-fn swap_bundle(app: &Path, new: &Path, old: &Path) -> Result<(), UpdateError> {
+/// Puts the bundle `new` at `to`, moving the old one at `app` to `old` (inside the work dir,
+/// which goes with it). Two renames: if the second fails, the old bundle goes back, so `app` is
+/// never half-written.
+fn swap_bundle(app: &Path, to: &Path, new: &Path, old: &Path) -> Result<(), UpdateError> {
     fs::rename(app, old).map_err(io_at(app))?;
-    if let Err(error) = fs::rename(new, app) {
+    if let Err(error) = fs::rename(new, to) {
         // Best-effort: if even this fails, the error below is all there is to say.
         let _ = fs::rename(old, app);
         return Err(io_at(app)(error));
     }
     Ok(())
+}
+
+impl Updater {
+    /// After the bundle `from` became `to`, points the `PATH` symlink at the binary in `to`, when
+    /// it pointed into `from`: on a case-sensitive volume the old path no longer exists.
+    /// Best-effort: the Update is done, and re-running the install script fixes the link.
+    fn repoint_path_link(&self, from: &Path, to: &Path) {
+        let Some(link) = &self.path_link else { return };
+        let Ok(target) = fs::read_link(link) else { return };
+        if !target.starts_with(from) {
+            return;
+        }
+        let new_target = to.join(BUNDLE_BINARY);
+        let tmp = link.with_file_name(".akshually.new");
+        // Clears a leftover from an earlier failed attempt, which would make `symlink` fail; if
+        // there is none, or it can't be removed, `symlink` below reports what matters.
+        let _ = fs::remove_file(&tmp);
+        let result = std::os::unix::fs::symlink(&new_target, &tmp).and_then(|()| fs::rename(&tmp, link));
+        if let Err(error) = result {
+            eprintln!("akshually: can't repoint {} at {}: {error}", link.display(), new_target.display());
+        }
+    }
 }
 
 /// Unpacks `packed` into `into`, with the platform's own tools, as the install script does.

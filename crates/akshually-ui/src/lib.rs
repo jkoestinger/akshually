@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use rune::{AppHandle, AppSpec, Chrome, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
+use rune::{
+    AppHandle, AppSpec, Chrome, Color, Cursor, Cx, El, Key, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text,
+};
 use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
@@ -44,9 +46,14 @@ const PUBLISH_LIST_MAX_HEIGHT: f32 = 320.0;
 const PUBLISH_LIST_MIN_HEIGHT: f32 = 120.0;
 /// The height of everything in the window around the Publish dialog's list of Drafts, which gets
 /// the rest: the dialog's header, Verdicts, Feedback note and buttons with a two-line summary
-/// (271, measured in `--scene publish-many`), the summary grown to its eight lines (105), a line
-/// of error (20), and a 16-pixel margin above and below the dialog (32).
-const PUBLISH_DIALOG_CHROME: f32 = 428.0;
+/// (271, measured in `--scene publish-many`, the line under the title on one line), the line
+/// wrapped to three (40, `--scene publish-long` in a narrow window; #102), the summary grown to
+/// its eight lines (105), a line of error (20), and a 16-pixel margin above and below the
+/// dialog (32).
+const PUBLISH_DIALOG_CHROME: f32 = 468.0;
+/// How far the Publish dialog's line moves up into the header's bottom padding (16), to sit the
+/// 4 points under the title that `Dialog::description` keeps (#102).
+const PUBLISH_LINE_RAISE: f32 = -12.0;
 /// How opaque a discarded Draft's card is in the Publish dialog, muted next to what goes out.
 const DISCARDED_OPACITY: f32 = 0.6;
 /// The tab bar's height in points: it is the window's title bar on macOS.
@@ -70,7 +77,10 @@ pub const WINDOW_CHROME: Chrome = Chrome {
 mod mono_font;
 mod notifier;
 mod rendered;
+mod scroll_bar;
+mod search;
 mod theme;
+mod thread_nav;
 
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
@@ -86,6 +96,8 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let headless = is_headless_run(&rune_args);
+    // The desktop entry's name, so the window shows its icon (Wayland app id, X11 window class).
+    rune::set_app_id(notifier::APP_ID);
     let fonts = mono_font::window_fonts();
     let spec = AppSpec {
         scenes: &[
@@ -95,6 +107,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("publish", scene_publish),
             ("publish-gitlab", scene_publish_gitlab),
             ("publish-many", scene_publish_many),
+            ("publish-long", scene_publish_long),
             ("co-review", scene_co_review),
             ("rendered", scene_rendered),
             ("update", scene_update),
@@ -105,7 +118,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         fonts: fonts.fonts,
         families: ("Inter", fonts.mono),
         on_key: Some(on_key),
-        ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
+        ..AppSpec::new("Akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
     };
     let init_service = service.clone();
     let app = rune::App::new(spec)
@@ -178,11 +191,16 @@ pub struct State {
     /// The Session the human asked to abandon (or close, for a Pull Request), until they
     /// confirm or cancel.
     confirming_end: Option<SessionId>,
+    /// The Session the human pressed Approve in while it held unsent items, until they confirm
+    /// or cancel (#104).
+    confirming_approve: Option<SessionId>,
     /// What a Session's diff view reads and writes once its tab is gone. Rune runs pointer,
     /// wheel and visible-row handlers against the last built view, so they can reach a diff
     /// view after `apply` dropped its tab and before the next rebuild drops the view (#37).
     /// It is never shown, and nothing but those stale handlers reads what they write to it.
     spare_diff: DiffState,
+    /// What a search field reads and writes once its tab is gone, as `spare_diff` is for the diff view.
+    spare_search: TextEdit,
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -220,6 +238,9 @@ struct SessionTab {
     /// Outdated and Resolved Threads the human expanded; the others show as one collapsed line.
     /// The UI's own, so it's lost on restart.
     expanded: Vec<ThreadId>,
+    /// The General Threads section is folded to its header row. The UI's own, so it's lost on
+    /// restart and every Session opens with it expanded.
+    general_folded: bool,
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
@@ -228,6 +249,15 @@ struct SessionTab {
     /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
     /// lost on restart.
     rendered: Option<String>,
+    /// The Session's Search: its query and where the human is in its matches. The UI's own, so
+    /// it's lost on restart.
+    search: search::Search,
+    /// Where the Thread `n` or `p` last went to is, so the next press carries on from it while it
+    /// is still in view. The UI's own.
+    reached: Option<thread_nav::RowOrder>,
+    /// The diff view's laid-out rect `[x, y, w, h]`, in window points, once it has one: where
+    /// to read what the diff shows (see `thread_nav`).
+    viewport: Option<[f32; 4]>,
 }
 
 impl SessionTab {
@@ -241,9 +271,13 @@ impl SessionTab {
             actions,
             diff,
             expanded: Vec::new(),
+            general_folded: false,
             choosing_view: false,
             choosing_member: false,
             rendered: None,
+            search: search::Search::new(),
+            reached: None,
+            viewport: None,
         };
         tab.annotate(None);
         tab
@@ -368,7 +402,9 @@ impl State {
             publish: None,
             summary: TextEdit::new(""),
             confirming_end: None,
+            confirming_approve: None,
             spare_diff: DiffState::new(Vec::new()),
+            spare_search: TextEdit::new(""),
         };
         let window = state.service.window();
         state.apply(window);
@@ -395,12 +431,22 @@ impl State {
                     let mut tab = old.swap_remove(at);
                     if tab.session.changeset_rev != session.changeset_rev {
                         show_files(&mut tab.diff, &session);
+                        // The Thread reached was a place in the diff just replaced.
+                        tab.reached = None;
                         // The lines it was on may be gone.
                         if self.composer.as_ref().is_some_and(|c| c.session == session.id) {
                             self.composer = None;
                         }
                     }
                     tab.actions = session.actions();
+                    // A new General Thread, or a new Comment in one, unfolds the section.
+                    let before = general_comment_counts(&tab.session);
+                    if general_comment_counts(&session)
+                        .iter()
+                        .any(|(id, n)| before.iter().all(|(b, m)| b != id || m < n))
+                    {
+                        tab.general_folded = false;
+                    }
                     // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
                     // resolved again (#69).
                     tab.expanded.retain(|id| session.threads.iter().any(|t| &t.id == id && collapses(t)));
@@ -423,9 +469,12 @@ impl State {
         if self.publish.as_ref().is_some_and(|p| !self.tabs.iter().any(|t| t.session.id == p.session)) {
             self.publish = None;
         }
-        if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
-            self.confirming_end = None;
-        }
+        let tabs = &self.tabs;
+        self.confirming_end.take_if(|id| !tabs.iter().any(|t| &t.session.id == id));
+        // Once approving has nothing to discard (the Round went over, say), the question is over:
+        // it must not come back with the next Draft, unasked.
+        self.confirming_approve
+            .take_if(|id| !tabs.iter().any(|t| &t.session.id == id && t.actions.discarded_by_approving > 0));
         self.annotate();
         self.displayed = displayed;
         self.inbox = inbox;
@@ -594,6 +643,17 @@ impl State {
         }
     }
 
+    /// Human, from the header's Approve: approves the Session, asking first when that discards
+    /// unsent items. The question shows with the Session it is about (#104).
+    fn approve(&mut self, id: SessionId) {
+        let Some(tab) = self.tab(&id) else { return };
+        if tab.actions.discarded_by_approving == 0 {
+            self.act(&id, Service::approve);
+            return;
+        }
+        self.confirming_approve = Some(id);
+    }
+
     /// Human: lays out every Session's Changeset as `layout`.
     fn set_diff_layout(&mut self, layout: DiffLayout) {
         self.service.set_diff_layout(layout);
@@ -676,8 +736,21 @@ impl State {
         let error = tab.session.check_anchor(&anchor).err().map(|e| e.to_string());
         let fallback = tab.session.fallback_anchor(&anchor);
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at, error, fallback });
-        self.composer_text = TextEdit::new("");
+        self.composer_text = focused_edit("");
+        self.unfold_general_for_composer();
         self.annotate();
+    }
+
+    /// Unfolds the General Threads section when the composer writes into it.
+    fn unfold_general_for_composer(&mut self) {
+        let Some(composer) = &self.composer else { return };
+        if composer.at.is_some() {
+            return;
+        }
+        let session = composer.session.clone();
+        if let Some(tab) = self.tab_mut(&session) {
+            tab.general_folded = false;
+        }
     }
 
     fn close_composer(&mut self) {
@@ -707,13 +780,16 @@ impl State {
         composer.anchor = anchor;
         composer.at = None;
         composer.error = None;
+        // The press on "Comment on the file" took focus off the text area.
+        self.composer_text.focused = true;
+        self.unfold_general_for_composer();
         self.annotate();
     }
 
     /// Opens the reply composer in `thread`.
     fn open_reply(&mut self, thread: ThreadRef) {
         self.reply = Some(thread);
-        self.reply_text = TextEdit::new("");
+        self.reply_text = focused_edit("");
     }
 
     fn close_reply(&mut self) {
@@ -736,7 +812,7 @@ impl State {
         let draft = tab.and_then(|t| t.session.threads.iter().find(|th| th.id == thread.thread)?.comments.first());
         let Some(draft) = draft else { return };
         let written = NewComment { body: draft.body.clone(), suggestion: draft.suggestion.clone() };
-        self.edit_text = TextEdit::new(written.to_markdown());
+        self.edit_text = focused_edit(written.to_markdown());
         self.editing = Some(thread);
     }
 
@@ -763,6 +839,12 @@ impl State {
             }
             None => tab.expanded.push(thread.thread.clone()),
         }
+    }
+
+    /// Folds the General Threads section of `session`'s tab to its header row, or unfolds it.
+    fn toggle_general_folded(&mut self, session: &SessionId) {
+        let Some(tab) = self.tab_mut(session) else { return };
+        tab.general_folded = !tab.general_folded;
     }
 
     /// The Session whose tab in the strip is keyed `tab`; `None` for the Inbox's.
@@ -897,17 +979,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(tab_bar.child(pull_request_opener(k, s)))
             .children(update_notice(k, s))
             .child(session_header(k, tab, &mut layer))
+            .children(search::bar(k, tab, s.diff_layout))
             .children(end_confirm(k, s, &tab.session))
+            .children(approve_confirm(k, s, tab))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
             .child(general_threads(k, s, tab, agent))
             .child(outdated_threads(k, tab))
             .children(stack_changeset_notice(k, &tab.session))
-            .child(col().grow(1.0).min_h(0.0).child(match tab.session.stack_changeset() {
-                Some(Err(error)) => stack_changeset_error(k, error),
-                _ => session_diff(k, s, tab, agent),
-            })),
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .child(match tab.session.stack_changeset() {
+                        Some(Err(error)) => stack_changeset_error(k, error),
+                        _ => session_diff(k, s, tab, agent),
+                    })
+                    .children(scroll_bar::overlay(k, cx, &diff_key(&tab.session.id))),
+            ),
         None => {
             let draft = theme::tokens(cx.system_dark()).color("state-draft");
             col()
@@ -938,10 +1028,10 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
     let dismiss = || button("Dismiss", "update-dismiss", ButtonVariant::Ghost, State::dismiss_update);
     let (note, buttons) = match &update.stage {
         UpdateStage::Available => (
-            format!("akshually {version} is available."),
+            format!("Akshually {version} is available."),
             vec![button("Update", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
         ),
-        UpdateStage::Installing => (format!("Installing akshually {version}…"), Vec::new()),
+        UpdateStage::Installing => (format!("Installing Akshually {version}…"), Vec::new()),
         // The agents may have stopped waiting since Restart was pressed.
         UpdateStage::Installed if s.confirming_restart && !update.waiting.is_empty() => (
             format!(
@@ -955,11 +1045,11 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
             ],
         ),
         UpdateStage::Installed => (
-            format!("akshually {version} is installed. Restart akshually to use it."),
+            format!("Akshually {version} is installed. Restart Akshually to use it."),
             vec![button("Restart", "update-restart", ButtonVariant::Outline, State::restart), dismiss()],
         ),
         UpdateStage::Failed(why) => (
-            format!("Couldn't update to akshually {version}: {why}"),
+            format!("Couldn't update to Akshually {version}: {why}"),
             vec![button("Try again", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
         ),
     };
@@ -1161,7 +1251,9 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .children(picker)
         .child(text(pr.title.clone()).font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
+        .child(changeset_totals(k, tab))
         .child(row().grow(1.0))
+        .children(thread_nav::buttons(k, tab))
         .child(layout_control(k, tab))
         .children(published.map(|badge| badge.build(k)))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
@@ -1182,6 +1274,26 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         )
 }
 
+/// The totals of the Changeset shown: its files, and the lines added and removed across them,
+/// summed from the same per-file counts the diff's file headers draw so the two always agree.
+/// Unlike a file header, it writes a zero count, so the text keeps its shape.
+fn changeset_totals(k: &Kit, tab: &SessionTab) -> El {
+    let files = tab.diff.files();
+    let (added, removed) = files.iter().fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
+    let count = files.len();
+    row()
+        .key("changeset-totals")
+        .gap(8.0)
+        .items_center()
+        .child(
+            text(format!("{count} {}", if count == 1 { "file" } else { "files" }))
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        )
+        .child(text(format!("+{added}")).font(k.ty.small).color(k.c.success.fg).key("total-adds"))
+        .child(text(format!("−{removed}")).font(k.ty.small).color(k.c.danger.fg).key("total-dels"))
+}
+
 /// The header while the Stack Changeset is shown: for reading only, so with no Drafts, Verdict
 /// or Publish.
 fn stack_changeset_header(k: &Kit, tab: &SessionTab, picker: Option<El>) -> El {
@@ -1199,6 +1311,7 @@ fn stack_changeset_header(k: &Kit, tab: &SessionTab, picker: Option<El>) -> El {
         .children(picker)
         .child(text("Whole Stack").font(k.ty.ui_medium).color(k.c.text_base))
         .child(text(format!("{members} Pull Requests → {base}")).font(k.ty.mono).color(k.c.text_muted))
+        .child(changeset_totals(k, tab))
         .child(row().grow(1.0))
         .child(layout_control(k, tab))
 }
@@ -1288,7 +1401,14 @@ fn publish_dialog(k: &Kit, s: &State, window_height: Option<f32>, layer: &mut Ve
     let Some(publish) = &s.publish else { return };
     let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
     let Some(pr) = tab.session.pull_request() else { return };
-    let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0);
+    // Workaround for a Rune bug (#102): at the pinned revision `Dialog::description` lays its text
+    // out on one line in a title column that can't shrink, so a long line runs out of the dialog
+    // and pushes the close button off the panel. The line is shown here, wrapped, in the style
+    // `Dialog` gives it, until the Rune bump (#107) lets it go back to `Dialog::description`
+    // (which also gives the dialog its accessibility description).
+    let line = format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference());
+    let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0).mt(PUBLISH_LINE_RAISE);
+    body = body.child(text(line).font(k.ty.ui.lh(20.0)).color(k.c.text_muted).wrap());
     if let Some(plan) = &publish.plan {
         let mut list = col().key("publish-drafts").w_full().gap(8.0);
         for (thread, kept) in plan.kept.iter().map(|t| (t, true)).chain(plan.discarded.iter().map(|t| (t, false))) {
@@ -1376,7 +1496,6 @@ fn publish_dialog(k: &Kit, s: &State, window_height: Option<f32>, layer: &mut Ve
             ),
     );
     Dialog::new("publish", "Publish review")
-        .description(format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference()))
         .open(true)
         .width(620.0)
         .fit()
@@ -1522,8 +1641,9 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let verdict = tab.actions.verdict.map(|verdict| match verdict {
         VerdictAction::Approve => Button::new("Approve")
             .variant(ButtonVariant::Contrast)
-            .on_press(move |s: &mut State| s.act(&verdict_id, Service::approve))
-            .build(k),
+            .on_press(move |s: &mut State| s.approve(verdict_id.clone()))
+            .build(k)
+            .key("approve"),
         VerdictAction::TakeTurnBack => Button::new("Take Turn back")
             .variant(ButtonVariant::Outline)
             .on_press(move |s: &mut State| s.act(&verdict_id, Service::take_turn_back))
@@ -1547,9 +1667,11 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .fill(k.c.layer_01)
         .child(text(session.branch().to_owned()).font(k.ty.mono).color(k.c.text_base))
         .child(text(base).font(k.ty.mono).color(k.c.text_muted))
+        .child(changeset_totals(k, tab))
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
+        .children(thread_nav::buttons(k, tab))
         .child(layout_control(k, tab))
         .children(view_select)
         .child(
@@ -1605,6 +1727,50 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
                     })
                     .build(k)
                     .key("end-confirm-end"),
+            ),
+    )
+}
+
+/// Asks the human to confirm approving a Session that holds unsent Drafts or reopened Threads,
+/// which the agent then never receives. Cancel keeps everything, so the Round can still go over.
+fn approve_confirm(k: &Kit, s: &State, tab: &SessionTab) -> Option<El> {
+    let session = &tab.session;
+    let items = tab.actions.discarded_by_approving;
+    if s.confirming_approve.as_ref() != Some(&session.id) || items == 0 {
+        return None;
+    }
+    let (noun, verb) = if items == 1 { ("item", "is") } else { ("items", "are") };
+    let question = format!(
+        "Approve without handing over? {items} unsent {noun} {verb} discarded: the agent only gets the Verdict."
+    );
+    let id = session.id.clone();
+    Some(
+        row()
+            .key("approve-confirm")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .gap(12.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(question).font(k.ty.ui).color(k.c.text_base))
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.confirming_approve = None)
+                    .build(k)
+                    .key("approve-confirm-cancel"),
+            )
+            .child(
+                Button::new("Approve")
+                    .variant(ButtonVariant::Danger)
+                    .on_press(move |s: &mut State| {
+                        s.confirming_approve = None;
+                        s.act(&id, Service::approve);
+                    })
+                    .build(k)
+                    .key("approve-confirm-approve"),
             ),
     )
 }
@@ -1724,6 +1890,11 @@ fn push_banner(k: &Kit, tab: &SessionTab) -> El {
     )
 }
 
+/// The key of the diff view of Session `id`, under which Rune keys its scroll viewport.
+fn diff_key(id: &SessionId) -> String {
+    format!("diff-{id}")
+}
+
 /// The Session's diff, with each file's Comment and Viewed controls and its Threads under their
 /// lines. The diff view finds its state by Session id, as it outlives this call. Its handlers
 /// can run after the Session's tab is gone (see `State::spare_diff`); they then do nothing.
@@ -1732,6 +1903,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     let id_mut = id.clone();
     let id_header = id.clone();
     let id_comment = id.clone();
+    let id_layout = id.clone();
     let kc = k.clone();
     // The Stack Changeset is for reading only: no "+" on its lines, no Comment on a file.
     let read_only = tab.session.stack_changeset_selected();
@@ -1744,7 +1916,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             None => &mut s.spare_diff,
         },
     )
-    .key(format!("diff-{}", tab.session.id))
+    .key(diff_key(&tab.session.id))
     .header_actions(move |s: &State, file: usize| {
         let Some(tab) = s.tab(&id_header) else { return row() };
         let Some(change) = tab.session.shown().files.get(file) else { return row() };
@@ -1792,6 +1964,11 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         }
     })
     .build(s, k)
+    .on_layout(move |s: &mut State, rect: [f32; 4]| {
+        if let Some(tab) = s.tab_mut(&id_layout) {
+            tab.viewport = Some(rect);
+        }
+    })
 }
 
 /// Says the Stack Changeset shown is only part of what the Stack changes, when the Forge cut it
@@ -1814,12 +1991,33 @@ fn stack_changeset_error(k: &Kit, error: &str) -> El {
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
 /// and the composer when it's writing one.
 fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
-    // Outdated File Threads show with the other Outdated Threads instead.
-    let general = |t: &Thread| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. });
-    let threads: Vec<&Thread> = tab.session.threads_shown().iter().filter(|t| general(t)).collect();
+    let threads = general_thread_list(&tab.session);
     let composing = s.composer.as_ref().is_some_and(|c| c.session == tab.session.id && c.at.is_none());
     if threads.is_empty() && !composing {
         return col();
+    }
+    // The composer is in the section, so it stays open while the human writes in it.
+    let folded = tab.general_folded && !composing;
+    let session = tab.session.id.clone();
+    let header = row()
+        .key("general-header")
+        .w_full()
+        .px(16.0)
+        .py(4.0)
+        .gap(8.0)
+        .items_center()
+        .child(text(format!("General Threads · {}", threads.len())).font(k.ty.small).color(k.c.text_faint))
+        .child(row().grow(1.0))
+        // While the composer is in the section it stays open, so a Hide would do nothing.
+        .children((!composing).then(|| {
+            Button::new(if folded { "Show" } else { "Hide" })
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.toggle_general_folded(&session))
+                .build(k)
+                .key("general-toggle")
+        }));
+    if folded {
+        return col().w_full().child(header);
     }
     let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
     for thread in threads {
@@ -1828,7 +2026,21 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     if composing {
         list = list.child(composer(k, s));
     }
-    col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list)
+    col()
+        .w_full()
+        .child(header)
+        .child(col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list))
+}
+
+/// The Threads of `session` that show in the General Threads section.
+fn general_thread_list(session: &SessionView) -> Vec<&Thread> {
+    // Outdated File Threads show with the other Outdated Threads instead.
+    session.threads_shown().iter().filter(|t| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. })).collect()
+}
+
+/// How many Comments each General Thread of `session` holds.
+fn general_comment_counts(session: &SessionView) -> Vec<(&ThreadId, usize)> {
+    general_thread_list(session).into_iter().map(|t| (&t.id, t.comments.len())).collect()
 }
 
 /// What shows under a line of the displayed Session's diff: the composer, or the Thread `a` names.
@@ -2106,6 +2318,35 @@ fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El 
     card
 }
 
+/// Whether `key` is Escape in a Comment field whose `text` is empty or whitespace only: the
+/// composer then closes as its Discard button does. Rune keeps Escape from a field's key handler
+/// during an input method composition, so it never gets here then.
+fn escape_on_empty(key: &KeyEvent, text: &TextEdit) -> bool {
+    key.key == Key::Escape && text.text.trim().is_empty()
+}
+
+/// The key handler of a composer's text area: Escape in an empty one discards the composer, by
+/// `close`. `text` is the area's text in the state.
+fn discard_on_escape(
+    text: fn(&State) -> &TextEdit,
+    close: fn(&mut State),
+) -> impl Fn(&mut State, &KeyEvent, &mut Tx) -> bool + 'static {
+    move |s: &mut State, key: &KeyEvent, _: &mut Tx| {
+        let discard = escape_on_empty(key, text(s));
+        if discard {
+            close(s);
+        }
+        discard
+    }
+}
+
+/// A text field that already has the keyboard focus, for a composer that has just opened.
+fn focused_edit(text: impl Into<String>) -> TextEdit {
+    let mut edit = TextEdit::new(text);
+    edit.focused = true;
+    edit
+}
+
 /// The reply being written in a Thread: a Draft until the Round is handed over.
 fn reply_composer(k: &Kit, s: &State) -> El {
     col()
@@ -2119,6 +2360,7 @@ fn reply_composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.reply_text)
                 .on_submit(|s: &mut State, _| s.save_reply())
+                .on_key(discard_on_escape(|s| &s.reply_text, State::close_reply))
                 .build(k),
         )
         .child(
@@ -2227,6 +2469,7 @@ fn composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.composer_text)
                 .on_submit(|s: &mut State, _| s.save_draft())
+                .on_key(discard_on_escape(|s| &s.composer_text, State::close_composer))
                 .build(k),
         )
         .child(
@@ -2265,9 +2508,21 @@ fn composer_title(s: &State) -> String {
     }
 }
 
-fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+/// The window's key handler: Ctrl+F (Cmd+F) opens Search, and the diff's keys (and `n`/`p` for
+/// the Threads) move the diff unless a field has the keys. Public so tests can drive it in Rune's headless `Runtime`.
+pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if search::is_open_chord(ev) {
+        return s.open_search();
+    }
+    if ev.key == rune::Key::Escape && s.close_displayed_search() {
+        return true;
+    }
+    if s.search_has_focus() {
+        return false;
+    }
     // The Rendered view covers the diff, whose keys must not move it underneath.
-    s.displayed_tab_mut().filter(|t| t.rendered.is_none()).is_some_and(|t| t.diff.key(ev, tx))
+    let Some(tab) = s.displayed_tab_mut().filter(|t| t.rendered.is_none()) else { return false };
+    tab.diff.key(ev, tx) || thread_nav::on_key(s, ev, tx)
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
@@ -2592,6 +2847,21 @@ fn scene_publish_many(s: &mut State) {
     for n in 10..30 {
         plan.kept.push(sample_thread(&format!("T{n}"), n..=n, "Another Draft, so the list outgrows the window.", None));
     }
+}
+
+/// `--scene publish-long`: the Publish dialog of `--scene publish`, on a Pull Request whose host
+/// and repository are long enough for the dialog's line to outgrow it.
+fn scene_publish_long(s: &mut State) {
+    scene_publish(s);
+    let Some(tab) = s.tabs.first() else { return };
+    let mut session = tab.session.clone();
+    let Source::PullRequest(pr) = &mut session.source else { return };
+    pr.id = PullRequestRef {
+        host: "github.enterprise.engineering.example-corporation.com".into(),
+        repo: "platform-engineering/kubernetes-cluster-configuration-and-deployment-manifests".into(),
+        number: 4821,
+    };
+    s.apply(scene_window(vec![session], None));
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
