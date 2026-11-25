@@ -70,7 +70,8 @@ enum Command {
     /// Exits 1 on error. After `draft` on this branch, it hands your Drafts to the human
     /// instead: a Round holds their questions, and `Closed: …` ends the co-review. With
     /// `--pr <url>`, hand your Drafts on that Pull Request to the human: `Published with the
-    /// Verdict …` gives the Verdict and the review's link.
+    /// Verdict …` gives the Verdict and the review's link; on a Stack of Pull Requests, `Published: …`
+    /// lists each one.
     Review(ReviewArgs),
     /// Reply to a Thread of this branch's Session (or with `--pr`, of that Pull Request's),
     /// e.g. `akshually reply T3 "Done: …"`. The human sees it at once; returns immediately.

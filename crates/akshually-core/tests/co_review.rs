@@ -196,7 +196,7 @@ fn the_co_reviewers_review_call_hands_its_drafts_to_the_human_and_returns_what_w
     assert!(pending.wait_timeout(Duration::from_millis(50)).is_none(), "blocks until the human is done");
     svc.keep_draft(&ThreadRef::new(&id, &thread)).unwrap();
     let url = svc.publish(&id, Verdict::Approve, "").unwrap();
-    assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url }));
+    assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url, pull_requests: vec![] }));
     assert!(svc.sessions().is_empty(), "the Session ends once the co-Reviewer has its outcome");
 }
 
@@ -209,7 +209,7 @@ fn a_co_review_the_human_publishes_before_the_agent_asks_is_kept_for_its_review_
     let url = svc.publish(&id, Verdict::Approve, "LGTM").unwrap();
 
     let pending = svc.review(ReviewRequest::pull_request(URL)).unwrap();
-    assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url }));
+    assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::Approve, url, pull_requests: vec![] }));
     assert!(svc.sessions().is_empty());
 }
 
@@ -239,7 +239,7 @@ fn closing_or_abandoning_a_co_review_tells_the_co_reviewer_it_was_abandoned() {
 
         end(&svc, &id).unwrap();
 
-        assert_eq!(pending.wait(), Some(Outcome::Abandoned));
+        assert_eq!(pending.wait(), Some(Outcome::Abandoned { pull_requests: vec![] }));
         assert!(svc.sessions().is_empty());
         assert!(published.lock().unwrap().is_empty());
     }
@@ -329,7 +329,10 @@ fn the_co_reviewer_answers_questions_in_their_threads_and_its_next_review_call_i
     );
     svc.keep_draft(&ThreadRef::new(&id, &questioned)).unwrap();
     let url = svc.publish(&id, Verdict::RequestChanges, "").unwrap();
-    assert_eq!(pending.wait(), Some(Outcome::Published { verdict: Verdict::RequestChanges, url }));
+    assert_eq!(
+        pending.wait(),
+        Some(Outcome::Published { verdict: Verdict::RequestChanges, url, pull_requests: vec![] })
+    );
     let bodies: Vec<_> = published.lock().unwrap()[0].comments.iter().map(|c| c.body.clone()).collect();
     assert_eq!(bodies, vec!["Validate the state."], "the questions and answers stay between the two");
 }

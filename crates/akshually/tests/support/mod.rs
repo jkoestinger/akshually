@@ -61,6 +61,16 @@ impl HostedApp {
         Self::serving(Service::new().with_forges(vec![Box::new(FakeForge)]))
     }
 
+    /// An app serving the Pull Requests of `forges`.
+    pub(crate) fn with_forges(forges: Vec<Box<dyn ForgeAdapter>>) -> Self {
+        Self::serving(Service::new().with_forges(forges))
+    }
+
+    /// An app serving [`StackForge`]'s Stack of two Pull Requests.
+    pub(crate) fn with_stack() -> Self {
+        Self::with_forges(vec![Box::new(StackForge)])
+    }
+
     fn serving(service: Service) -> Self {
         let dirs = TestDirs::new();
         let service = Arc::new(service);
@@ -169,6 +179,82 @@ impl ForgeAdapter for FakeForge {
 
     fn publish(&self, _: &PullRequest, _: &Review) -> Result<String, ForgeError> {
         Ok(format!("{PR_URL}#pullrequestreview-1"))
+    }
+}
+
+pub(crate) fn stack_url(number: u64) -> String {
+    format!("https://forge.test/acme/web/pull/{number}")
+}
+
+pub(crate) fn stack_pr_ref(number: u64) -> PullRequestRef {
+    PullRequestRef { host: "forge.test".into(), repo: "acme/web".into(), number }
+}
+
+/// A Forge with the Stack `#1 <- #2` (branches `a` and `b`, on `main`).
+pub(crate) struct StackForge;
+
+fn stack_branches(number: u64) -> (&'static str, &'static str) {
+    match number {
+        1 => ("a", "main"),
+        _ => ("b", "a"),
+    }
+}
+
+impl ForgeAdapter for StackForge {
+    fn host(&self) -> &str {
+        "forge.test"
+    }
+
+    fn recognise(&self, url: &str) -> Option<PullRequestRef> {
+        let number = url.strip_prefix("https://forge.test/acme/web/pull/")?;
+        Some(stack_pr_ref(number.split(['/', '#']).next()?.parse().ok()?))
+    }
+
+    fn pull_request(&self, id: &PullRequestRef) -> Result<PullRequest, ForgeError> {
+        let (head, base) = stack_branches(id.number);
+        Ok(PullRequest {
+            id: id.clone(),
+            url: stack_url(id.number),
+            title: format!("Pull Request {}", id.number),
+            author: "maria".into(),
+            head_branch: head.into(),
+            head_sha: format!("head{}", id.number),
+            base_sha: format!("base{}", id.number),
+            base_branch: base.into(),
+            from_fork: false,
+        })
+    }
+
+    fn open_with_head_branch(&self, _: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        let found = [1, 2].into_iter().filter(|n| stack_branches(*n).0 == branch);
+        found.map(|n| self.pull_request(&stack_pr_ref(n))).collect()
+    }
+
+    fn open_with_target_branch(&self, _: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        let found = [1, 2].into_iter().filter(|n| stack_branches(*n).1 == branch);
+        found.map(|n| self.pull_request(&stack_pr_ref(n))).collect()
+    }
+
+    fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
+        let path = format!("f{}.rs", pr.id.number);
+        let files = vec![FileChange::text(&path, Some("fn a() {}\n"), Some("fn a() {\n    b();\n}\n"))];
+        Ok(Changeset { base: pr.base_sha.clone(), files })
+    }
+
+    fn threads(&self, _: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
+        Ok(Vec::new())
+    }
+
+    fn viewer(&self) -> Result<String, ForgeError> {
+        Ok("me".into())
+    }
+
+    fn verdicts(&self, _: &PullRequest, _: bool) -> Result<Vec<Verdict>, ForgeError> {
+        Ok(Verdict::ALL.to_vec())
+    }
+
+    fn publish(&self, pr: &PullRequest, _: &Review) -> Result<String, ForgeError> {
+        Ok(format!("{}#review", pr.url))
     }
 }
 

@@ -37,12 +37,12 @@ impl Service {
     /// Agent, as co-Reviewer: hands its Drafts on the Pull Request at `url` to the human, and
     /// waits for what the human Published, or Abandoned (see `review`).
     pub(super) fn co_review(&self, url: &str, ack: bool) -> Result<PendingReview, Error> {
-        let (id, member) = self.open_pull_request_session(url, Some(Role::CoReviewer))?;
+        let (id, _) = self.open_pull_request_session(url, Some(Role::CoReviewer))?;
         let (tx, rx) = mpsc::channel();
         let mut inner = self.lock();
         let at = inner.position(&id)?;
         inner.next_waiter += 1;
-        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack, member: Some(member) };
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack };
         let waiter_id = waiter.id;
         let session = &mut inner.sessions[at];
         if session.waiter.is_some() {
@@ -543,5 +543,15 @@ pub(super) fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Th
         .collect();
     let forge = Some(ForgeThread { id: remote.id, resolved: remote.resolved_by.is_some() });
     let resolved = remote.resolved_by.map(Party::Other);
-    Thread { id: ThreadId::new(""), anchor, excerpt, comments, resolved, outdated, reopened: false, forge }
+    Thread {
+        id: ThreadId::new(""),
+        anchor,
+        excerpt,
+        comments,
+        resolved,
+        outdated,
+        reopened: false,
+        forge,
+        pull_request: None,
+    }
 }
