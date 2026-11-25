@@ -252,6 +252,8 @@ impl Updater {
         }
         let new_target = to.join(BUNDLE_BINARY);
         let tmp = link.with_file_name(".akshually.new");
+        // Clears a leftover from an earlier failed attempt, which would make `symlink` fail; if
+        // there is none, or it can't be removed, `symlink` below reports what matters.
         let _ = fs::remove_file(&tmp);
         let result = std::os::unix::fs::symlink(&new_target, &tmp).and_then(|()| fs::rename(&tmp, link));
         if let Err(error) = result {
