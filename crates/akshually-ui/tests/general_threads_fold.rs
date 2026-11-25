@@ -88,7 +88,7 @@ fn a_session_opened_with_a_general_thread_shows_the_section_expanded_with_its_co
 }
 
 #[test]
-fn hiding_the_section_leaves_only_its_header_row_and_showing_brings_the_threads_back() {
+fn hiding_the_section_leaves_only_its_header_row() {
     let (_repo, _service, _id, mut rt) = review_with_a_general_draft();
 
     press(&mut rt, "general-toggle");
@@ -96,6 +96,12 @@ fn hiding_the_section_leaves_only_its_header_row_and_showing_brings_the_threads_
     assert!(!shows(&rt, "Needs a second look."), "the Thread still shows");
     assert!(rt.find("general-scroll").is_none(), "the scroll area still shows");
     assert!(texts_within(&rt, "general-header").iter().any(|t| t == "Show"), "the header doesn't offer Show");
+}
+
+#[test]
+fn showing_a_hidden_section_brings_the_threads_back() {
+    let (_repo, _service, _id, mut rt) = review_with_a_general_draft();
+    press(&mut rt, "general-toggle");
 
     press(&mut rt, "general-toggle");
 

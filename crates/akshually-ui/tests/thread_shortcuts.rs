@@ -103,13 +103,22 @@ fn lines_in_view(rt: &Runtime<State>) -> Vec<u32> {
 }
 
 #[test]
-fn n_scrolls_to_the_next_thread_below_the_view_and_p_to_the_previous_one_above_it() {
+fn n_scrolls_to_the_next_thread_below_the_view() {
     let repo = repo_with_a_long_change();
     let (_service, _id, mut rt) = review_with_three_threads(&repo);
     type_text(&mut rt, "n");
-    assert_eq!(lines_in_view(&rt), [5], "the first `n` didn't go to the first Thread");
+
     type_text(&mut rt, "n");
-    assert_eq!(lines_in_view(&rt), [50]);
+
+    assert_eq!(lines_in_view(&rt), [50], "the second `n` didn't go to the next Thread");
+}
+
+#[test]
+fn p_scrolls_to_the_previous_thread_above_the_view() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    type_text(&mut rt, "n");
+    type_text(&mut rt, "n");
 
     type_text(&mut rt, "p");
 
