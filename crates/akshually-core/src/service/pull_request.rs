@@ -4,13 +4,15 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::handoff::{Call, Waiter};
+use super::stack::{detect_stack, free_run, joined_session};
 use super::{
-    ChangesetView, Ending, PendingReview, Role, Service, Session, SessionId, SessionView, Source, Turn, Verdict,
+    ChangesetView, Member, PendingReview, PublishedReview, Role, Service, Session, SessionId, SessionView, Source,
+    Turn, Verdict,
 };
 use crate::forge::{
     ForgeAdapter, PullRequest, PullRequestRef, RemoteAnchor, RemoteThread, Review, ReviewComment, ReviewReply,
 };
-use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, ForgeThread, Party, Thread, ThreadId, drafts_in};
 use crate::{Changeset, Error};
 
 impl Service {
@@ -61,9 +63,9 @@ impl Service {
         })
     }
 
-    /// The Session of the Pull Request at `url`, opened if needed. The human (`agent: None`)
-    /// gets it displayed; an agent joins it in its `role`, and a Session it opens starts in
-    /// the agent's Turn, out of the human's way.
+    /// The Session of the Pull Request at `url`, opened if needed, with the Stack it is in. The
+    /// human (`agent: None`) gets it displayed, on that Member; an agent joins it in its `role`,
+    /// and a Session it opens starts in the agent's Turn, out of the human's way.
     pub(super) fn open_pull_request_session(
         &self,
         url: &str,
@@ -74,12 +76,10 @@ impl Service {
             .iter()
             .find_map(|forge| Some((forge, forge.recognise(url)?)))
             .ok_or_else(|| Error::NotAPullRequest(url.to_owned()))?;
-        let open = |sessions: &[Session]| {
-            let mut sessions = sessions.iter();
-            sessions.find(|s| s.view.pull_request().is_some_and(|p| p.id == pr)).map(|s| s.view.id.clone())
-        };
+        let open = |sessions: &[Session]| sessions.iter().find(|s| s.view.has_member(&pr)).map(|s| s.view.id.clone());
         let found = |id: SessionId| -> Result<(SessionId, PullRequestRef), Error> {
             if agent.is_none() {
+                self.select_member(&id, &pr)?;
                 self.display(&id)?;
             }
             Ok((id, pr.clone()))
@@ -91,9 +91,33 @@ impl Service {
         }
 
         // Not holding the lock: the Forge may take a while.
-        let pull_request = forge.pull_request(&pr)?;
-        let changeset = forge.changeset(&pull_request)?;
-        let remote = forge.threads(&pull_request)?;
+        let opened = forge.pull_request(&pr)?;
+        let stack = detect_stack(forge.as_ref(), &opened)?;
+        // Two open Sessions never merge: the Stack stops at a Pull Request with a Session, and a
+        // Pull Request next to a Stack that has one joins it.
+        let owner = |sessions: &[Session], p: &PullRequestRef| {
+            sessions.iter().find(|s| s.view.has_member(p)).map(|s| s.view.id.clone())
+        };
+        let joined = joined_session(&stack, &pr, |p| owner(&self.lock().sessions, p));
+        if let Some(session) = joined {
+            self.follow_stack(&session, true);
+            // A Stack stops below a fork: the Session may not take it after all.
+            if open(&self.lock().sessions) == Some(session.clone()) {
+                return found(session);
+            }
+        }
+        let stack = {
+            let inner = self.lock();
+            free_run(stack, &pr, |p| owner(&inner.sessions, p).is_some())
+        };
+        let mut fetched = Vec::new();
+        for member in stack {
+            // The listings that found the Stack's other Pull Requests leave out their commits.
+            let member = forge.complete(member)?;
+            let changeset = forge.changeset(&member)?;
+            let remote = forge.threads(&member)?;
+            fetched.push((member, changeset, remote));
+        }
 
         let mut inner = self.lock();
         // Another call may have opened it meanwhile.
@@ -101,28 +125,33 @@ impl Service {
             drop(inner);
             return found(id);
         }
-        let threads: Vec<Thread> = remote
-            .into_iter()
-            .map(|t| existing_thread(t, &changeset))
-            .enumerate()
-            .map(|(i, thread)| Thread { id: ThreadId::new(format!("T{}", i + 1)), ..thread })
-            .collect();
         inner.next_id += 1;
         let id = SessionId::new(format!("s{}", inner.next_id));
-        let view = SessionView {
+        let mut session = Session::default();
+        let members: Vec<Member> = fetched
+            .into_iter()
+            .map(|(member, changeset, remote)| {
+                let threads: Vec<Thread> =
+                    remote.into_iter().map(|t| existing_thread(t, &changeset)).map(|t| session.numbered(t)).collect();
+                Member::new(member, changeset, threads)
+            })
+            .collect();
+        let selected = members.iter().position(|m| m.pull_request.id == pr).unwrap_or(0);
+        session.view = SessionView {
             id: id.clone(),
-            source: Source::PullRequest(pull_request),
-            changeset,
+            source: Source::PullRequest(members[selected].pull_request.clone()),
             view: ChangesetView::Full,
             round: 1,
-            threads,
+            members,
+            selected,
+            opened: Some(pr.clone()),
             agent,
             // The human drafts until Publish; an agent that opens it is still reviewing.
             turn: if agent.is_some() { Turn::Agent } else { Turn::Human },
             ..SessionView::default()
         };
-        let threads_opened = view.threads.len() as u32;
-        inner.sessions.push(Session { view, threads_opened, ..Session::default() });
+        session.view.swap_in(selected);
+        inner.sessions.push(session);
         if agent.is_none() {
             inner.window.display_session(&id);
         }
@@ -130,9 +159,10 @@ impl Service {
         Ok((id, pr))
     }
 
-    /// Human: Publishes the Session's kept Drafts, `summary` (markdown, may be empty) and
-    /// `verdict` to the Forge as one review, and returns its web page. The Session then has
-    /// its Verdict, and the human closes it. Blocks on the Forge.
+    /// Human: Publishes the kept Drafts of the Member shown, `summary` (markdown, may be empty)
+    /// and `verdict` to its Pull Request as one review, and returns its web page. The Member
+    /// then has its Verdict and takes no more Drafts; the Session goes on with the others, and
+    /// ends once every Member is Published, which the human then closes. Blocks on the Forge.
     pub fn publish(&self, id: &SessionId, verdict: Verdict, summary: &str) -> Result<String, Error> {
         let (pr, drafts) = {
             let mut inner = self.lock();
@@ -153,24 +183,29 @@ impl Service {
         inner.sessions[at].publishing = false;
         let url = sent?;
         let session = &mut inner.sessions[at];
-        let view = &mut session.view;
-        // Only what was sent: the human may have drafted more meanwhile.
-        for sent in &drafts.kept {
-            let Some(thread) = view.threads.iter_mut().find(|t| t.id == sent.id) else { continue };
-            for comment in thread.comments.iter_mut().filter(|c| c.is_draft()).take(sent.comments.len()) {
-                comment.round = Some(view.round);
+        // The human may have shown another Member meanwhile: it's this one that was sent.
+        let member = session.view.member_position(&pr.id).ok_or_else(|| Error::NotInStack(pr.id.to_string()))?;
+        session.at_member(member, |session| {
+            let view = &mut session.view;
+            // Only what was sent: the human may have drafted more meanwhile.
+            for sent in &drafts.kept {
+                let Some(thread) = view.threads.iter_mut().find(|t| t.id == sent.id) else { continue };
+                for comment in thread.comments.iter_mut().filter(|c| c.is_draft()).take(sent.comments.len()) {
+                    comment.round = Some(view.round);
+                }
             }
-        }
-        // The Forge now has them as they were sent, whatever the human did meanwhile.
-        let changed = drafts.resolve.iter().map(|t| (t, true)).chain(drafts.reopen.iter().map(|t| (t, false)));
-        for (sent, resolved) in changed {
-            let thread = view.threads.iter_mut().find(|t| t.id == sent.id);
-            if let Some(forge) = thread.and_then(|t| t.forge.as_mut()) {
-                forge.resolved = resolved;
+            // The Forge now has them as they were sent, whatever the human did meanwhile.
+            let changed = drafts.resolve.iter().map(|t| (t, true)).chain(drafts.reopen.iter().map(|t| (t, false)));
+            for (sent, resolved) in changed {
+                let thread = view.threads.iter_mut().find(|t| t.id == sent.id);
+                if let Some(forge) = thread.and_then(|t| t.forge.as_mut()) {
+                    forge.resolved = resolved;
+                }
             }
-        }
-        // A co-Reviewer learns what went out; without one, the human closes the Session.
-        session.conclude(Ending::Published { verdict, url: url.clone() });
+            view.published = Some(PublishedReview { verdict, url: url.clone() });
+        });
+        // A co-Reviewer learns what went out once the Session ends; without one, the human closes it.
+        session.end_when_published();
         inner.reap();
         inner.inbox.published(&pr.id);
         inner.notify();
@@ -212,27 +247,42 @@ impl Service {
     /// reload (`SessionView::pull_request_update`) without touching the Changeset. A Forge that
     /// can't be reached offers nothing this time. Blocks on the Forges.
     pub fn check_pull_requests(&self) {
-        let open: Vec<(SessionId, PullRequest)> = self
+        let open: Vec<(SessionId, Vec<PullRequest>)> = self
             .lock()
             .sessions
             .iter()
-            .filter_map(|s| Some((s.view.id.clone(), s.view.pull_request()?.clone())))
+            .map(|s| {
+                (s.view.id.clone(), s.view.stack().into_iter().filter(|m| m.in_stack).map(|m| m.pull_request).collect())
+            })
+            .filter(|(_, members): &(SessionId, Vec<PullRequest>)| !members.is_empty())
             .collect();
-        for (id, pr) in open {
-            // Not holding the lock: the Forge may take a while.
-            let Some(forge) = self.forge_for(&pr) else { continue };
-            let Ok(update) = forge.update(&pr) else { continue };
-            let mut inner = self.lock();
-            let Ok(at) = inner.position(&id) else { continue };
-            let view = &mut inner.sessions[at].view;
-            // Reloaded meanwhile: the answer is about a head the Session no longer shows.
-            if view.pull_request().map(|p| &p.head_sha) != Some(&pr.head_sha) {
-                continue;
+        for (id, members) in open {
+            for pr in members {
+                // Not holding the lock: the Forge may take a while.
+                let Some(forge) = self.forge_for(&pr) else { continue };
+                let Ok(update) = forge.update(&pr) else { continue };
+                let mut inner = self.lock();
+                let Ok(at) = inner.position(&id) else { break };
+                let session = &mut inner.sessions[at];
+                let Some(member) = session.view.member_position(&pr.id) else { continue };
+                let changed = session.at_member(member, |session| {
+                    let view = &mut session.view;
+                    // Reloaded meanwhile: the answer is about a head the Session no longer shows.
+                    if view.pull_request().map(|p| &p.head_sha) != Some(&pr.head_sha)
+                        || view.pull_request_update == update
+                    {
+                        return false;
+                    }
+                    view.pull_request_update = update;
+                    true
+                });
+                if changed {
+                    inner.notify();
+                }
             }
-            if view.pull_request_update != update {
-                view.pull_request_update = update;
-                inner.notify();
-            }
+            // Pull Requests came and went, perhaps.
+            self.follow_stack(&id, false);
+            self.refresh_stack_changeset(&id);
         }
     }
 
@@ -247,11 +297,17 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        session.refresh(changeset, None, false);
-        merge_threads(session, remote);
-        session.view.source = Source::PullRequest(now);
-        session.view.pull_request_update = None;
+        let member = session.view.member_position(&pr.id).ok_or_else(|| Error::NotInStack(pr.id.to_string()))?;
+        session.at_member(member, |session| {
+            session.refresh(changeset, None, false);
+            merge_threads(session, remote);
+            session.view.source = Source::PullRequest(now);
+            session.view.pull_request_update = None;
+        });
         inner.notify();
+        drop(inner);
+        self.follow_stack(id, false);
+        self.refresh_stack_changeset(id);
         Ok(())
     }
 
@@ -269,7 +325,7 @@ impl Service {
     }
 
     /// The adapter serving `pr`.
-    fn forge_for(&self, pr: &PullRequest) -> Option<&dyn ForgeAdapter> {
+    pub(super) fn forge_for(&self, pr: &PullRequest) -> Option<&dyn ForgeAdapter> {
         self.forges.iter().map(|f| f.as_ref()).find(|f| f.recognise(&pr.url).as_ref() == Some(&pr.id))
     }
 }
@@ -280,13 +336,16 @@ fn is_own(forge: &dyn ForgeAdapter, pr: &PullRequest) -> Result<bool, Error> {
     Ok(forge.viewer()?.eq_ignore_ascii_case(&pr.author))
 }
 
-/// A Pull Request Session's Pull Request and Drafts, unless it has ended.
+/// The Pull Request shown and its Drafts, unless the Session has ended or it was Published.
 fn drafts(view: &SessionView) -> Result<(PullRequest, Drafts), Error> {
     let Some(pr) = view.pull_request().cloned() else {
         return Err(Error::InvalidRequest(format!("Session {} isn't a Pull Request: only one is published", view.id)));
     };
     if view.ended.is_some() {
         return Err(Error::Ended);
+    }
+    if view.is_published() {
+        return Err(Error::AlreadyPublished);
     }
     Ok((pr, Drafts::of(view)))
 }
@@ -392,9 +451,14 @@ fn forge_change(thread: &Thread) -> Option<ForgeChange> {
 
 impl SessionView {
     /// Whether the Session holds something not Published: a Draft (the human's, or the
-    /// co-Reviewer's not kept yet), or a Thread resolved or reopened here but not on the Forge.
+    /// co-Reviewer's not kept yet), or a Thread resolved or reopened here but not on the Forge,
+    /// in a Member that wasn't Published.
     pub(super) fn has_unpublished(&self) -> bool {
-        self.drafts() > 0 || self.threads.iter().any(|t| forge_change(t).is_some())
+        let shown = self.selected;
+        let mut parked = self.members.iter().enumerate().filter(|(at, m)| *at != shown && m.published.is_none());
+        let unpublished =
+            |threads: &[Thread]| threads.iter().any(|t| forge_change(t).is_some()) || drafts_in(threads) > 0;
+        (!self.is_published() && unpublished(&self.threads)) || parked.any(|(_, m)| unpublished(&m.threads))
     }
 }
 
@@ -465,8 +529,7 @@ fn merge_threads(session: &mut Session, remote: Vec<RemoteThread>) {
                 *thread = Thread { id: thread.id.clone(), comments, resolved, reopened: thread.reopened, ..now };
             }
             None => {
-                session.threads_opened += 1;
-                threads.push(Thread { id: ThreadId::new(format!("T{}", session.threads_opened)), ..now });
+                threads.push(Thread { id: session.next_thread_id(), ..now });
             }
         }
     }
@@ -476,7 +539,7 @@ fn merge_threads(session: &mut Session, remote: Vec<RemoteThread>) {
 /// A Thread already on the Forge, as a Session Thread (numbered by the caller). The excerpt is
 /// the anchored code, or for a Thread the Forge says is outdated, the diff it kept for it; such
 /// a Thread is Outdated here too.
-fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
+pub(super) fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
     let anchor = match remote.anchor {
         RemoteAnchor::Lines { path, side, start, end } => Anchor::Lines { path, side, start, end },
         RemoteAnchor::File { path } => Anchor::File { path },
@@ -492,5 +555,15 @@ fn existing_thread(remote: RemoteThread, changeset: &Changeset) -> Thread {
         .collect();
     let forge = Some(ForgeThread { id: remote.id, resolved: remote.resolved_by.is_some() });
     let resolved = remote.resolved_by.map(Party::Other);
-    Thread { id: ThreadId::new(""), anchor, excerpt, comments, resolved, outdated, reopened: false, forge }
+    Thread {
+        id: ThreadId::new(""),
+        anchor,
+        excerpt,
+        comments,
+        resolved,
+        outdated,
+        reopened: false,
+        forge,
+        pull_request: None,
+    }
 }

@@ -1,0 +1,11 @@
+[
+  {
+    "number": 481,
+    "html_url": "https://github.com/acme/web/pull/481",
+    "title": "Add the session store",
+    "user": { "login": "maria" },
+    "state": "open",
+    "head": { "ref": "session-store", "sha": "headA", "repo": { "full_name": "acme/web" } },
+    "base": { "ref": "main", "sha": "baseA", "repo": { "full_name": "acme/web" } }
+  }
+]

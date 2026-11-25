@@ -164,7 +164,7 @@ impl Session {
     fn delivered(&mut self, outcome: &Outcome) {
         match outcome {
             Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
-            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } | Outcome::Closed => {
+            Outcome::Approved | Outcome::Abandoned { .. } | Outcome::Published { .. } | Outcome::Closed => {
                 self.finished = true
             }
         }
@@ -178,7 +178,7 @@ impl Session {
             return;
         }
         self.queued.clear();
-        self.queued.push(ending.into());
+        self.queued.push(ending.into_outcome(self.view.member_outcomes()));
         self.deliver();
     }
 }

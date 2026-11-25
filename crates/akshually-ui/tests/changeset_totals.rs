@@ -209,6 +209,8 @@ impl ForgeAdapter for FakeForge {
             head_branch: "sso".into(),
             head_sha: "headsha".into(),
             base_sha: "basesha".into(),
+            base_branch: "main".into(),
+            ..PullRequest::default()
         })
     }
 

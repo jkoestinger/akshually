@@ -9,6 +9,8 @@
   "updated_at": "2026-11-12T08:15:30.123Z",
   "target_branch": "main",
   "source_branch": "rotate-creds",
+  "source_project_id": 42,
+  "target_project_id": 42,
   "author": { "id": 7, "username": "tom", "name": "Tom" },
   "draft": false,
   "sha": "head1",

@@ -32,9 +32,24 @@ pub trait ForgeAdapter: Send + Sync {
     /// The Pull Request's current metadata.
     fn pull_request(&self, pr: &PullRequestRef) -> Result<PullRequest, ForgeError>;
 
+    /// `pr` from a listing (`open_with_head_branch`, `open_with_target_branch`) with whatever the
+    /// listing left out, which the Changeset needs: its commits. Costs a request for a Forge
+    /// whose listings are partial, so it is asked only of a Pull Request that joins a Stack.
+    fn complete(&self, pr: PullRequest) -> Result<PullRequest, ForgeError> {
+        Ok(pr)
+    }
+
     /// The Pull Request's Changeset at `pr.head_sha`, as whole old and new texts per file,
     /// against the merge-base (what the Forge's own diff shows).
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError>;
+
+    /// The Changeset between two commits of `repo` (`owner/repo`): what `head` changes against
+    /// `base`, as a Pull Request's Changeset has it. The Stack Changeset is this, from the
+    /// bottom Member's base to the top Member's head. `Unsupported` for a Forge with no way to
+    /// ask. Blocks on the network.
+    fn changeset_between(&self, _repo: &str, _base: &str, _head: &str) -> Result<Comparison, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "compare two commits" })
+    }
 
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
@@ -49,6 +64,21 @@ pub trait ForgeAdapter: Send + Sync {
     /// Sends `review` to `pr` as one review under the human's name, against `pr.head_sha`, and
     /// returns its web page. On failure nothing is left half-published.
     fn publish(&self, pr: &PullRequest, review: &Review) -> Result<String, ForgeError>;
+
+    /// The open Pull Requests of `repo` (`owner/repo`) whose head branch is `branch`, which the
+    /// Stack of one asking to merge into `branch` is built from. Those from a fork are included,
+    /// marked `from_fork`. `Unsupported` for a Forge with no way to ask: its Pull Requests are
+    /// then Stacks of one. Blocks on the network.
+    fn open_with_head_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "find Pull Requests by branch" })
+    }
+
+    /// The open Pull Requests of `repo` asking to merge into `branch`, those from a fork
+    /// included, marked `from_fork`. `Unsupported` for a Forge with no way to ask. Blocks on the
+    /// network.
+    fn open_with_target_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "find Pull Requests by branch" })
+    }
 
     /// What was pushed to the Pull Request since `pr` was fetched: `None` while its head is
     /// still `pr.head_sha`. Cheap enough to poll; adapters may answer from a conditional request.
@@ -70,6 +100,22 @@ pub trait ForgeAdapter: Send + Sync {
     }
 }
 
+/// What a Forge says two commits differ by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comparison {
+    pub changeset: Changeset,
+    /// Why the Changeset is only part of the comparison, when the Forge cut it short; `None` when
+    /// it is whole.
+    pub cut_off: Option<String>,
+}
+
+impl Comparison {
+    /// A comparison the Forge gave whole.
+    pub fn whole(changeset: Changeset) -> Self {
+        Comparison { changeset, cut_off: None }
+    }
+}
+
 /// An open Pull Request in the human's Inbox.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxItem {
@@ -84,7 +130,18 @@ pub struct InboxItem {
     pub created_at: i64,
     /// Seconds since the Unix epoch. Any activity changes it: pushes, comments, labels.
     pub updated_at: i64,
-    pub role: InboxRole,
+    /// Why the Forge listed it for the human; `None` for a Member of a Stack that it didn't.
+    #[serde(default)]
+    pub role: Option<InboxRole>,
+    /// The branch it asks to merge into, which Stack detection starts from.
+    #[serde(default)]
+    pub base_branch: String,
+    /// Its head branch.
+    #[serde(default)]
+    pub head_branch: String,
+    /// Its head branch lives in another repository (a fork).
+    #[serde(default)]
+    pub from_fork: bool,
     /// It meets its approval requirement, by the Forge's own measure; one approval when the
     /// project has none.
     #[serde(default)]
@@ -92,6 +149,30 @@ pub struct InboxItem {
     /// The human gave a Verdict on it since their review was last requested.
     #[serde(default)]
     pub verdict_given: bool,
+}
+
+impl InboxItem {
+    /// Whether it is done with, so the Inbox leaves it out unless a Session holds it: the Pull
+    /// Request is approved, or the human gave a Verdict on it.
+    pub fn done(&self) -> bool {
+        self.approved || self.verdict_given
+    }
+
+    /// The Pull Request as far as the listing says: enough for Stack detection, with no commits.
+    pub(crate) fn pull_request(&self) -> PullRequest {
+        PullRequest {
+            id: self.id.clone(),
+            url: self.url.clone(),
+            title: self.title.clone(),
+            author: self.author.clone(),
+            head_branch: self.head_branch.clone(),
+            base_branch: self.base_branch.clone(),
+            from_fork: self.from_fork,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            ..PullRequest::default()
+        }
+    }
 }
 
 /// Why a Pull Request is in the Inbox.
@@ -181,8 +262,8 @@ pub struct PullRequestUpdate {
     pub commits: Option<u32>,
 }
 
-/// Names one Pull Request: a Pull Request Session's identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Names one Pull Request: a Member of a Pull Request Session's Stack.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PullRequestRef {
     /// The Forge's web host, as configured (`github.com`, `github.example.com`).
     pub host: String,
@@ -198,7 +279,7 @@ impl std::fmt::Display for PullRequestRef {
 }
 
 /// A Pull Request's metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub id: PullRequestRef,
     /// The Pull Request's web page.
@@ -212,6 +293,20 @@ pub struct PullRequest {
     /// The target branch's commit the Pull Request was compared against when fetched: its tip
     /// on GitHub, the merge-base on GitLab (`diff_refs.base_sha`).
     pub base_sha: String,
+    /// The branch it asks to merge into, which a Pull Request on top of it has as its head
+    /// branch (ADR 0004). Empty in a Session saved before Stacks.
+    #[serde(default)]
+    pub base_branch: String,
+    /// Its head branch lives in another repository (a fork), so no other Pull Request of this
+    /// repository is stacked on it through that branch's name.
+    #[serde(default)]
+    pub from_fork: bool,
+    /// Seconds since the Unix epoch, as the Forge says.
+    #[serde(default)]
+    pub created_at: i64,
+    /// Seconds since the Unix epoch. Any activity changes it: pushes, comments, labels.
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl PullRequest {

@@ -177,7 +177,7 @@ fn confirming_the_close_of_local_works_tab_abandons_it() {
 
     press(&mut rt, "end-confirm-end");
 
-    assert_eq!(pending.wait_timeout(Duration::from_secs(5)), Some(Outcome::Abandoned));
+    assert_eq!(pending.wait_timeout(Duration::from_secs(5)), Some(Outcome::Abandoned { pull_requests: vec![] }));
 }
 
 const PR_URL: &str = "https://forge.test/acme/web/pull/7";
@@ -207,6 +207,9 @@ impl ForgeAdapter for FakeForge {
             head_branch: "sso".into(),
             head_sha: "headsha".into(),
             base_sha: "basesha".into(),
+            base_branch: "main".into(),
+            from_fork: false,
+            ..Default::default()
         })
     }
 

@@ -25,6 +25,9 @@ fn pr() -> PullRequest {
         head_branch: "sso".into(),
         head_sha: "headsha".into(),
         base_sha: "basesha".into(),
+        base_branch: "main".into(),
+        from_fork: false,
+        ..Default::default()
     }
 }
 
@@ -140,6 +143,7 @@ fn thread(id: &str, comments: Vec<Comment>) -> Thread {
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     }
 }
 

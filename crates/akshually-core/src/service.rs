@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, PullRequestUpdate};
 use crate::store::Store;
-use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
+use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId, drafts_in};
 use crate::update::Updater;
 use crate::{Error, Notification, Notifier, Settings, git, reanchor};
 
@@ -22,14 +22,18 @@ mod drafts;
 mod handoff;
 mod inbox;
 mod pull_request;
+mod stack;
+mod stack_changeset;
 mod threads;
 mod update;
 mod window;
 
 pub use actions::{EndAction, HandOver, SessionActions, ThreadActions, VerdictAction};
 pub use handoff::{CancelReview, PendingReview};
-pub use inbox::{InboxRow, InboxRowState, InboxView};
+pub use inbox::{InboxRow, InboxRowState, InboxStack, InboxStanding, InboxView};
 pub use pull_request::PublishPlan;
+pub use stack::{Member, MemberView, PublishedReview};
+pub use stack_changeset::StackChangeset;
 pub use update::{UpdateStage, UpdateView};
 pub use window::{DiffLayout, Displayed, WindowView};
 
@@ -78,12 +82,38 @@ pub enum Outcome {
     /// The Verdict: the human approved the agent's local work.
     Approved,
     /// The human closed the Session without a Verdict; the agent should stop.
-    Abandoned,
+    Abandoned {
+        /// What became of each Pull Request of a Stack of more than one; empty otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pull_requests: Vec<MemberOutcome>,
+    },
     /// The human Published their Review of a Pull Request with `verdict`; `url` is the review
-    /// on the Forge.
-    Published { verdict: Verdict, url: String },
+    /// on the Forge. Of a Stack, they are the topmost Published Member's.
+    Published {
+        verdict: Verdict,
+        url: String,
+        /// What became of each Pull Request of a Stack of more than one, in Stack order; empty
+        /// otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pull_requests: Vec<MemberOutcome>,
+    },
     /// The human closed a co-review of local work, which has no Verdict: a normal end.
     Closed,
+}
+
+/// What became of one Pull Request of a Stack when its Session ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberOutcome {
+    /// How the agent names it, as its Forge does: `acme/web #482`, `platform/infra !97`.
+    pub name: String,
+    /// Its web page.
+    pub url: String,
+    /// The Verdict of its Review, when the human Published it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    /// Its Review on the Forge, when the human Published it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
 }
 
 /// How a Session ended: the [`Outcome`]s that end it, which a Round never does. It becomes
@@ -103,12 +133,13 @@ pub enum Ending {
     Closed,
 }
 
-impl From<Ending> for Outcome {
-    fn from(ending: Ending) -> Self {
-        match ending {
+impl Ending {
+    /// What the agent receives for this Ending, with what became of each Pull Request of a Stack.
+    pub(super) fn into_outcome(self, pull_requests: Vec<MemberOutcome>) -> Outcome {
+        match self {
             Ending::Approved => Outcome::Approved,
-            Ending::Abandoned => Outcome::Abandoned,
-            Ending::Published { verdict, url } => Outcome::Published { verdict, url },
+            Ending::Abandoned => Outcome::Abandoned { pull_requests },
+            Ending::Published { verdict, url } => Outcome::Published { verdict, url, pull_requests },
             Ending::Closed => Outcome::Closed,
         }
     }
@@ -347,6 +378,20 @@ pub struct SessionView {
     /// New commits pushed to the Pull Request since its Changeset was fetched. Offered as a
     /// reload, never applied: `None` means nothing to reload.
     pub pull_request_update: Option<PullRequestUpdate>,
+    /// A Pull Request Session's Stack, bottom to top: the Review of each Member, parked while
+    /// another is shown (`SessionView::stack` lists them). Empty for local work. The fields
+    /// above hold the Review of the Member `selected`, whose slot here is stale.
+    pub members: Vec<Member>,
+    /// The position in `members` of the Member shown.
+    pub selected: usize,
+    /// What Publish sent for the Member shown, once it did: it takes no more Drafts.
+    pub published: Option<PublishedReview>,
+    /// The Pull Request the Session was opened on, which names its tab; `None` before Stacks,
+    /// when it is the one shown.
+    pub opened: Option<PullRequestRef>,
+    /// The Stack Changeset, for a Stack of two or more (`offers_stack_changeset`). Not saved.
+    #[serde(skip)]
+    pub stack_changeset: StackChangeset,
 }
 
 impl SessionView {
@@ -387,11 +432,31 @@ impl SessionView {
 
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
+        if self.stack_changeset_selected() {
+            return self.stack_changeset.shown();
+        }
+        self.member_changeset()
+    }
+
+    /// The Changeset of the Member shown that its Changeset view picks, which the Stack
+    /// Changeset takes the place of in the Window while it is selected.
+    fn member_changeset(&self) -> &Changeset {
         match (self.view, &self.since_session_base, &self.since_last_round) {
             (ChangesetView::SinceSessionBase, Some(since), _) => since,
             (ChangesetView::SinceLastRound, _, Some(since)) => since,
             _ => &self.changeset,
         }
+    }
+
+    /// Whether Threads can be started on the Changeset shown, and the Member's own are shown on
+    /// it: not on the Stack Changeset, which is for reading only.
+    pub fn takes_threads(&self) -> bool {
+        !self.stack_changeset_selected()
+    }
+
+    /// The Threads shown with the Changeset shown: the Member's, and none on the Stack Changeset.
+    pub fn threads_shown(&self) -> &[Thread] {
+        if self.takes_threads() { &self.threads } else { &[] }
     }
 
     /// The Changeset views the Session has, in the order to offer them: the changes since the
@@ -408,7 +473,7 @@ impl SessionView {
     pub fn mark(&self) -> Option<SessionMark> {
         if self.attention {
             Some(SessionMark::Attention)
-        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() {
+        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() || self.parked_update() {
             Some(SessionMark::ReloadOffered)
         } else if self.turn == Turn::Agent {
             Some(SessionMark::AgentsTurn)
@@ -417,13 +482,21 @@ impl SessionView {
         }
     }
 
-    /// The Changeset Threads are anchored in: the shown one, except since the last Round,
-    /// where the old side is that Round's code rather than a base and files the agent left
-    /// alone are hidden, so Threads stay anchored in the full Changeset.
+    /// Whether a Member that isn't shown received pushes.
+    fn parked_update(&self) -> bool {
+        let shown = self.selected;
+        self.members.iter().enumerate().any(|(at, m)| at != shown && m.pull_request_update.is_some())
+    }
+
+    /// The Changeset the Member's Threads are anchored in: the one its Changeset view shows,
+    /// except since the last Round, where the old side is that Round's code rather than a base
+    /// and files the agent left alone are hidden, so Threads stay anchored in the full
+    /// Changeset. Never the Stack Changeset: a Member's Threads follow its own code whatever the
+    /// human is looking at.
     pub fn anchored_in(&self) -> &Changeset {
         match self.view {
             ChangesetView::SinceLastRound => &self.changeset,
-            _ => self.shown(),
+            _ => self.member_changeset(),
         }
     }
 
@@ -450,14 +523,14 @@ impl SessionView {
             Anchor::Lines { path: on, .. } | Anchor::File { path: on } => on == path,
             Anchor::Review => false,
         };
-        self.threads.iter().filter(|t| t.resolved.is_none()).filter(on_file).count()
+        self.threads_shown().iter().filter(|t| t.resolved.is_none()).filter(on_file).count()
     }
 
     /// Where each current line Thread sits in the shown Changeset: under its last line. Outdated
     /// Threads, and Threads on lines not shown, have no place.
     pub fn placed_threads(&self) -> Vec<PlacedThread> {
         let shown = self.shown();
-        let placed = self.threads.iter().filter(|t| !t.outdated).filter_map(|t| {
+        let placed = self.threads_shown().iter().filter(|t| !t.outdated).filter_map(|t| {
             let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
             if *side == Side::Old && !self.old_side_shown() {
                 return None;
@@ -479,6 +552,9 @@ impl SessionView {
     /// in the shown Changeset's file at `file`. A selection running across sides anchors to its
     /// last line alone. `None` where no Thread can go.
     pub fn anchor_for_selection(&self, file: usize, start: (Side, u32), end: (Side, u32)) -> Option<Anchor> {
+        if !self.takes_threads() {
+            return None;
+        }
         let path = self.shown().files.get(file)?.path.clone();
         let side = end.0;
         if side == Side::Old && !self.old_side_shown() {
@@ -492,7 +568,14 @@ impl SessionView {
     /// anchored in (`InvalidAnchor`), and a Forge takes line Comments only within its diff's
     /// hunks (`OutsideDiff`).
     pub fn check_anchor(&self, anchor: &Anchor) -> Result<(), Error> {
+        self.check_takes_threads()?;
         self.excerpt_at(anchor).map(drop)
+    }
+
+    /// Refuses a Thread started by the human while the Stack Changeset is shown. An agent's Draft
+    /// isn't: its URL names a Member, whatever the human is looking at.
+    pub(super) fn check_takes_threads(&self) -> Result<(), Error> {
+        if self.takes_threads() { Ok(()) } else { Err(Error::StackChangesetReadOnly) }
     }
 
     /// Where a Comment can go when the Forge refuses `anchor`'s lines: their whole file. `None`
@@ -525,18 +608,25 @@ impl SessionView {
 
     /// How many Drafts the Session holds: the human's, and the co-Reviewer's not kept yet.
     pub fn drafts(&self) -> usize {
-        self.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
+        drafts_in(&self.threads)
     }
 
-    /// The Session's name, as its tab shows it: `repo · branch` for local work, `acme/web #482`
-    /// for a Pull Request.
+    /// The Session's name, as its tab shows it: `repo · branch` for local work; for Pull
+    /// Requests the one opened, `acme/web #482`, and the size of its Stack when it has more than
+    /// one Member.
     pub fn title(&self) -> String {
         match &self.source {
             Source::Local { repo, branch } => {
                 let name = repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into());
                 format!("{name} · {branch}")
             }
-            Source::PullRequest(pr) => pr.reference(),
+            Source::PullRequest(pr) => {
+                let reference = self.opened_pull_request().unwrap_or(pr).reference();
+                match self.members.len() {
+                    0 | 1 => reference,
+                    members => format!("{reference} · Stack of {members}"),
+                }
+            }
         }
     }
 }
@@ -606,15 +696,20 @@ struct Session {
     /// the same again means nothing new to offer.
     #[serde(skip)]
     disk_checked: Option<disk::DiskCheck>,
+    /// When the Stack was last looked up on the Forge, so the next check can skip it.
+    #[serde(skip)]
+    stack_lookup: Option<stack::StackLookup>,
 }
 
 impl Session {
     /// Opens a Thread at `anchor` whose first Comment is `author`'s Draft `comment` (already
     /// checked with `check_comment`).
     fn open_thread(&mut self, anchor: Anchor, comment: NewComment, author: Party) -> Result<ThreadId, Error> {
+        if self.view.is_published() {
+            return Err(Error::AlreadyPublished);
+        }
         let excerpt = self.view.excerpt_at(&anchor)?;
-        self.threads_opened += 1;
-        let thread = ThreadId::new(format!("T{}", self.threads_opened));
+        let thread = self.next_thread_id();
         let NewComment { body, suggestion } = comment;
         self.view.threads.push(Thread {
             id: thread.clone(),
@@ -625,6 +720,7 @@ impl Session {
             outdated: false,
             reopened: false,
             forge: None,
+            pull_request: None,
         });
         Ok(thread)
     }
@@ -729,6 +825,12 @@ impl Inner {
         }
     }
 
+    /// What each Session holds: its Pull Requests, those that left the Stack included.
+    fn holdings(&self) -> Vec<(SessionId, Vec<PullRequestRef>)> {
+        let members = |s: &Session| s.view.stack().into_iter().map(|m| m.pull_request.id).collect();
+        self.sessions.iter().map(|s| (s.view.id.clone(), members(s))).collect()
+    }
+
     fn position(&self, id: &SessionId) -> Result<usize, Error> {
         self.sessions.iter().position(|s| &s.view.id == id).ok_or_else(|| Error::UnknownSession(id.clone()))
     }
@@ -807,6 +909,7 @@ impl Service {
             if session.view.pull_request().is_none() && session.view.agent.is_none() {
                 session.view.agent = Some(Role::Author);
             }
+            session.view.restore_stack();
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
         inner.inbox = store.load_inbox();
@@ -985,6 +1088,8 @@ impl Service {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let view = &mut inner.sessions[at].view;
+        // The files on the Window are the Stack Changeset's, not the Member's.
+        view.check_takes_threads()?;
         if !view.changeset.files.iter().any(|f| f.path == path) {
             return Err(Error::NotInChangeset(path.to_owned()));
         }
@@ -1042,7 +1147,11 @@ impl Service {
                 (Source::Local { .. }, _) => {
                     return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
                 }
-                (Source::PullRequest(_), Some(_)) => Some(Ending::Abandoned),
+                // Published if at least one Member was, whatever the others did.
+                (Source::PullRequest(_), Some(_)) => Some(match session.view.last_published() {
+                    Some(PublishedReview { verdict, url }) => Ending::Published { verdict, url },
+                    None => Ending::Abandoned,
+                }),
                 (Source::PullRequest(_), None) => None,
             };
             if let Some(ending) = ending {

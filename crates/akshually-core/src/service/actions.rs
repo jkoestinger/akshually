@@ -101,7 +101,8 @@ impl SessionView {
             let items = self.to_hand_over();
             HandOver { items, offered: items > 0 && yours && !ended }
         });
-        let threads = self.threads.iter().map(|t| thread_actions(t, ended)).collect();
+        // A Published Member takes no more of anything.
+        let threads = self.threads.iter().map(|t| thread_actions(t, ended || self.is_published())).collect();
         let discarded_by_approving = if verdict == Some(VerdictAction::Approve) { self.to_hand_over() } else { 0 };
         SessionActions { verdict, discarded_by_approving, end, hand_over, threads }
     }
@@ -155,6 +156,9 @@ impl SessionView {
             self.threads.iter().find(|t| &t.id == thread).ok_or_else(|| Error::UnknownThread(thread.clone()))?;
         if self.ended.is_some() {
             return Err(Error::Ended);
+        }
+        if self.is_published() {
+            return Err(Error::AlreadyPublished);
         }
         Ok(thread_actions(found, false))
     }

@@ -10,6 +10,10 @@
     "author": { "id": 7, "username": "tom", "name": "Tom" },
     "draft": false,
     "sha": "head1",
+    "source_branch": "rotate-creds",
+    "target_branch": "main",
+    "source_project_id": 42,
+    "target_project_id": 42,
     "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/97",
     "references": { "short": "!97", "relative": "!97", "full": "platform/infra!97" }
   },

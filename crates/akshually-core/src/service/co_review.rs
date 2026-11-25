@@ -21,9 +21,12 @@ impl Service {
     ) -> Result<ThreadId, Error> {
         let comment = comment.into();
         check_comment(&anchor, &comment)?;
-        let id = match source.into() {
-            SourceRef::PullRequest(url) => self.open_pull_request_session(&url, Some(Role::CoReviewer))?.0,
-            SourceRef::Local(cwd) => self.open_local_co_review(&cwd)?,
+        let (id, member) = match source.into() {
+            SourceRef::PullRequest(url) => {
+                let (id, member) = self.open_pull_request_session(&url, Some(Role::CoReviewer))?;
+                (id, Some(member))
+            }
+            SourceRef::Local(cwd) => (self.open_local_co_review(&cwd)?, None),
         };
         let mut inner = self.lock();
         let at = inner.position(&id)?;
@@ -32,7 +35,9 @@ impl Service {
             return Err(Error::Ended);
         }
         session.join(Role::CoReviewer)?;
-        let thread = session.open_thread(anchor, comment, Party::Agent)?;
+        // The Review of the Pull Request its URL names, whichever Member the human shows.
+        let member = member.and_then(|pr| session.view.member_position(&pr)).unwrap_or(session.view.selected);
+        let thread = session.at_member(member, |session| session.open_thread(anchor, comment, Party::Agent))?;
         inner.notify();
         Ok(thread)
     }

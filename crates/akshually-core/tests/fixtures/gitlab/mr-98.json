@@ -1,0 +1,13 @@
+{
+  "iid": 98,
+  "project_id": 42,
+  "title": "Fork fix",
+  "state": "opened",
+  "target_branch": "vault",
+  "source_branch": "fix",
+  "source_project_id": 77,
+  "target_project_id": 42,
+  "author": { "id": 9, "username": "outsider", "name": "Out" },
+  "web_url": "https://gitlab.example.com/platform/infra/-/merge_requests/98",
+  "diff_refs": { "base_sha": "mb8", "head_sha": "head8", "start_sha": "target8" }
+}

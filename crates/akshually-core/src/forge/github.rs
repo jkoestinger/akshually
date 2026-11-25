@@ -12,8 +12,9 @@ use ureq::{Body, RequestBuilder};
 use url::Url;
 
 use super::{
-    CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole, PullRequest,
-    PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review, epoch_seconds, fetch_files,
+    Comparison, CredentialSources, FileFetch, ForgeAdapter, ForgeError, ForgeKind, HostConfig, InboxItem, InboxRole,
+    PullRequest, PullRequestRef, PullRequestUpdate, RemoteAnchor, RemoteComment, RemoteThread, Review, epoch_seconds,
+    fetch_files,
     http::{Client, Dialect, host_matches, not_found_as},
     with_suggestion,
 };
@@ -21,6 +22,9 @@ use crate::{Changeset, Hunk, Side, Verdict};
 
 /// Pages of up to this many items, GitHub's maximum.
 const PAGE: &str = "100";
+
+/// The most files GitHub lists for a comparison of two commits, whatever the paging.
+const COMPARE_FILE_LIMIT: usize = 300;
 
 /// The REST API version every request asks for.
 const API_VERSION: &str = "2022-11-28";
@@ -133,8 +137,8 @@ impl GitHub {
     }
 
     /// A file's contents at `sha`.
-    fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
-        let mut url = self.client.endpoint(&repo_segments(pr, &["contents"]));
+    fn file(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
+        let mut url = self.client.endpoint(&repo_segments(repo, &["contents"]));
         url.path_segments_mut().expect("the API base is a URL with a path").extend(path.split('/'));
         url.query_pairs_mut().append_pair("ref", sha);
         let request = self.client.agent().get(url.as_str());
@@ -157,12 +161,85 @@ impl GitHub {
         Ok(())
     }
 
+    /// The open Pull Requests of `repo` whose `filter` (`head` or `base`) is `value`: the first
+    /// page of them, which is far more than one branch has.
+    fn open_pull_requests(&self, repo: &str, filter: &str, value: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        let mut url = self.client.endpoint(&repo_segments(repo, &["pulls"]));
+        url.query_pairs_mut().append_pair("state", "open").append_pair(filter, value).append_pair("per_page", PAGE);
+        let pulls: Vec<Pull> = self.get_json(url.as_str())?;
+        let host = self.client.host();
+        Ok(pulls
+            .into_iter()
+            .map(|pull| {
+                let id = PullRequestRef { host: host.to_owned(), repo: repo.to_owned(), number: pull.number };
+                pull.into_pull_request(&id)
+            })
+            .collect())
+    }
+
+    /// Every page of the list at `url`, following its `Link` headers. Blocks on the network.
+    fn pages<T: DeserializeOwned>(&self, url: &str) -> Result<Vec<T>, ForgeError> {
+        let mut next = Some(url.to_owned());
+        let mut pages = Vec::new();
+        while let Some(url) = next.take() {
+            // Only ever send the token to this host's API.
+            if !url.starts_with(&format!("{}/", self.client.api())) {
+                return Err(self.client.unexpected(format!("a page link leads off the API: {url}")));
+            }
+            let mut response = self.get(&url, "application/vnd.github+json")?;
+            next = next_page(&response);
+            pages.push(response.body_mut().read_json().map_err(|e| self.client.unexpected(e))?);
+        }
+        Ok(pages)
+    }
+
+    /// The Changeset of `listed` files of `repo`, from the merge-base `base` to `head`, with
+    /// their contents on both sides read from the Forge.
+    fn files_changeset(
+        &self,
+        repo: &str,
+        listed: Vec<ChangedFile>,
+        base: String,
+        head: &str,
+    ) -> Result<Changeset, ForgeError> {
+        // Like the local Source, renames are a deletion plus an addition. Line comments must
+        // fit GitHub's own diff, so each file keeps its hunks.
+        let mut fetches = Vec::new();
+        for file in listed {
+            let hunks = file.patch.as_deref().map(Hunk::parse_patch);
+            let path = file.filename;
+            let fetch = |old: Option<&String>, new: Option<&String>, hunks| FileFetch {
+                path: new.or(old).cloned().unwrap_or_default(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks,
+            };
+            match file.status.as_str() {
+                "added" | "copied" => fetches.push(fetch(None, Some(&path), hunks)),
+                "removed" => fetches.push(fetch(Some(&path), None, hunks)),
+                "renamed" => {
+                    // GitHub shows the renamed file only: none of the old path's lines, and of
+                    // the new path's only those its patch changes.
+                    let previous = file.previous_filename.unwrap_or_else(|| path.clone());
+                    fetches.push(fetch(Some(&previous), None, Some(Vec::new())));
+                    fetches.push(fetch(None, Some(&path), Some(hunks.unwrap_or_default())));
+                }
+                "unchanged" => {}
+                _ => fetches.push(fetch(Some(&path), Some(&path), hunks)),
+            }
+        }
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files =
+            fetch_files(&fetches, |path, side| self.file(repo, path, if side == Side::Old { &base } else { head }))?;
+        Ok(Changeset { base, files })
+    }
+
     fn lock_polls(&self) -> std::sync::MutexGuard<'_, HashMap<PullRequestRef, Polled>> {
         self.polls.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn pull_url(&self, pr: &PullRequestRef) -> Url {
-        self.client.endpoint(&repo_segments(pr, &["pulls", &pr.number.to_string()]))
+        self.client.endpoint(&repo_segments(&pr.repo, &["pulls", &pr.number.to_string()]))
     }
 
     /// How many commits `new` is ahead of `old`; `None` when GitHub can't say, as after a
@@ -173,19 +250,47 @@ impl GitHub {
             ahead_by: u32,
         }
         let range = format!("{old}...{new}");
-        let url = self.client.endpoint(&repo_segments(pr, &["compare", &range]));
+        let url = self.client.endpoint(&repo_segments(&pr.repo, &["compare", &range]));
         self.get_json::<Compare>(url.as_str()).ok().map(|c| c.ahead_by)
     }
+}
+
+/// A comparison of two commits, as far as the merge-base goes.
+#[derive(Deserialize)]
+struct Compare {
+    merge_base_commit: Commit,
+}
+
+#[derive(Deserialize)]
+struct Commit {
+    sha: String,
+}
+
+/// A file a Pull Request or a comparison changes, as GitHub lists it.
+#[derive(Deserialize)]
+struct ChangedFile {
+    filename: String,
+    status: String,
+    previous_filename: Option<String>,
+    /// GitHub's diff of the file; none for a binary file or a huge diff.
+    patch: Option<String>,
 }
 
 /// A Pull Request as GitHub's REST API answers it.
 #[derive(Deserialize)]
 struct Pull {
+    /// Only the list answers it; the one Pull Request is asked for by its number.
+    #[serde(default)]
+    number: u64,
     html_url: String,
     title: String,
     user: User,
     head: Ref,
     base: Ref,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
 }
 
 #[derive(Deserialize)]
@@ -198,10 +303,25 @@ struct Ref {
     #[serde(rename = "ref")]
     name: String,
     sha: String,
+    /// The repository the branch is in; null once a fork was deleted.
+    #[serde(default)]
+    repo: Option<Repo>,
+}
+
+#[derive(Deserialize)]
+struct Repo {
+    full_name: String,
 }
 
 impl Pull {
     fn into_pull_request(self, pr: &PullRequestRef) -> PullRequest {
+        // A head repository other than the base's, or none left, is a fork. An answer that
+        // names neither says nothing, so it isn't one.
+        let from_fork = match (&self.head.repo, &self.base.repo) {
+            (Some(head), Some(base)) => !head.full_name.eq_ignore_ascii_case(&base.full_name),
+            (None, Some(_)) => true,
+            _ => false,
+        };
         PullRequest {
             id: pr.clone(),
             url: self.html_url,
@@ -210,6 +330,11 @@ impl Pull {
             head_branch: self.head.name,
             head_sha: self.head.sha,
             base_sha: self.base.sha,
+            base_branch: self.base.name,
+            from_fork,
+            // A time GitHub doesn't give, or in a form not understood, is no time.
+            created_at: epoch_seconds(&self.created_at).unwrap_or(0),
+            updated_at: epoch_seconds(&self.updated_at).unwrap_or(0),
         }
     }
 }
@@ -220,9 +345,9 @@ fn with_headers<B>(request: RequestBuilder<B>, accept: &str) -> RequestBuilder<B
 }
 
 /// `repos/OWNER/REPO` followed by `rest`.
-fn repo_segments<'a>(pr: &'a PullRequestRef, rest: &[&'a str]) -> Vec<&'a str> {
+fn repo_segments<'a>(repo: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
     let mut segments = vec!["repos"];
-    segments.extend(pr.repo.split('/'));
+    segments.extend(repo.split('/'));
     segments.extend(rest);
     segments
 }
@@ -263,77 +388,48 @@ impl ForgeAdapter for GitHub {
         Ok(pull.into_pull_request(pr))
     }
 
+    fn open_with_head_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        // `head` takes `owner:branch`, which leaves out the same branch name in other owners' forks.
+        let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+        self.open_pull_requests(repo, "head", &format!("{owner}:{branch}"))
+    }
+
+    fn open_with_target_branch(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
+        self.open_pull_requests(repo, "base", branch)
+    }
+
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
-        #[derive(Deserialize)]
-        struct Compare {
-            merge_base_commit: Commit,
-        }
-        #[derive(Deserialize)]
-        struct Commit {
-            sha: String,
-        }
-        #[derive(Deserialize)]
-        struct File {
-            filename: String,
-            status: String,
-            previous_filename: Option<String>,
-            /// GitHub's diff of the file; none for a binary file or a huge diff.
-            patch: Option<String>,
-        }
         let id = &pr.id;
         // `base.sha` is the base branch's tip; GitHub's diff is against the merge-base.
         let range = format!("{}...{}", pr.base_sha, pr.head_sha);
         let compare: Compare =
-            self.get_json(self.client.endpoint(&repo_segments(id, &["compare", &range])).as_str())?;
-        let base = compare.merge_base_commit.sha;
+            self.get_json(self.client.endpoint(&repo_segments(&id.repo, &["compare", &range])).as_str())?;
 
         let number = id.number.to_string();
-        let mut url = self.client.endpoint(&repo_segments(id, &["pulls", &number, "files"]));
+        let mut url = self.client.endpoint(&repo_segments(&id.repo, &["pulls", &number, "files"]));
         url.query_pairs_mut().append_pair("per_page", PAGE);
-        let mut next = Some(url.to_string());
-        let mut listed = Vec::new();
-        while let Some(url) = next.take() {
-            // Only ever send the token to this host's API.
-            if !url.starts_with(&format!("{}/", self.client.api())) {
-                return Err(self.client.unexpected(format!("a page link leads off the API: {url}")));
-            }
-            let mut response = self.get(&url, "application/vnd.github+json")?;
-            next = next_page(&response);
-            let page: Vec<File> = response.body_mut().read_json().map_err(|e| self.client.unexpected(e))?;
-            listed.extend(page);
-        }
+        let pages: Vec<Vec<ChangedFile>> = self.pages(url.as_str())?;
+        let listed = pages.into_iter().flatten().collect();
+        self.files_changeset(&id.repo, listed, compare.merge_base_commit.sha, &pr.head_sha)
+    }
 
-        // Like the local Source, renames are a deletion plus an addition. Line comments must
-        // fit GitHub's own diff, so each file keeps its hunks.
-        let mut fetches = Vec::new();
-        for file in listed {
-            let hunks = file.patch.as_deref().map(Hunk::parse_patch);
-            let path = file.filename;
-            let fetch = |old: Option<&String>, new: Option<&String>, hunks| FileFetch {
-                path: new.or(old).cloned().unwrap_or_default(),
-                old: old.cloned(),
-                new: new.cloned(),
-                hunks,
-            };
-            match file.status.as_str() {
-                "added" | "copied" => fetches.push(fetch(None, Some(&path), hunks)),
-                "removed" => fetches.push(fetch(Some(&path), None, hunks)),
-                "renamed" => {
-                    // GitHub shows the renamed file only: none of the old path's lines, and of
-                    // the new path's only those its patch changes.
-                    let previous = file.previous_filename.unwrap_or_else(|| path.clone());
-                    fetches.push(fetch(Some(&previous), None, Some(Vec::new())));
-                    fetches.push(fetch(None, Some(&path), Some(hunks.unwrap_or_default())));
-                }
-                "unchanged" => {}
-                _ => fetches.push(fetch(Some(&path), Some(&path), hunks)),
-            }
+    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Comparison, ForgeError> {
+        /// A comparison: the merge-base and its files.
+        #[derive(Deserialize)]
+        struct Answer {
+            merge_base_commit: Commit,
+            #[serde(default)]
+            files: Vec<ChangedFile>,
         }
-        fetches.sort_by(|a, b| a.path.cmp(&b.path));
-        let files = fetch_files(&fetches, |path, side| {
-            self.file(id, path, if side == Side::Old { &base } else { &pr.head_sha })
-        })?;
-        Ok(Changeset { base, files })
+        let range = format!("{base}...{head}");
+        // One request: the files come with the first page only, up to `COMPARE_FILE_LIMIT` for
+        // the whole comparison, and the pages after it only add commits.
+        let url = self.client.endpoint(&repo_segments(repo, &["compare", &range]));
+        let answer: Answer = self.get_json(url.as_str())?;
+        let cut_off = (answer.files.len() >= COMPARE_FILE_LIMIT)
+            .then(|| format!("GitHub lists at most {COMPARE_FILE_LIMIT} files of a comparison"));
+        let changeset = self.files_changeset(repo, answer.files, answer.merge_base_commit.sha, head)?;
+        Ok(Comparison { changeset, cut_off })
     }
 
     fn update(&self, pr: &PullRequest) -> Result<Option<PullRequestUpdate>, ForgeError> {
@@ -493,6 +589,12 @@ impl GitHub {
             updated_at: String,
             author: Option<GqlActor>,
             repository: Repository,
+            #[serde(default)]
+            head_ref_name: String,
+            #[serde(default)]
+            base_ref_name: String,
+            #[serde(default)]
+            is_cross_repository: bool,
             /// Null when the project requires no review.
             review_decision: Option<String>,
             /// Each reviewer's latest Approve or Request changes.
@@ -541,7 +643,10 @@ impl GitHub {
                     author: pr.author.map_or_else(|| "ghost".to_owned(), |u| u.login),
                     created_at: time(&pr.created_at)?,
                     updated_at: time(&pr.updated_at)?,
-                    role,
+                    role: Some(role),
+                    head_branch: pr.head_ref_name,
+                    base_branch: pr.base_ref_name,
+                    from_fork: pr.is_cross_repository,
                     approved,
                     verdict_given: role == InboxRole::Assignee && reviewed,
                 })
@@ -648,6 +753,7 @@ const INBOX_QUERY: &str = "query($q: String!) {
     nodes {
       ... on PullRequest {
         number title url createdAt updatedAt author { login } repository { nameWithOwner }
+        headRefName baseRefName isCrossRepository
         reviewDecision
         latestOpinionatedReviews(first: 100) { nodes { state } }
         viewerDidAuthor viewerLatestReview { state }
