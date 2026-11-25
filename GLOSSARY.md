@@ -20,6 +20,10 @@ _Avoid_: Diff mode, view (a Changeset view is which Changeset is shown, not how)
 A markdown file of a Changeset shown as rendered text over the diff, its changed lines tinted. For reading only: it has no Threads.
 _Avoid_: Preview
 
+**Search**:
+Finding text in the code of the Changeset a Session shows, moving from one match to the next. It does not look in Threads.
+_Avoid_: Find, filter
+
 **Window**:
 The one app window: it shows the Inbox or one Session at a time, with one Diff layout for all of them. When the Session it shows goes away, it shows the Inbox.
 _Avoid_: Screen, app
