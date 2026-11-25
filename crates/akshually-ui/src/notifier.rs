@@ -15,7 +15,14 @@ impl Notifier for DesktopNotifier {
     fn notify(&self, n: Notification) {
         // The D-Bus call blocks, and the service is locked while it notifies.
         std::thread::spawn(move || {
-            let _ = notify_rust::Notification::new().appname("akshually").summary(&n.title).body(&n.body).show();
+            // Icon by name and the desktop entry's name, so the shell shows the installed icon.
+            let _ = notify_rust::Notification::new()
+                .appname("Akshually")
+                .icon("akshually")
+                .hint(notify_rust::Hint::DesktopEntry("akshually".into()))
+                .summary(&n.title)
+                .body(&n.body)
+                .show();
         });
     }
 

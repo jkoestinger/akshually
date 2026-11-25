@@ -81,6 +81,8 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 /// flags, without the program name.
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let headless = is_headless_run(&rune_args);
+    // The desktop entry's name, so the window shows its icon (Wayland app id, X11 window class).
+    rune::set_app_id("akshually");
     let fonts = mono_font::window_fonts();
     let spec = AppSpec {
         scenes: &[
@@ -100,7 +102,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
         fonts: fonts.fonts,
         families: ("Inter", fonts.mono),
         on_key: Some(on_key),
-        ..AppSpec::new("akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
+        ..AppSpec::new("Akshually", (1280.0, 800.0), || State::new(Arc::new(Service::new())), view)
     };
     let init_service = service.clone();
     let app = rune::App::new(spec)
@@ -900,10 +902,10 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
     let dismiss = || button("Dismiss", "update-dismiss", ButtonVariant::Ghost, State::dismiss_update);
     let (note, buttons) = match &update.stage {
         UpdateStage::Available => (
-            format!("akshually {version} is available."),
+            format!("Akshually {version} is available."),
             vec![button("Update", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
         ),
-        UpdateStage::Installing => (format!("Installing akshually {version}…"), Vec::new()),
+        UpdateStage::Installing => (format!("Installing Akshually {version}…"), Vec::new()),
         // The agents may have stopped waiting since Restart was pressed.
         UpdateStage::Installed if s.confirming_restart && !update.waiting.is_empty() => (
             format!(
@@ -917,11 +919,11 @@ fn update_notice(k: &Kit, s: &State) -> Option<El> {
             ],
         ),
         UpdateStage::Installed => (
-            format!("akshually {version} is installed. Restart akshually to use it."),
+            format!("Akshually {version} is installed. Restart Akshually to use it."),
             vec![button("Restart", "update-restart", ButtonVariant::Outline, State::restart), dismiss()],
         ),
         UpdateStage::Failed(why) => (
-            format!("Couldn't update to akshually {version}: {why}"),
+            format!("Couldn't update to Akshually {version}: {why}"),
             vec![button("Try again", "update-install", ButtonVariant::Outline, State::install_update), dismiss()],
         ),
     };
