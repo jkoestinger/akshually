@@ -400,7 +400,7 @@ fn repair_launcher() {
     }
     let Some(data_home) = dirs::data_dir() else { return };
     if let Err(error) = akshually_core::repair_launcher(&data_home) {
-        eprintln!("akshually: can't update the launcher entry in {}: {error}", data_home.display());
+        eprintln!("akshually: can't update the launcher entry: {error}");
     }
 }
 

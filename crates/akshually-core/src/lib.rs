@@ -20,7 +20,7 @@ mod thread;
 pub mod update;
 
 pub use changeset::{BinarySizes, Changeset, Collapsed, FileChange, Hunk, LocalOptions};
-pub use launcher::repair_launcher;
+pub use launcher::{LauncherError, repair_launcher};
 pub use notifier::{Notification, Notifier};
 pub use paths::Paths;
 pub use reanchor::reanchor;

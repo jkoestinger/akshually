@@ -1,5 +1,6 @@
-//! Seam C: self-update at its HTTP boundary: which release is offered, looking releases up and
-//! downloading them from a `mockito` GitHub, and replacing a throwaway install with one.
+//! Self-update through the core crate's public interface, against a `mockito` GitHub and a
+//! throwaway directory: which release is offered, looking releases up and downloading them, and
+//! replacing an install with one.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
