@@ -6,7 +6,7 @@ mod install;
 mod releases;
 mod version;
 
-pub use install::{Archive, Target, Updater};
+pub use install::{Archive, Target, Updater, installed_exe};
 pub use releases::Releases;
 pub use version::{Version, VersionError, release_offered};
 

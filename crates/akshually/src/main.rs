@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use akshually_core::{
     Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge,
     ipc::{self, BindError, ClientError, Connection, ErrorCode, Server},
-    update::{Releases, Updater},
+    update::{self, Releases, Updater},
 };
 
 /// The agent skill `agent-help` prints.
@@ -425,7 +425,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     // No window means nothing to notify about, and tests never show real notifications.
     let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);
-    service.on_restart(move || relaunch(&exe, headless));
+    // An Update may have renamed the macOS bundle, so the binary to start isn't always at `exe`.
+    service.on_restart(move || relaunch(&update::installed_exe(&exe), headless));
     let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
         // Another instance serves the CLI already; leave it to that one, and bring its window
