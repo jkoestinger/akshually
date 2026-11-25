@@ -92,7 +92,7 @@ pub fn is_headless_run(rune_args: &[String]) -> bool {
 pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> {
     let headless = is_headless_run(&rune_args);
     // The desktop entry's name, so the window shows its icon (Wayland app id, X11 window class).
-    rune::set_app_id("akshually");
+    rune::set_app_id(notifier::APP_ID);
     let fonts = mono_font::window_fonts();
     let spec = AppSpec {
         scenes: &[
