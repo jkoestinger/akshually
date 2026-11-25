@@ -74,6 +74,7 @@ pub const WINDOW_CHROME: Chrome = Chrome {
     drag_regions: true,
 };
 
+mod highlight;
 mod mono_font;
 mod notifier;
 mod rendered;
@@ -82,6 +83,7 @@ mod search;
 mod theme;
 mod thread_nav;
 
+pub use highlight::changeset_highlighter;
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
 use rendered::{rendered_button, rendered_view};
@@ -345,6 +347,7 @@ fn file_diffs(changeset: &Changeset) -> Vec<FileDiff> {
 /// collapsed (#78).
 fn show_files(diff: &mut DiffState, session: &SessionView) {
     let changeset = session.shown();
+    diff.set_highlighter(highlight::changeset_highlighter(changeset));
     diff.set_files(file_diffs(changeset));
     for (at, file) in changeset.files.iter().enumerate() {
         if file.collapsed.is_some() || session.viewed.contains(&file.path) {
