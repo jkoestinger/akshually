@@ -152,6 +152,70 @@ fn with_threads(session: SessionView, threads: Vec<Thread>) -> SessionView {
     SessionView { threads, ..session }
 }
 
+// --- Approving with unsent items ---
+
+#[test]
+fn approving_with_drafts_reports_how_many_unsent_items_it_discards() {
+    let drafts = vec![thread("T1", vec![comment(Party::Human, None)]), thread("T2", vec![comment(Party::Human, None)])];
+    let session = with_threads(local(Role::Author, Turn::Human, None), drafts);
+
+    let actions = session.actions();
+
+    assert_eq!(actions.verdict, Some(VerdictAction::Approve));
+    assert_eq!(actions.discarded_by_approving, 2);
+}
+
+#[test]
+fn approving_after_reopening_a_thread_reports_it_as_an_unsent_item() {
+    let reopened = Thread { reopened: true, ..thread("T1", vec![comment(Party::Agent, Some(1))]) };
+    let session = with_threads(local(Role::Author, Turn::Human, None), vec![reopened]);
+
+    let discarded = session.actions().discarded_by_approving;
+
+    assert_eq!(discarded, 1);
+}
+
+#[test]
+fn approving_with_open_threads_but_nothing_unsent_discards_nothing() {
+    let open =
+        vec![thread("T1", vec![comment(Party::Agent, Some(1))]), thread("T2", vec![comment(Party::Human, Some(1))])];
+    let session = with_threads(local(Role::Author, Turn::Human, None), open);
+
+    let discarded = session.actions().discarded_by_approving;
+
+    assert_eq!(discarded, 0);
+}
+
+#[test]
+fn approving_discards_exactly_what_the_hand_over_would_carry() {
+    let reopened =
+        Thread { reopened: true, ..thread("T1", vec![comment(Party::Agent, Some(1)), comment(Party::Human, None)]) };
+    let session = with_threads(
+        local(Role::Author, Turn::Human, None),
+        vec![reopened, thread("T2", vec![comment(Party::Human, None)])],
+    );
+
+    let actions = session.actions();
+
+    assert_eq!(actions.discarded_by_approving, session.to_hand_over());
+    assert_eq!(actions.hand_over.map(|h| h.items), Some(actions.discarded_by_approving));
+}
+
+#[test]
+fn nothing_is_discarded_where_the_session_offers_no_approve() {
+    let drafts = vec![thread("T1", vec![comment(Party::Human, None)])];
+    let sessions = [
+        local(Role::Author, Turn::Agent, None),
+        local(Role::CoReviewer, Turn::Human, None),
+        local(Role::Author, Turn::Human, Some(Ending::Approved)),
+        pull_request(Some(Role::CoReviewer), Turn::Human, None),
+    ];
+
+    let discarded = sessions.map(|s| with_threads(s, drafts.clone()).actions().discarded_by_approving);
+
+    assert_eq!(discarded, [0, 0, 0, 0]);
+}
+
 #[test]
 fn a_round_with_drafts_can_be_handed_over_in_the_humans_turn() {
     let drafts = vec![thread("T1", vec![comment(Party::Human, None)]), thread("T2", vec![comment(Party::Human, None)])];
