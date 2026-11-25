@@ -270,6 +270,7 @@ impl Service {
             }
             // Pull Requests came and went, perhaps.
             self.follow_stack(&id);
+            self.refresh_stack_changeset(&id);
         }
     }
 
@@ -294,6 +295,7 @@ impl Service {
         inner.notify();
         drop(inner);
         self.follow_stack(id);
+        self.refresh_stack_changeset(id);
         Ok(())
     }
 

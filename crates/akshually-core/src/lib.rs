@@ -25,8 +25,8 @@ pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
     InboxView, Member, MemberView, Outcome, PendingReview, PlacedThread, PublishPlan, PublishedReview, ReviewRequest,
-    Role, Service, SessionActions, SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef,
-    Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView,
+    Role, Service, SessionActions, SessionId, SessionMark, SessionView, Source, SourceRef, StackChangeset,
+    ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
@@ -64,6 +64,10 @@ pub enum Error {
     NoPullRequestSession(String),
     #[error("{0} isn't in this Session's Stack")]
     NotInStack(String),
+    #[error("this Session has no Stack Changeset: its Stack holds one Pull Request")]
+    NoStackChangeset,
+    #[error("the Stack Changeset is for reading only: select a Pull Request of the Stack to comment on it")]
+    StackChangesetReadOnly,
     #[error("this Pull Request is Published already: it takes no more Drafts or Publish")]
     AlreadyPublished,
     #[error("no Thread {0} in this Session")]

@@ -23,6 +23,7 @@ mod handoff;
 mod inbox;
 mod pull_request;
 mod stack;
+mod stack_changeset;
 mod threads;
 mod update;
 mod window;
@@ -32,6 +33,7 @@ pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
 pub use stack::{Member, MemberView, PublishedReview};
+pub use stack_changeset::StackChangeset;
 pub use update::{UpdateStage, UpdateView};
 pub use window::{DiffLayout, Displayed, WindowView};
 
@@ -360,6 +362,9 @@ pub struct SessionView {
     /// The Pull Request the Session was opened on, which names its tab; `None` before Stacks,
     /// when it is the one shown.
     pub opened: Option<PullRequestRef>,
+    /// The Stack Changeset, for a Stack of two or more (`offers_stack_changeset`). Not saved.
+    #[serde(skip)]
+    pub whole_stack: StackChangeset,
 }
 
 impl SessionView {
@@ -400,6 +405,9 @@ impl SessionView {
 
     /// The Changeset the human is looking at.
     pub fn shown(&self) -> &Changeset {
+        if self.stack_changeset_selected() {
+            return self.whole_stack.shown();
+        }
         match (self.view, &self.since_session_base, &self.since_last_round) {
             (ChangesetView::SinceSessionBase, Some(since), _) => since,
             (ChangesetView::SinceLastRound, _, Some(since)) => since,
@@ -465,6 +473,10 @@ impl SessionView {
     /// How many open Threads are anchored to the file at `path`, on its lines or as a whole:
     /// those not resolved, Outdated ones included.
     pub fn open_threads_on(&self, path: &str) -> usize {
+        // The Stack Changeset shows no Thread of the members.
+        if self.stack_changeset_selected() {
+            return 0;
+        }
         let on_file = |t: &&Thread| match &t.anchor {
             Anchor::Lines { path: on, .. } | Anchor::File { path: on } => on == path,
             Anchor::Review => false,
@@ -475,6 +487,9 @@ impl SessionView {
     /// Where each current line Thread sits in the shown Changeset: under its last line. Outdated
     /// Threads, and Threads on lines not shown, have no place.
     pub fn placed_threads(&self) -> Vec<PlacedThread> {
+        if self.stack_changeset_selected() {
+            return Vec::new();
+        }
         let shown = self.shown();
         let placed = self.threads.iter().filter(|t| !t.outdated).filter_map(|t| {
             let Anchor::Lines { path, side, end, .. } = &t.anchor else { return None };
@@ -491,6 +506,9 @@ impl SessionView {
     /// in the shown Changeset's file at `file`. A selection running across sides anchors to its
     /// last line alone. `None` where no Thread can go.
     pub fn anchor_for_selection(&self, file: usize, start: (Side, u32), end: (Side, u32)) -> Option<Anchor> {
+        if self.stack_changeset_selected() {
+            return None;
+        }
         let path = self.shown().files.get(file)?.path.clone();
         let side = end.0;
         if side == Side::Old && !self.old_side_shown() {
@@ -518,6 +536,9 @@ impl SessionView {
 
     /// The code a Thread at `anchor` would be written against, once `check_anchor` passes.
     fn excerpt_at(&self, anchor: &Anchor) -> Result<String, Error> {
+        if self.stack_changeset_selected() {
+            return Err(Error::StackChangesetReadOnly);
+        }
         let excerpt = anchor.excerpt(self.anchored_in()).map_err(Error::InvalidAnchor)?;
         if !self.changeset.takes_comment_at(anchor) {
             let Anchor::Lines { path, side, start, end } = anchor.clone() else {

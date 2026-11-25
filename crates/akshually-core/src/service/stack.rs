@@ -316,8 +316,12 @@ impl Service {
         let at = inner.position(id)?;
         let view = &mut inner.sessions[at].view;
         let to = view.member_position(pr).ok_or_else(|| Error::NotInStack(pr.to_string()))?;
+        // Choosing a member also takes the Stack Changeset off the Window.
+        let left_stack_changeset = view.deselect_stack_changeset();
         if to != view.selected {
             view.select(to);
+            inner.notify();
+        } else if left_stack_changeset {
             inner.notify();
         }
         Ok(())
