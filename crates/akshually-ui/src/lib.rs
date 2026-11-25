@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use rune::{AppHandle, AppSpec, Chrome, Color, Cursor, Cx, El, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text};
+use rune::{
+    AppHandle, AppSpec, Chrome, Color, Cursor, Cx, El, Key, KeyEvent, ScrollSpec, TextEdit, Tx, col, row, text,
+};
 use rune_kit::diff::{self, Annotation, DiffMode, DiffState, DiffView, FileDiff, LineRange, LineRef};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation, TabStrip};
 use rune_kit::{
@@ -1957,6 +1959,13 @@ fn comments(k: &Kit, mut card: El, thread: &Thread, comments: &[Comment]) -> El 
     card
 }
 
+/// Whether `key` is Escape in a Comment field whose `text` is empty or whitespace only: the
+/// composer then closes as its Discard button does. Rune keeps Escape from a field's key handler
+/// during an input method composition, so it never gets here then.
+fn escape_on_empty(key: &KeyEvent, text: &TextEdit) -> bool {
+    key.key == Key::Escape && text.text.trim().is_empty()
+}
+
 /// The reply being written in a Thread: a Draft until the Round is handed over.
 fn reply_composer(k: &Kit, s: &State) -> El {
     col()
@@ -1970,6 +1979,13 @@ fn reply_composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.reply_text)
                 .on_submit(|s: &mut State, _| s.save_reply())
+                .on_key(|s: &mut State, key, _| {
+                    let discard = escape_on_empty(key, &s.reply_text);
+                    if discard {
+                        s.close_reply();
+                    }
+                    discard
+                })
                 .build(k),
         )
         .child(
@@ -2078,6 +2094,13 @@ fn composer(k: &Kit, s: &State) -> El {
                 .auto_grow(2, 12)
                 .on_edit(|s: &mut State| &mut s.composer_text)
                 .on_submit(|s: &mut State, _| s.save_draft())
+                .on_key(|s: &mut State, key, _| {
+                    let discard = escape_on_empty(key, &s.composer_text);
+                    if discard {
+                        s.close_composer();
+                    }
+                    discard
+                })
                 .build(k),
         )
         .child(
