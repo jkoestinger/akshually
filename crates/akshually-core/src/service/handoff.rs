@@ -5,7 +5,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
-use super::{Ending, Inner, Outcome, Session, SessionId, Turn, lock};
+use super::{Ending, Inner, Outcome, PublishedReview, Session, SessionId, Turn, lock};
+use crate::forge::PullRequestRef;
 
 /// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
 /// the next `review` call.
@@ -133,6 +134,8 @@ pub(super) struct Waiter {
     pub(super) outcome: Sender<Outcome>,
     /// The call acknowledges what it receives.
     pub(super) ack: bool,
+    /// The Pull Request its URL named, which the outcome it receives is about.
+    pub(super) member: Option<PullRequestRef>,
 }
 
 impl Session {
@@ -142,7 +145,8 @@ impl Session {
             return;
         }
         let Some(waiter) = self.waiter.take() else { return };
-        let outcome = self.queued.remove(0);
+        let queued = self.queued.remove(0);
+        let outcome = self.outcome_for(&waiter, queued);
         match waiter.outcome.send(outcome.clone()) {
             Ok(()) => {
                 self.view.agent_waiting = false;
@@ -157,6 +161,16 @@ impl Session {
             }
             // A waiter that went away without being dropped yet gives it back.
             Err(mpsc::SendError(outcome)) => self.queued.insert(0, outcome),
+        }
+    }
+
+    /// What `waiter` is told of `outcome`: when the Session ended Published, what happened to the
+    /// Pull Request its URL named: its Verdict if it was Published, else Abandoned.
+    fn outcome_for(&self, waiter: &Waiter, outcome: Outcome) -> Outcome {
+        let (Outcome::Published { .. }, Some(member)) = (&outcome, &waiter.member) else { return outcome };
+        match self.view.published_review(member) {
+            Some(PublishedReview { verdict, url }) => Outcome::Published { verdict, url },
+            None => Outcome::Abandoned,
         }
     }
 

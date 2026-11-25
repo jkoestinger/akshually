@@ -43,7 +43,7 @@ pub enum InboxRowState {
     Updated,
     /// Nothing happened since the human last opened it.
     Seen,
-    /// It has an open Session, holding `drafts` Drafts.
+    /// It has an open Session, holding `drafts` Drafts in this Pull Request's Review.
     SessionOpen { session: SessionId, drafts: usize },
 }
 
@@ -97,12 +97,18 @@ impl Inbox {
             .items
             .iter()
             .map(|item| {
-                let session = sessions
-                    .iter()
-                    // A Published Session stays open until the human closes it.
-                    .find(|s| s.view.pull_request().is_some_and(|p| p.id == item.id));
+                // A Published Session stays open until the human closes it.
+                let session = sessions.iter().find(|s| s.view.has_member(&item.id));
                 let state = match (session, self.seen(&item.id)) {
-                    (Some(s), _) => InboxRowState::SessionOpen { session: s.view.id.clone(), drafts: s.view.drafts() },
+                    (Some(s), _) => InboxRowState::SessionOpen {
+                        session: s.view.id.clone(),
+                        drafts: s
+                            .view
+                            .stack()
+                            .into_iter()
+                            .find(|m| m.pull_request.id == item.id)
+                            .map_or(0, |m| m.drafts),
+                    },
                     (None, None) => InboxRowState::New,
                     (None, Some(seen)) if seen < item.updated_at => InboxRowState::Updated,
                     (None, Some(_)) => InboxRowState::Seen,
@@ -175,10 +181,7 @@ impl Service {
             first
         });
         // Done with, unless the human is still reviewing it: their Session keeps it listed.
-        items.retain(|i| {
-            !(i.approved || i.verdict_given)
-                || inner.sessions.iter().any(|s| s.view.pull_request().is_some_and(|p| p.id == i.id))
-        });
+        items.retain(|i| !(i.approved || i.verdict_given) || inner.sessions.iter().any(|s| s.view.has_member(&i.id)));
         items.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
 
         let requested = |items: &[InboxItem], pr: &PullRequestRef| {

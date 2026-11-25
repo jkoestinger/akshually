@@ -2125,6 +2125,10 @@ fn scene_session(s: &mut State) {
         attention: false,
         changed_on_disk: Default::default(),
         pull_request_update: None,
+        members: Vec::new(),
+        selected: 0,
+        published: None,
+        opened: None,
     };
     let other = |id: &str, branch: &str, turn: Turn, attention: bool| SessionView {
         id: SessionId::new(id),
@@ -2182,6 +2186,10 @@ fn scene_threads(s: &mut State) {
         attention: false,
         changed_on_disk: ["src/round.rs".to_owned(), "src/session.rs".to_owned()].into(),
         pull_request_update: None,
+        members: Vec::new(),
+        selected: 0,
+        published: None,
+        opened: None,
         round: 1,
         threads: vec![
             thread(

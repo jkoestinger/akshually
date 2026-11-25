@@ -52,15 +52,17 @@ pub trait ForgeAdapter: Send + Sync {
 
     /// The open Pull Requests of `repo` (`owner/repo`) whose head branch is `branch`, which the
     /// Stack of one asking to merge into `branch` is built from. Those from a fork are included,
-    /// marked `from_fork`. A Forge with no way to ask has none. Blocks on the network.
+    /// marked `from_fork`. `Unsupported` for a Forge with no way to ask: its Pull Requests are
+    /// then Stacks of one. Blocks on the network.
     fn open_with_head_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
-        Ok(Vec::new())
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "find Pull Requests by branch" })
     }
 
     /// The open Pull Requests of `repo` asking to merge into `branch`, those from a fork
-    /// included, marked `from_fork`. A Forge with no way to ask has none. Blocks on the network.
+    /// included, marked `from_fork`. `Unsupported` for a Forge with no way to ask. Blocks on the
+    /// network.
     fn open_with_target_branch(&self, _repo: &str, _branch: &str) -> Result<Vec<PullRequest>, ForgeError> {
-        Ok(Vec::new())
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "find Pull Requests by branch" })
     }
 
     /// What was pushed to the Pull Request since `pr` was fetched: `None` while its head is
@@ -194,8 +196,8 @@ pub struct PullRequestUpdate {
     pub commits: Option<u32>,
 }
 
-/// Names one Pull Request: a Pull Request Session's identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Names one Pull Request: a member of a Pull Request Session's Stack.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PullRequestRef {
     /// The Forge's web host, as configured (`github.com`, `github.example.com`).
     pub host: String,
@@ -211,7 +213,7 @@ impl std::fmt::Display for PullRequestRef {
 }
 
 /// A Pull Request's metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub id: PullRequestRef,
     /// The Pull Request's web page.

@@ -24,9 +24,9 @@ pub use paths::Paths;
 pub use reanchor::reanchor;
 pub use service::{
     CancelReview, ChangesetView, DiffLayout, Displayed, EndAction, Ending, HandOver, InboxRow, InboxRowState,
-    InboxView, Outcome, PendingReview, PlacedThread, PublishPlan, ReviewRequest, Role, Service, SessionActions,
-    SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef, Turn, UpdateStage, UpdateView,
-    Verdict, VerdictAction, WindowView,
+    InboxView, Member, MemberView, Outcome, PendingReview, PlacedThread, PublishPlan, PublishedReview, ReviewRequest,
+    Role, Service, SessionActions, SessionId, SessionMark, SessionView, Source, SourceRef, ThreadActions, ThreadRef,
+    Turn, UpdateStage, UpdateView, Verdict, VerdictAction, WindowView,
 };
 pub use settings::{Settings, SettingsError};
 pub use thread::{Anchor, Comment, ForgeThread, NewComment, Party, Round, Side, Thread, ThreadId, fence_for};
@@ -62,6 +62,10 @@ pub enum Error {
     NoSessionHere { repo: std::path::PathBuf, branch: String },
     #[error("no Session for {0}")]
     NoPullRequestSession(String),
+    #[error("{0} isn't in this Session's Stack")]
+    NotInStack(String),
+    #[error("this Pull Request is Published already: it takes no more Drafts or Publish")]
+    AlreadyPublished,
     #[error("no Thread {0} in this Session")]
     UnknownThread(ThreadId),
     #[error("{0} isn't in the Changeset")]

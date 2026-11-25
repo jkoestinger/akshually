@@ -10,11 +10,10 @@ impl SessionView {
     pub fn to_hand_over(&self) -> usize {
         let co_review = self.is_co_review();
         let comments: usize = self
-            .threads
-            .iter()
+            .all_threads()
             .map(|t| (0..t.comments.len()).filter(|&i| carried_in_next_round(co_review, t, i)).count())
             .sum();
-        comments + self.threads.iter().filter(|t| t.reopened && !co_review).count()
+        comments + self.all_threads().filter(|t| t.reopened && !co_review).count()
     }
 }
 
@@ -41,7 +40,7 @@ impl Service {
         let number = session.view.round;
         let co_review = session.view.is_co_review();
         let mut threads = Vec::new();
-        for thread in &mut session.view.threads {
+        for thread in session.view.all_threads_mut() {
             let carried: Vec<bool> =
                 (0..thread.comments.len()).map(|i| carried_in_next_round(co_review, thread, i)).collect();
             let drafts: Vec<Comment> = thread
@@ -94,13 +93,13 @@ impl Service {
             for withdrawn in std::mem::take(&mut session.queued) {
                 let Outcome::Round(round) = withdrawn else { continue };
                 for reopened in round.threads.iter().filter(|t| t.reopened) {
-                    let thread = session.view.threads.iter_mut().find(|t| t.id == reopened.id);
+                    let thread = session.view.all_threads_mut().find(|t| t.id == reopened.id);
                     if let Some(thread) = thread.filter(|t| t.resolved.is_none()) {
                         thread.reopened = true;
                     }
                 }
             }
-            for comment in session.view.threads.iter_mut().flat_map(|t| &mut t.comments) {
+            for comment in session.view.all_threads_mut().flat_map(|t| &mut t.comments) {
                 if comment.author == Party::Human && comment.round.is_some_and(|n| n >= first) {
                     comment.round = None;
                 }
@@ -157,13 +156,18 @@ impl Service {
     ) -> Result<T, Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
-        let view = &mut inner.sessions[at].view;
-        if !view.thread_offered(thread)?.agent_draft {
-            return Err(Error::NotAnAgentDraft(thread.clone()));
-        }
-        let threads = &mut view.threads;
-        let found = threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
-        let result = f(threads, found);
+        let session = &mut inner.sessions[at];
+        // The Thread may be in a member that isn't shown: ids run across the Session.
+        let member = session.view.member_of(thread).unwrap_or(session.view.selected);
+        let result = session.at_member(member, |session| {
+            let view = &mut session.view;
+            if !view.thread_offered(thread)?.agent_draft {
+                return Err(Error::NotAnAgentDraft(thread.clone()));
+            }
+            let threads = &mut view.threads;
+            let found = threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
+            Ok(f(threads, found))
+        })?;
         inner.notify();
         Ok(result)
     }

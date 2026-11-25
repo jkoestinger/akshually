@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::changeset::{self, Changeset, LocalOptions};
-use crate::forge::{ForgeAdapter, PullRequest, PullRequestUpdate};
+use crate::forge::{ForgeAdapter, PullRequest, PullRequestRef, PullRequestUpdate};
 use crate::store::Store;
 use crate::thread::{Anchor, Comment, NewComment, Party, Round, Side, Thread, ThreadId};
 use crate::update::Updater;
@@ -22,6 +22,7 @@ mod drafts;
 mod handoff;
 mod inbox;
 mod pull_request;
+mod stack;
 mod threads;
 mod update;
 mod window;
@@ -30,6 +31,7 @@ pub use actions::{EndAction, HandOver, SessionActions, ThreadActions, VerdictAct
 pub use handoff::{CancelReview, PendingReview};
 pub use inbox::{InboxRow, InboxRowState, InboxView};
 pub use pull_request::PublishPlan;
+pub use stack::{Member, MemberView, PublishedReview};
 pub use update::{UpdateStage, UpdateView};
 pub use window::{DiffLayout, Displayed, WindowView};
 
@@ -347,6 +349,17 @@ pub struct SessionView {
     /// New commits pushed to the Pull Request since its Changeset was fetched. Offered as a
     /// reload, never applied: `None` means nothing to reload.
     pub pull_request_update: Option<PullRequestUpdate>,
+    /// A Pull Request Session's Stack, bottom to top: the Review of each member, parked while
+    /// another is shown (`SessionView::stack` lists them). Empty for local work. The fields
+    /// above hold the Review of the member `selected`, whose slot here is stale.
+    pub members: Vec<Member>,
+    /// The position in `members` of the member shown.
+    pub selected: usize,
+    /// What Publish sent for the member shown, once it did: it takes no more Drafts.
+    pub published: Option<PublishedReview>,
+    /// The Pull Request the Session was opened on, which names its tab; `None` before Stacks,
+    /// when it is the one shown.
+    pub opened: Option<PullRequestRef>,
 }
 
 impl SessionView {
@@ -408,13 +421,19 @@ impl SessionView {
     pub fn mark(&self) -> Option<SessionMark> {
         if self.attention {
             Some(SessionMark::Attention)
-        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() {
+        } else if !self.changed_on_disk.is_empty() || self.pull_request_update.is_some() || self.parked_update() {
             Some(SessionMark::ReloadOffered)
         } else if self.turn == Turn::Agent {
             Some(SessionMark::AgentsTurn)
         } else {
             None
         }
+    }
+
+    /// Whether a member that isn't shown received pushes.
+    fn parked_update(&self) -> bool {
+        let shown = self.selected;
+        self.members.iter().enumerate().any(|(at, m)| at != shown && m.pull_request_update.is_some())
     }
 
     /// The Changeset Threads are anchored in: the shown one, except since the last Round,
@@ -521,15 +540,22 @@ impl SessionView {
         self.threads.iter().flat_map(|t| &t.comments).filter(|c| c.is_draft()).count()
     }
 
-    /// The Session's name, as its tab shows it: `repo · branch` for local work, `acme/web #482`
-    /// for a Pull Request.
+    /// The Session's name, as its tab shows it: `repo · branch` for local work; for Pull
+    /// Requests the one opened, `acme/web #482`, and the size of its Stack when it has more than
+    /// one member.
     pub fn title(&self) -> String {
         match &self.source {
             Source::Local { repo, branch } => {
                 let name = repo.file_name().map_or_else(|| repo.display().to_string(), |n| n.to_string_lossy().into());
                 format!("{name} · {branch}")
             }
-            Source::PullRequest(pr) => pr.reference(),
+            Source::PullRequest(pr) => {
+                let reference = self.opened_pull_request().unwrap_or(pr).reference();
+                match self.members.len() {
+                    0 | 1 => reference,
+                    members => format!("{reference} · Stack of {members}"),
+                }
+            }
         }
     }
 }
@@ -605,6 +631,9 @@ impl Session {
     /// Opens a Thread at `anchor` whose first Comment is `author`'s Draft `comment` (already
     /// checked with `check_comment`).
     fn open_thread(&mut self, anchor: Anchor, comment: NewComment, author: Party) -> Result<ThreadId, Error> {
+        if self.view.is_published() {
+            return Err(Error::AlreadyPublished);
+        }
         let excerpt = self.view.excerpt_at(&anchor)?;
         self.threads_opened += 1;
         let thread = ThreadId::new(format!("T{}", self.threads_opened));
@@ -800,6 +829,7 @@ impl Service {
             if session.view.pull_request().is_none() && session.view.agent.is_none() {
                 session.view.agent = Some(Role::Author);
             }
+            session.view.restore_stack();
         }
         let mut inner = Inner { next_id, sessions, session_bases, ..Inner::default() };
         inner.inbox = store.load_inbox();
@@ -935,7 +965,7 @@ impl Service {
 
         let mut inner = self.lock();
         inner.next_waiter += 1;
-        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack };
+        let waiter = Waiter { id: inner.next_waiter, outcome: tx, ack: request.ack, member: None };
         let waiter_id = waiter.id;
         let existing = inner.sessions.iter().position(|s| s.view.is_local(&repo, &branch));
         let id = match existing {
@@ -1035,7 +1065,11 @@ impl Service {
                 (Source::Local { .. }, _) => {
                     return Err(Error::InvalidRequest("local work ends with a Verdict or by abandoning it".into()));
                 }
-                (Source::PullRequest(_), Some(_)) => Some(Ending::Abandoned),
+                // Published if at least one member was, whatever the others did.
+                (Source::PullRequest(_), Some(_)) => Some(match session.view.last_published() {
+                    Some(PublishedReview { verdict, url }) => Ending::Published { verdict, url },
+                    None => Ending::Abandoned,
+                }),
                 (Source::PullRequest(_), None) => None,
             };
             if let Some(ending) = ending {
