@@ -11,9 +11,9 @@ use std::mem;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChangesetView, Service, Session, SessionId, SessionView, Source};
+use super::{ChangesetView, MemberOutcome, Service, Session, SessionId, SessionView, Source};
 use crate::forge::{ForgeAdapter, ForgeError, PullRequest, PullRequestRef, PullRequestUpdate};
-use crate::thread::{Thread, ThreadId};
+use crate::thread::{PullRequestMark, Thread, ThreadId};
 use crate::{Changeset, Error, Verdict};
 
 /// What a member's Publish sent to its Pull Request.
@@ -168,9 +168,38 @@ impl SessionView {
         self.published.is_some()
     }
 
-    /// What Publish sent for `pr`, when it did.
-    pub(super) fn published_review(&self, pr: &PullRequestRef) -> Option<PublishedReview> {
-        self.stack().into_iter().find(|m| &m.pull_request.id == pr)?.published
+    /// What became of each Pull Request of the Stack, bottom to top, for the agent; empty for a
+    /// Stack of one, whose outcome says no more than its Ending.
+    pub(super) fn member_outcomes(&self) -> Vec<MemberOutcome> {
+        let members: Vec<_> = self.stack().into_iter().filter(|m| m.in_stack || m.published.is_some()).collect();
+        if members.len() < 2 {
+            return Vec::new();
+        }
+        let outcome = |m: MemberView| MemberOutcome {
+            name: format!("{} #{}", m.pull_request.id.repo, m.pull_request.id.number),
+            url: m.pull_request.url,
+            verdict: m.published.as_ref().map(|p| p.verdict),
+            review: m.published.map(|p| p.url),
+        };
+        members.into_iter().map(outcome).collect()
+    }
+
+    /// Which Pull Request each Thread belongs to, for a Round to tell the agent; empty for a
+    /// Stack of one.
+    pub(super) fn pull_request_marks(&self) -> HashMap<ThreadId, PullRequestMark> {
+        if self.member_outcomes().is_empty() {
+            return HashMap::new();
+        }
+        let stack = self.stack();
+        let mark = |at: usize| {
+            let pr = &stack[at].pull_request;
+            PullRequestMark {
+                pull_request: pr.url.clone(),
+                pull_request_name: format!("{} #{}", pr.id.repo, pr.id.number),
+            }
+        };
+        let threads = self.all_threads().filter_map(|t| Some((t.id.clone(), mark(self.member_of(&t.id)?))));
+        threads.collect()
     }
 
     /// The Review that ends the Session as Published: the topmost member's that was Published.

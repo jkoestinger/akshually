@@ -130,6 +130,18 @@ pub struct Thread {
     /// Set for a Thread already on the Forge: how it is known there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<ForgeThread>,
+    /// Which Pull Request of a Stack it is on, in a Round handed to the agent. Never kept.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestMark>,
+}
+
+/// The Pull Request of a Stack a Thread belongs to, as a Round tells the agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestMark {
+    /// Its web page.
+    pub pull_request: String,
+    /// How the agent names it: `acme/web #482`.
+    pub pull_request_name: String,
 }
 
 /// A Thread as it is on the Forge, as last fetched or Published.

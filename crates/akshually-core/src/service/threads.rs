@@ -135,6 +135,9 @@ impl Service {
             None => session.view.selected,
         };
         session.at_member(member, |session| {
+            if session.view.is_published() {
+                return Err(Error::AlreadyPublished);
+            }
             // Only a Round tells the agent about a Thread: one of its own Drafts nobody questioned,
             // or one already on the Forge, isn't the agent's to answer.
             let found = session

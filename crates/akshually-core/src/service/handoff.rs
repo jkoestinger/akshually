@@ -5,8 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, Weak};
 use std::time::Duration;
 
-use super::{Ending, Inner, Outcome, PublishedReview, Session, SessionId, Turn, lock};
-use crate::forge::PullRequestRef;
+use super::{Ending, Inner, Outcome, Session, SessionId, Turn, lock};
 
 /// A `review` call waiting for the human. Dropping it stops waiting, and frees the Session for
 /// the next `review` call.
@@ -134,8 +133,6 @@ pub(super) struct Waiter {
     pub(super) outcome: Sender<Outcome>,
     /// The call acknowledges what it receives.
     pub(super) ack: bool,
-    /// The Pull Request its URL named, which the outcome it receives is about.
-    pub(super) member: Option<PullRequestRef>,
 }
 
 impl Session {
@@ -145,8 +142,7 @@ impl Session {
             return;
         }
         let Some(waiter) = self.waiter.take() else { return };
-        let queued = self.queued.remove(0);
-        let outcome = self.outcome_for(&waiter, queued);
+        let outcome = self.queued.remove(0);
         match waiter.outcome.send(outcome.clone()) {
             Ok(()) => {
                 self.view.agent_waiting = false;
@@ -164,21 +160,11 @@ impl Session {
         }
     }
 
-    /// What `waiter` is told of `outcome`: when the Session ended Published, what happened to the
-    /// Pull Request its URL named: its Verdict if it was Published, else Abandoned.
-    fn outcome_for(&self, waiter: &Waiter, outcome: Outcome) -> Outcome {
-        let (Outcome::Published { .. }, Some(member)) = (&outcome, &waiter.member) else { return outcome };
-        match self.view.published_review(member) {
-            Some(PublishedReview { verdict, url }) => Outcome::Published { verdict, url },
-            None => Outcome::Abandoned,
-        }
-    }
-
     /// The agent got `outcome` for good.
     fn delivered(&mut self, outcome: &Outcome) {
         match outcome {
             Outcome::Round(round) => self.replaced_last_rounds.retain(|(n, _)| *n > round.number),
-            Outcome::Approved | Outcome::Abandoned | Outcome::Published { .. } | Outcome::Closed => {
+            Outcome::Approved | Outcome::Abandoned { .. } | Outcome::Published { .. } | Outcome::Closed => {
                 self.finished = true
             }
         }
@@ -192,7 +178,7 @@ impl Session {
             return;
         }
         self.queued.clear();
-        self.queued.push(ending.into());
+        self.queued.push(ending.into_outcome(self.view.member_outcomes()));
         self.deliver();
     }
 }

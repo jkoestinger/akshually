@@ -2272,6 +2272,7 @@ fn scene_threads(s: &mut State) {
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     };
     let session = SessionView {
         id: SessionId::new("sample"),
@@ -2540,6 +2541,7 @@ fn sample_thread(id: &str, lines: std::ops::RangeInclusive<u32>, body: &str, rou
         outdated: false,
         reopened: false,
         forge: None,
+        pull_request: None,
     }
 }
 
