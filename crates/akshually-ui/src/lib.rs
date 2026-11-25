@@ -1746,13 +1746,14 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
         .items_center()
         .child(text(format!("General Threads · {}", threads.len())).font(k.ty.small).color(k.c.text_faint))
         .child(row().grow(1.0))
-        .child(
+        // While the composer is in the section it stays open, so a Hide would do nothing.
+        .children((!composing).then(|| {
             Button::new(if folded { "Show" } else { "Hide" })
                 .variant(ButtonVariant::Ghost)
                 .on_press(move |s: &mut State| s.toggle_general_folded(&session))
                 .build(k)
-                .key("general-toggle"),
-        );
+                .key("general-toggle")
+        }));
     if folded {
         return col().w_full().child(header);
     }

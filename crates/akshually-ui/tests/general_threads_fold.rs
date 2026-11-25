@@ -191,3 +191,61 @@ fn collapsing_the_section_in_one_sessions_tab_leaves_another_sessions_expanded()
 
     assert!(shows(&rt, "A note on the other Review."), "the other Session's section collapsed too");
 }
+
+/// A Session of uncommitted work with a Comment on the whole Review, one on the whole file
+/// `a.txt` and one on its line 1, and a window showing it.
+fn work_with_three_comments() -> Runtime<State> {
+    let repo = TestRepo::new();
+    repo.write("a.txt", "one\n").commit_all("base");
+    repo.write("a.txt", "two\n");
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session();
+    service.comment(id, Anchor::Review, "Note on the Review").unwrap();
+    service.comment(id, Anchor::file("a.txt"), "Note on the file").unwrap();
+    service.comment(id, Anchor::lines(Side::New, "a.txt", 1..=1), "Note on the line").unwrap();
+    window(&service)
+}
+
+#[test]
+fn threads_on_the_review_and_on_whole_files_fold_together_and_threads_on_lines_stay() {
+    let mut rt = work_with_three_comments();
+    assert!(texts_within(&rt, "general-header").iter().any(|t| t == "General Threads · 2"), "the count is off");
+
+    press(&mut rt, "general-toggle");
+
+    assert!(!shows(&rt, "Note on the Review"), "the Review's Thread still shows");
+    assert!(!shows(&rt, "Note on the file"), "the whole file's Thread still shows");
+    assert!(shows(&rt, "Note on the line"), "the Thread on a line folded with the section");
+}
+
+#[test]
+fn outdated_threads_are_neither_counted_nor_folded_with_the_section() {
+    let repo = TestRepo::new();
+    repo.write("a.txt", "one\n").commit_all("base");
+    repo.write("a.txt", "two\n");
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    service.comment(pending.session(), Anchor::Review, "Note on the Review").unwrap();
+    service.comment(pending.session(), Anchor::file("a.txt"), "Note on the file").unwrap();
+    repo.write("a.txt", "one\n");
+    service.reload(pending.session()).unwrap();
+    let mut rt = window(&service);
+    assert!(texts_within(&rt, "general-header").iter().any(|t| t == "General Threads · 1"), "the count is off");
+
+    press(&mut rt, "general-toggle");
+
+    assert!(!shows(&rt, "Note on the Review"), "the Review's Thread still shows");
+    assert!(shows(&rt, "Outdated"), "the Outdated Thread folded with the section");
+}
+
+#[test]
+fn hide_is_not_offered_while_the_composer_is_open_in_the_section() {
+    let (_repo, _service, _id, mut rt) = review_with_a_general_draft();
+
+    press_labelled(&mut rt, "Comment on Review");
+
+    assert!(rt.find("composer").is_some(), "the composer isn't shown");
+    assert!(rt.find("general-toggle").is_none(), "the header offers a Hide that couldn't do anything");
+    assert!(shows(&rt, "Needs a second look."), "the Thread isn't shown");
+}
