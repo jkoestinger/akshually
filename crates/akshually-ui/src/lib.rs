@@ -1126,12 +1126,13 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(layout_control(k, tab))
         .children(published.map(|badge| badge.build(k)))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
-        .child(
+        // A Published member takes no more Drafts.
+        .children(session.published.is_none().then(|| {
             Button::new("Comment on Review")
                 .variant(ButtonVariant::Ghost)
                 .on_press(|s: &mut State| s.compose_general(None))
-                .build(k),
-        )
+                .build(k)
+        }))
         .children(tab.actions.hand_over.map(|hand_over| hand_over_button(k, tab, hand_over)))
         .child(
             Button::new("Publish…")

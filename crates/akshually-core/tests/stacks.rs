@@ -30,6 +30,8 @@ struct World {
     published: Vec<(u64, Review)>,
     /// How many times the Forge was asked for Changesets.
     changesets: u32,
+    /// A Forge lists this many Pull Requests at most for a branch, the first ones opened.
+    page: Option<usize>,
 }
 
 /// A Forge whose open Pull Requests are the ones in `world`, which a test changes as time goes by.
@@ -83,7 +85,8 @@ impl FakeForge {
 
     fn lookup(&self, matches: impl Fn(&Pr) -> bool) -> Vec<PullRequest> {
         let world = self.world.lock().unwrap();
-        world.open.iter().filter(|p| matches(p)).map(to_pull_request).collect()
+        let found = world.open.iter().filter(|p| matches(p)).map(to_pull_request);
+        found.take(world.page.unwrap_or(usize::MAX)).collect()
     }
 }
 
@@ -539,6 +542,35 @@ fn closing_asks_for_confirmation_only_when_a_member_holds_drafts_or_an_agent_is_
 }
 
 // --- A Stack that changes ---
+
+#[test]
+fn refreshing_a_stack_that_did_not_change_leaves_its_session_as_it_was() {
+    let forge = FakeForge::stack_of_three();
+    let svc = forge.service();
+    let id = open(&svc, 2);
+    svc.comment(&id, Anchor::Review, "A Draft.").unwrap();
+    let before = svc.session(&id).unwrap();
+
+    svc.check_pull_requests();
+
+    assert_eq!(svc.session(&id).unwrap(), before);
+}
+
+#[test]
+fn a_pull_request_into_a_busy_branch_stays_when_the_forge_lists_only_the_first_of_them() {
+    let forge = FakeForge::default();
+    // Three open Pull Requests into `main` before #99, and the Forge lists the first two.
+    forge.open(10, "x", "main").open(11, "y", "main").open(12, "z", "main").open(99, "solo", "main");
+    forge.world.lock().unwrap().page = Some(2);
+    let svc = forge.service();
+    let id = open(&svc, 99);
+    let before = svc.session(&id).unwrap();
+
+    svc.check_pull_requests();
+
+    assert_eq!(svc.session(&id).unwrap(), before, "#99 left its Stack because it is on a later page");
+    assert!(svc.session(&id).unwrap().stack()[0].in_stack);
+}
 
 #[test]
 fn a_new_pull_request_on_top_of_the_stack_joins_the_session_when_refreshed() {

@@ -215,10 +215,19 @@ fn choosing_a_member_in_the_picker_shows_its_review() {
     press(&mut rt, "stack-member-trigger");
 
     press(&mut rt, "option2");
+    // As the service's subscriber hands the window the change.
+    let window = service.window();
+    rt.update_if(move |s: &mut State, _| {
+        s.apply(window);
+        true
+    });
+    rt.frame(0.0);
 
     let session = service.session(&id).unwrap();
     assert_eq!(session.pull_request().unwrap().id.number, 3);
     assert_eq!(session.drafts(), 2);
+    let drawn = texts_within(&rt, &format!("diff-{id}"));
+    assert!(drawn.iter().any(|t| t.contains("f3.rs")), "the diff still shows the other member: {drawn:?}");
 }
 
 #[test]

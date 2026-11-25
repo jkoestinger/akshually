@@ -370,21 +370,27 @@ impl Service {
 
 /// The Stack `members` make now, bottom to top: found from the first one still open, or empty
 /// when none is. `Err` when the Forge can't say.
+///
+/// A member is found by its head branch, a narrow question: the branch it asks to merge into may
+/// be one with more open Pull Requests than a Forge lists at once.
 fn current_stack(forge: &dyn ForgeAdapter, members: &[MemberView]) -> Result<Vec<PullRequest>, ForgeError> {
     // The member shown first: it is the one the human is looking at.
-    let order =
-        members.iter().filter(|m| m.in_stack).filter(|m| m.selected).chain(members.iter().filter(|m| m.in_stack));
-    for member in order {
-        let mut pull_request = member.pull_request.clone();
-        if pull_request.base_branch.is_empty() {
-            // Saved before Stacks: it doesn't know its target branch.
-            pull_request = forge.pull_request(&pull_request.id)?;
-        }
-        let asking = forge.open_with_target_branch(&pull_request.id.repo, &pull_request.base_branch)?;
-        // Open and still asking to merge where it did.
-        if let Some(open) = asking.into_iter().find(|p| p.id == pull_request.id) {
+    let order = members.iter().filter(|m| m.in_stack && m.selected).chain(members.iter().filter(|m| m.in_stack));
+    // The Forge finds a head branch of this repository, never a fork's.
+    let mut asked = false;
+    for member in order.filter(|m| !m.pull_request.from_fork) {
+        let pull_request = &member.pull_request;
+        asked = true;
+        let named = forge.open_with_head_branch(&pull_request.id.repo, &pull_request.head_branch)?;
+        // Open and still asking to merge where it did; a member saved before Stacks doesn't know.
+        let asking = |p: &PullRequest| pull_request.base_branch.is_empty() || p.base_branch == pull_request.base_branch;
+        if let Some(open) = named.into_iter().find(|p| p.id == pull_request.id && asking(p)) {
             return detect_stack(forge, &open);
         }
+    }
+    if !asked {
+        let host = members.first().map_or_else(String::new, |m| m.pull_request.id.host.clone());
+        return Err(ForgeError::Unsupported { host, what: "tell whether a Pull Request from a fork is still open" });
     }
     Ok(Vec::new())
 }
