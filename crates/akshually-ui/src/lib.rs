@@ -67,6 +67,7 @@ pub const WINDOW_CHROME: Chrome = Chrome {
 mod mono_font;
 mod notifier;
 mod rendered;
+mod search;
 mod theme;
 
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
@@ -182,6 +183,8 @@ pub struct State {
     /// view after `apply` dropped its tab and before the next rebuild drops the view (#37).
     /// It is never shown, and nothing but those stale handlers reads what they write to it.
     spare_diff: DiffState,
+    /// What a search field reads and writes once its tab is gone, as `spare_diff` is for the diff view.
+    spare_search: TextEdit,
 }
 
 /// The Publish dialog of one Pull Request Session.
@@ -225,6 +228,9 @@ struct SessionTab {
     /// The path of the file whose Rendered view is open over the diff. The UI's own, so it's
     /// lost on restart.
     rendered: Option<String>,
+    /// The Session's Search: its query and where the human is in its matches. The UI's own, so
+    /// it's lost on restart.
+    search: search::Search,
 }
 
 impl SessionTab {
@@ -233,7 +239,15 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, &session);
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None };
+        let mut tab = SessionTab {
+            session,
+            actions,
+            diff,
+            expanded: Vec::new(),
+            choosing_view: false,
+            rendered: None,
+            search: search::Search::new(),
+        };
         tab.annotate(None);
         tab
     }
@@ -358,6 +372,7 @@ impl State {
             summary: TextEdit::new(""),
             confirming_end: None,
             spare_diff: DiffState::new(Vec::new()),
+            spare_search: TextEdit::new(""),
         };
         let window = state.service.window();
         state.apply(window);
@@ -872,6 +887,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(tab_bar.child(pull_request_opener(k, s)))
             .children(update_notice(k, s))
             .child(session_header(k, tab, &mut layer))
+            .children(search::bar(k, tab, s.diff_layout))
             .children(end_confirm(k, s, &tab.session))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
@@ -2141,7 +2157,18 @@ fn composer_title(s: &State) -> String {
     }
 }
 
-fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+/// The window's key handler: Ctrl+F (Cmd+F) opens Search, and the diff's keys move the diff
+/// unless a field has the keys. Public so tests can drive it in Rune's headless `Runtime`.
+pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if search::is_open_chord(ev) {
+        return s.open_search();
+    }
+    if ev.key == rune::Key::Escape && s.close_displayed_search() {
+        return true;
+    }
+    if s.search_has_focus() {
+        return false;
+    }
     // The Rendered view covers the diff, whose keys must not move it underneath.
     s.displayed_tab_mut().filter(|t| t.rendered.is_none()).is_some_and(|t| t.diff.key(ev, tx))
 }
