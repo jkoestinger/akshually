@@ -69,6 +69,7 @@ mod notifier;
 mod rendered;
 mod search;
 mod theme;
+mod thread_nav;
 
 pub use mono_font::{MonoFace, MonoFonts, upright_mono};
 pub use notifier::DesktopNotifier;
@@ -231,6 +232,8 @@ struct SessionTab {
     /// The Session's Search: its query and where the human is in its matches. The UI's own, so
     /// it's lost on restart.
     search: search::Search,
+    /// The Thread `n` or `p` last went to, so the next press carries on from it. The UI's own.
+    reached: Option<thread_nav::Reached>,
 }
 
 impl SessionTab {
@@ -247,6 +250,7 @@ impl SessionTab {
             choosing_view: false,
             rendered: None,
             search: search::Search::new(),
+            reached: None,
         };
         tab.annotate(None);
         tab
@@ -1120,6 +1124,7 @@ fn pull_request_header(k: &Kit, tab: &SessionTab, pr: &akshually_core::forge::Pu
         .child(text(format!("{} · {} → {base}", pr.author, session.branch())).font(k.ty.mono).color(k.c.text_muted))
         .child(changeset_totals(k, tab))
         .child(row().grow(1.0))
+        .children(thread_nav::buttons(k, tab))
         .child(layout_control(k, tab))
         .child(Badge::new(format!("{} Drafts", tab.session.drafts())).build(k))
         .child(
@@ -1444,6 +1449,7 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
         .child(Badge::new(format!("Round {}", session.round)).build(k))
         .child(if yours { turn.variant(BadgeVariant::Accent) } else { turn }.build(k))
         .child(row().grow(1.0))
+        .children(thread_nav::buttons(k, tab))
         .child(layout_control(k, tab))
         .children(view_select)
         .child(
@@ -2157,8 +2163,8 @@ fn composer_title(s: &State) -> String {
     }
 }
 
-/// The window's key handler: Ctrl+F (Cmd+F) opens Search, and the diff's keys move the diff
-/// unless a field has the keys. Public so tests can drive it in Rune's headless `Runtime`.
+/// The window's key handler: Ctrl+F (Cmd+F) opens Search, and the diff's keys (and `n`/`p` for
+/// the Threads) move the diff unless a field has the keys. Public so tests can drive it in Rune's headless `Runtime`.
 pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if search::is_open_chord(ev) {
         return s.open_search();
@@ -2170,7 +2176,7 @@ pub fn on_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return false;
     }
     // The Rendered view covers the diff, whose keys must not move it underneath.
-    s.displayed_tab_mut().filter(|t| t.rendered.is_none()).is_some_and(|t| t.diff.key(ev, tx))
+    thread_nav::on_diff_key(s, ev, tx)
 }
 
 /// `--scene session`: a sample Session in Round 2, shown since its last Round, plus tabs for an
