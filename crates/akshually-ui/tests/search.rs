@@ -225,22 +225,18 @@ fn repo_with_two_hunks() -> TestRepo {
     repo
 }
 
-/// How far down the diff is scrolled: the furthest any element is carried up by scrolling.
-fn scrolled(rt: &Runtime<State>) -> f32 {
-    rt.elements().into_iter().map(|e| e.scrolled[1]).fold(0.0, f32::max)
-}
-
 #[test]
 fn typing_in_the_search_field_never_triggers_the_diffs_own_keys() {
     let repo = repo_with_two_hunks();
     let (_service, _id, mut rt) = review(&repo);
     find_chord(&mut rt);
-    let before = scrolled(&rt);
+    assert!(!shows(&rt, "df0.n80"), "the second hunk was in view before any key");
 
-    type_text(&mut rt, "jk][");
+    // Two `j`s would take the diff to the second hunk, as `after_escape_the_diffs_own_keys_work_again` has it.
+    type_text(&mut rt, "jj][");
 
     assert_eq!(count(&rt), "No matches", "the keys didn't land in the search field");
-    assert_eq!(scrolled(&rt), before, "a diff key moved the diff while the search field had focus");
+    assert!(!shows(&rt, "df0.n80"), "a diff key moved the diff while the search field had focus");
 }
 
 #[test]
@@ -305,9 +301,9 @@ fn text_in_an_unexpanded_unchanged_stretch_is_not_matched_until_it_is_expanded()
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(0.0);
-    // The diff view expands without rebuilding the window, so the count catches up on the next
-    // thing the human does in the field.
-    find_chord(&mut rt);
+    for _ in 0..10 {
+        rt.frame(1.0 / 60.0);
+    }
 
     assert_eq!(count(&rt), "1 of 1", "the expanded stretch wasn't searched");
 }

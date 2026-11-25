@@ -171,11 +171,12 @@ fn searched_lines<'a>(
 ) -> Vec<(u32, diff::Side, u32, &'a str)> {
     let mut lines = Vec::new();
     // An unchanged line is the same text on both sides, so it's found once, as the diff shows it.
-    let (context, side) = match (&change.new, &change.old) {
+    let (text, side) = match (&change.new, &change.old) {
         (Some(new), _) => (new.as_str(), diff::Side::New),
         (None, old) => (old.as_deref().unwrap_or(""), diff::Side::Old),
     };
-    let context: Vec<&str> = if diff.hunks.is_empty() { Vec::new() } else { context.lines().collect() };
+    // Split only once a stretch turns out to be showing: most files never reveal one.
+    let mut context: Option<Vec<&str>> = None;
     let old_total = change.old.as_deref().map_or(0, |old| old.lines().count() as u32);
     let (mut old_at, mut new_at) = (1u32, 1u32);
     for gap in 0..=diff.hunks.len() {
@@ -186,6 +187,7 @@ fn searched_lines<'a>(
         };
         let hidden = tab.diff.hidden(file, gap);
         let revealed = hidden.map_or(0, |hidden| len.saturating_sub(hidden));
+        // From the hunk it grows from: the first stretch upwards from the first hunk, the last
         // downwards from the last, and a middle one only when it's whole.
         let shown = match (gap, hidden) {
             (0, _) => len - revealed..len,
@@ -194,6 +196,7 @@ fn searched_lines<'a>(
             _ => 0..0,
         };
         for k in shown {
+            let context = context.get_or_insert_with(|| text.lines().collect());
             let (anchor, line) = (new_at + k, if side == diff::Side::New { new_at + k } else { old_at + k });
             if let Some(&source) = context.get(line.saturating_sub(1) as usize) {
                 lines.push((anchor, side, line, source));
