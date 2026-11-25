@@ -2,8 +2,9 @@
 //! reach: an update replaces only the binary, so the binary carries the files itself.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::store::write_atomically;
 
 /// The launcher entry this version ships, as `packaging/linux/akshually.desktop`.
 const DESKTOP_ENTRY: &[u8] = include_bytes!("../../../packaging/linux/akshually.desktop");
@@ -19,6 +20,14 @@ const ICONS: [(&str, &[u8]); 7] = [
     ("512x512", include_bytes!("../../../packaging/icons/hicolor/512x512/apps/akshually.png")),
 ];
 
+/// Why the launcher entry or its icon couldn't be written.
+#[derive(Debug, thiserror::Error)]
+pub enum LauncherError {
+    /// Writing `path` failed.
+    #[error("can't write {}: {source}", path.display())]
+    Io { path: PathBuf, source: std::io::Error },
+}
+
 /// Brings the launcher entry and the icon under `data_home` (the user's XDG data home) up to
 /// this version's, when an `akshually` launcher entry is installed there already: a missing or
 /// different file is replaced. Writes nothing for a binary with no launcher entry (a hand-run or
@@ -26,7 +35,7 @@ const ICONS: [(&str, &[u8]); 7] = [
 ///
 /// Fails at the first file it can't write; the caller logs it and goes on, since the launcher is
 /// cosmetic and must never hold up the app.
-pub fn repair_launcher(data_home: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn repair_launcher(data_home: &Path) -> Result<Vec<PathBuf>, LauncherError> {
     let entry = data_home.join("applications/akshually.desktop");
     if !entry.is_file() {
         return Ok(Vec::new());
@@ -46,15 +55,11 @@ pub fn repair_launcher(data_home: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(written)
 }
 
-/// Writes `bytes` to `path` beside it and renames over it, so a reader never sees half a file.
-fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = dir.join(format!(".{name}.new"));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
-        // Best-effort: the rename's error is the one to report.
-        let _ = fs::remove_file(&tmp);
-    })
+/// Writes `bytes` to `path`, making its directory first.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), LauncherError> {
+    let at = |source| LauncherError::Io { path: path.to_owned(), source };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(at)?;
+    }
+    write_atomically(path, bytes).map_err(at)
 }

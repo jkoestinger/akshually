@@ -1,11 +1,11 @@
-//! Seam A: the launch repair of the Linux launcher entry and icon, against a throwaway data
-//! home, with the files `packaging/` ships as the expected content.
+//! The core crate's public interface, against a throwaway directory: the launch repair of the
+//! Linux launcher entry and icon, with the files `packaging/` ships as the expected content.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use akshually_core::repair_launcher;
+use akshually_core::{LauncherError, repair_launcher};
 use akshually_testkit::TestDirs;
 
 const SIZES: [&str; 7] = ["16x16", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512"];
@@ -91,5 +91,8 @@ fn an_unwritable_data_home_is_an_error_not_a_panic() {
     for dir in &locked {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    assert!(result.is_err(), "reported success writing to a read-only data home");
+    let Err(LauncherError::Io { path, .. }) = result else {
+        panic!("reported success writing to a read-only data home")
+    };
+    assert!(path.starts_with(dirs.path()), "the error names {} rather than the file it couldn't write", path.display());
 }

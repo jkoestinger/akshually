@@ -1,5 +1,6 @@
-//! Seam C: self-update at its HTTP boundary: which release is offered, looking releases up and
-//! downloading them from a `mockito` GitHub, and replacing a throwaway install with one.
+//! Self-update through the core crate's public interface, against a `mockito` GitHub and a
+//! throwaway directory: which release is offered, looking releases up and downloading them, and
+//! replacing an install with one.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -233,13 +234,28 @@ fn an_install_whose_bundle_has_any_name_is_replaced_as_a_bundle() {
     let (name, archive) = macos_asset("new binary");
     let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
     let apps = TestDirs::new();
-    let exe = write_bundle(&apps.path().join("Review"), "old binary");
+    let exe = write_bundle(&apps.path().join("Review.app"), "old binary");
     let (release, updater) = release_and_updater(&github, Target::new(MACOS, Archive::Zip), &exe);
 
     updater.install(&release).unwrap();
 
     let left: Vec<_> = fs::read_dir(apps.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(left, ["Akshually.app"]);
+}
+
+#[test]
+fn a_contents_macos_binary_outside_an_app_directory_is_replaced_as_a_plain_binary() {
+    let (name, archive) = linux_asset("new binary");
+    let github = FakeReleases::new(vec![FakeRelease::new(TAG).asset(&name, archive)]);
+    let dirs = TestDirs::new();
+    let exe = write_bundle(&dirs.path().join("Review"), "old binary");
+    let (release, updater) = release_and_updater(&github, Target::new(LINUX, Archive::TarGz), &exe);
+
+    updater.install(&release).unwrap();
+
+    assert_eq!(fs::read_to_string(&exe).unwrap(), "new binary");
+    let left: Vec<_> = fs::read_dir(dirs.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["Review"], "the update treated a directory without `.app` as a bundle");
 }
 
 #[test]
