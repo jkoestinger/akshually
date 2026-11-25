@@ -72,6 +72,7 @@ pub const WINDOW_CHROME: Chrome = Chrome {
 mod mono_font;
 mod notifier;
 mod rendered;
+mod scroll_bar;
 mod search;
 mod theme;
 
@@ -919,7 +920,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(push_banner(k, tab))
             .child(general_threads(k, s, tab, agent))
             .child(outdated_threads(k, tab))
-            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab, agent))),
+            .child(col().grow(1.0).min_h(0.0).child(session_diff(k, s, tab, agent)).children(scroll_bar::overlay(
+                k,
+                cx,
+                &diff_key(&tab.session.id),
+            ))),
         None => {
             let draft = theme::tokens(cx.system_dark()).color("state-draft");
             col()
@@ -1694,6 +1699,11 @@ fn push_banner(k: &Kit, tab: &SessionTab) -> El {
     )
 }
 
+/// The key of the diff view of Session `id`, under which Rune keys its scroll viewport.
+fn diff_key(id: &SessionId) -> String {
+    format!("diff-{id}")
+}
+
 /// The Session's diff, with each file's Comment and Viewed controls and its Threads under their
 /// lines. The diff view finds its state by Session id, as it outlives this call. Its handlers
 /// can run after the Session's tab is gone (see `State::spare_diff`); they then do nothing.
@@ -1712,7 +1722,7 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
             None => &mut s.spare_diff,
         },
     )
-    .key(format!("diff-{}", tab.session.id))
+    .key(diff_key(&tab.session.id))
     .header_actions(move |s: &State, file: usize| {
         let Some(tab) = s.tab(&id_header) else { return row() };
         let Some(change) = tab.session.shown().files.get(file) else { return row() };
