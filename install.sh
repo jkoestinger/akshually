@@ -6,8 +6,9 @@
 # Installs the latest stable release, or the tag in `AKSHUALLY_VERSION` (pre-releases included), after
 # checking the asset against the release's `SHA256SUMS`. Re-running it replaces the install in place.
 #
-#   Linux:  ~/.local/bin/akshually and ~/.local/share/applications/akshually.desktop
-#   macOS:  ~/Applications/akshually.app, and a ~/.local/bin/akshually symlink to the binary inside it
+#   Linux:  ~/.local/bin/akshually, and under the data home (`$XDG_DATA_HOME`, else ~/.local/share) the
+#           launcher entry applications/akshually.desktop and the icon in icons/hicolor/
+#   macOS:  ~/Applications/Akshually.app, and a ~/.local/bin/akshually symlink to the binary inside it
 #
 # These locations are a contract: self-update replaces installs found there (docs/adr/0003).
 # `AKSHUALLY_RELEASES_URL` points it at another copy of the Releases tree, for the tests' `file://` one.
@@ -99,14 +100,23 @@ main() {
     if [[ $ext == tar.gz ]]; then
         tar -C "$work/unpacked" -xzf "$work/$asset"
         local dir="$work/unpacked/${asset%.tar.gz}"
+        # Releases from before the icon hold none, so it is installed when the asset has it.
         [[ -f $dir/akshually && -f $dir/akshually.desktop ]] ||
             die "$asset doesn't hold akshually and its launcher entry, so nothing was installed; report it at $releases_page"
         install_linux "$dir" "$bin_dir"
     else
         unzip -q "$work/$asset" -d "$work/unpacked"
-        [[ -f $work/unpacked/akshually.app/Contents/MacOS/akshually ]] ||
-            die "$asset doesn't hold akshually.app, so nothing was installed; report it at $releases_page"
-        install_macos "$work/unpacked/akshually.app" "$bin_dir"
+        # Releases from before the rename hold `akshually.app`; either way it is installed as `Akshually.app`.
+        local app='' name
+        for name in Akshually.app akshually.app; do
+            if [[ -f $work/unpacked/$name/Contents/MacOS/akshually ]]; then
+                app="$work/unpacked/$name"
+                break
+            fi
+        done
+        [[ -n $app ]] ||
+            die "$asset doesn't hold Akshually.app, so nothing was installed; report it at $releases_page"
+        install_macos "$app" "$bin_dir"
     fi
     new=$("$bin_dir/akshually" --version) ||
         die "the installed $bin_dir/akshually doesn't run; report it at $releases_page with your OS version"
@@ -154,11 +164,26 @@ path_hint() {
     fi
 }
 
-# Installs the binary and the launcher entry from the unpacked tarball dir `$1` into bin dir `$2`.
+# Prints the user's XDG data home. The app repairs its launcher entry there at launch, so both must
+# agree where it is; a relative `$XDG_DATA_HOME` is ignored, as the spec says.
+data_home() {
+    case ${XDG_DATA_HOME:-} in
+    /*) echo "$XDG_DATA_HOME" ;;
+    *) echo "$HOME/.local/share" ;;
+    esac
+}
+
+# Installs the binary, the launcher entry and the icon from the unpacked tarball dir `$1` into bin dir `$2`.
 install_linux() {
     local dir=$1 bin_dir=$2
+    local data icon
+    data=$(data_home)
     replace_file 755 "$dir/akshually" "$bin_dir/akshually"
-    replace_file 644 "$dir/akshually.desktop" "$HOME/.local/share/applications/akshually.desktop"
+    replace_file 644 "$dir/akshually.desktop" "$data/applications/akshually.desktop"
+    [[ -d $dir/icons/hicolor ]] || return 0
+    while read -r icon; do
+        replace_file 644 "$dir/icons/hicolor/$icon" "$data/icons/hicolor/$icon"
+    done < <(cd "$dir/icons/hicolor" && find . -type f -name akshually.png | sed 's|^\./||')
 }
 
 # Copies `$2` to `$3` with mode `$1`. It writes beside `$3` and renames over it, so a running
@@ -172,23 +197,25 @@ replace_file() {
     mv -f "$tmp" "$dest"
 }
 
-# Installs the unpacked bundle `$1` as `~/Applications/akshually.app` and links `$2/akshually` to the
+# Installs the unpacked bundle `$1` as `~/Applications/Akshually.app` and links `$2/akshually` to the
 # binary inside it, so the CLI and the app stay one binary.
 install_macos() {
     local app=$1 bin_dir=$2
     local apps="$HOME/Applications"
     mkdir -p "$apps" "$bin_dir"
-    # Copy beside the old bundle first (the temp dir may be on another volume), then swap it in.
-    rm -rf "$apps/.akshually.app.new"
-    cp -R "$app" "$apps/.akshually.app.new"
-    rm -rf "$apps/akshually.app"
-    mv "$apps/.akshually.app.new" "$apps/akshually.app"
+    # Copy beside the old bundle first (the temp dir may be on another volume), then swap it in. Both
+    # names go before the move: on a case-insensitive volume they are one directory, and removing
+    # the old name after the move would remove the new bundle.
+    rm -rf "$apps/.Akshually.app.new"
+    cp -R "$app" "$apps/.Akshually.app.new"
+    rm -rf "$apps/akshually.app" "$apps/Akshually.app"
+    mv "$apps/.Akshually.app.new" "$apps/Akshually.app"
     # curl sets no quarantine flag, but a proxy or a copied download could: clear it so Gatekeeper
     # doesn't call the unsigned app damaged.
     if command -v xattr >/dev/null; then
-        xattr -dr com.apple.quarantine "$apps/akshually.app" 2>/dev/null || true
+        xattr -dr com.apple.quarantine "$apps/Akshually.app" 2>/dev/null || true
     fi
-    ln -sfn "$apps/akshually.app/Contents/MacOS/akshually" "$bin_dir/akshually"
+    ln -sfn "$apps/Akshually.app/Contents/MacOS/akshually" "$bin_dir/akshually"
 }
 
 main "$@"

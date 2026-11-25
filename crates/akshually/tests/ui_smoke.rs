@@ -211,7 +211,7 @@ fn escape_closes_the_rendered_view_in_the_app() {
 fn the_update_notice_names_the_newer_release_and_offers_update() {
     let tree = scene_tree("update", &[]);
 
-    assert!(tree.0.to_string().contains("akshually 99.0.0 is available."), "no update notice naming the release");
+    assert!(tree.0.to_string().contains("Akshually 99.0.0 is available."), "no update notice naming the release");
     assert!(tree.button("Update").is_some(), "the notice offers no Update");
 }
 
@@ -226,7 +226,7 @@ fn dismissing_the_update_notice_hides_it() {
 fn an_installed_update_offers_restart() {
     let tree = scene_tree("update-installed", &[]);
 
-    assert!(tree.0.to_string().contains("akshually 99.0.0 is installed."), "the notice doesn't say it's installed");
+    assert!(tree.0.to_string().contains("Akshually 99.0.0 is installed."), "the notice doesn't say it's installed");
     assert!(tree.button("Restart").is_some(), "the notice offers no Restart");
 }
 

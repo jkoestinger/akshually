@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use akshually_core::{
     Anchor, LocalOptions, NewComment, Outcome, Paths, Service, Settings, Side, ThreadId, forge,
     ipc::{self, BindError, ClientError, Connection, ErrorCode, Server},
-    update::{Releases, Updater},
+    update::{self, Releases, Updater},
 };
 
 /// The agent skill `agent-help` prints.
@@ -391,6 +391,19 @@ fn connect_to_running(paths: &Paths) -> Result<Connection> {
     }
 }
 
+/// Brings the Linux launcher entry and icon up to this version's, when the entry is installed: an
+/// update replaces only the binary, so this is how an existing install gets the icon. Logged, never
+/// fatal: the launcher is cosmetic.
+fn repair_launcher() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(data_home) = dirs::data_dir() else { return };
+    if let Err(error) = akshually_core::repair_launcher(&data_home) {
+        eprintln!("akshually: can't update the launcher entry in {}: {error}", data_home.display());
+    }
+}
+
 fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     let settings = Settings::load(&Settings::file_from_env())?;
     if !headless && akshually_ui::is_headless_run(&rune_args) {
@@ -412,7 +425,8 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
     // No window means nothing to notify about, and tests never show real notifications.
     let service = Arc::new(if headless { service } else { service.with_notifier(akshually_ui::DesktopNotifier) });
     service.set_settings(settings);
-    service.on_restart(move || relaunch(&exe, headless));
+    // An Update may have renamed the macOS bundle, so the binary to start isn't always at `exe`.
+    service.on_restart(move || relaunch(&update::installed_exe(&exe), headless));
     let server = match Server::bind(&paths, service.clone()) {
         Ok(server) => server,
         // Another instance serves the CLI already; leave it to that one, and bring its window
@@ -432,6 +446,7 @@ fn app(headless: bool, rune_args: Vec<String>) -> Result<ExitCode> {
             if std::env::var_os("AKSHUALLY_TEST_CONTROL").is_some() { server.with_test_control() } else { server };
         server.serve().context("can't serve the CLI")?;
     } else {
+        repair_launcher();
         let notifying_service = service.clone();
         std::thread::spawn(move || {
             // Logged and notified rather than fatal: the window stays up (ADR 0002), though

@@ -5,15 +5,17 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>akshually</string>
+	<string>Akshually</string>
 	<key>CFBundleExecutable</key>
+	<string>akshually</string>
+	<key>CFBundleIconFile</key>
 	<string>akshually</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.github.jkoestinger.akshually</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>akshually</string>
+	<string>Akshually</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
