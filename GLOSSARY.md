@@ -100,6 +100,10 @@ _Avoid_: Suggestion, pending comment
 Where a Thread is attached: a line range on the old or new side of a file, a whole file, or the Review as a whole.
 _Avoid_: Position, location
 
+**General Thread**:
+A Thread anchored to a whole file or to the Review as a whole, so it has no line in the diff; the Window shows them together above the diff.
+_Avoid_: Review-wide comment, global comment
+
 **Outdated**:
 The state of a Thread whose Anchor no longer exists in the current Changeset; it still shows the code it was written against.
 _Avoid_: Stale, orphaned
