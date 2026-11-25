@@ -177,6 +177,9 @@ pub struct State {
     /// The Session the human asked to abandon (or close, for a Pull Request), until they
     /// confirm or cancel.
     confirming_end: Option<SessionId>,
+    /// The Session the human pressed Approve in while it held unsent items, until they confirm
+    /// or cancel (#104).
+    confirming_approve: Option<SessionId>,
     /// What a Session's diff view reads and writes once its tab is gone. Rune runs pointer,
     /// wheel and visible-row handlers against the last built view, so they can reach a diff
     /// view after `apply` dropped its tab and before the next rebuild drops the view (#37).
@@ -357,6 +360,7 @@ impl State {
             publish: None,
             summary: TextEdit::new(""),
             confirming_end: None,
+            confirming_approve: None,
             spare_diff: DiffState::new(Vec::new()),
         };
         let window = state.service.window();
@@ -414,6 +418,9 @@ impl State {
         }
         if self.confirming_end.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
             self.confirming_end = None;
+        }
+        if self.confirming_approve.as_ref().is_some_and(|id| !self.tabs.iter().any(|t| &t.session.id == id)) {
+            self.confirming_approve = None;
         }
         self.annotate();
         self.displayed = displayed;
@@ -581,6 +588,17 @@ impl State {
                 self.confirming_end = Some(id);
             }
         }
+    }
+
+    /// Human, from the header's Approve: approves the Session, asking first when that discards
+    /// unsent items. The question shows with the Session it is about (#104).
+    fn approve(&mut self, id: SessionId) {
+        let Some(tab) = self.tab(&id) else { return };
+        if tab.actions.discarded_by_approving == 0 {
+            self.act(&id, Service::approve);
+            return;
+        }
+        self.confirming_approve = Some(id);
     }
 
     /// Human: lays out every Session's Changeset as `layout`.
@@ -873,6 +891,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .children(update_notice(k, s))
             .child(session_header(k, tab, &mut layer))
             .children(end_confirm(k, s, &tab.session))
+            .children(approve_confirm(k, s, tab))
             .children(turn_banner(k, &tab.session))
             .child(disk_banner(k, tab))
             .child(push_banner(k, tab))
@@ -1399,8 +1418,9 @@ fn session_header(k: &Kit, tab: &SessionTab, layer: &mut Vec<El>) -> El {
     let verdict = tab.actions.verdict.map(|verdict| match verdict {
         VerdictAction::Approve => Button::new("Approve")
             .variant(ButtonVariant::Contrast)
-            .on_press(move |s: &mut State| s.act(&verdict_id, Service::approve))
-            .build(k),
+            .on_press(move |s: &mut State| s.approve(verdict_id.clone()))
+            .build(k)
+            .key("approve"),
         VerdictAction::TakeTurnBack => Button::new("Take Turn back")
             .variant(ButtonVariant::Outline)
             .on_press(move |s: &mut State| s.act(&verdict_id, Service::take_turn_back))
@@ -1483,6 +1503,50 @@ fn end_confirm(k: &Kit, s: &State, session: &SessionView) -> Option<El> {
                     })
                     .build(k)
                     .key("end-confirm-end"),
+            ),
+    )
+}
+
+/// Asks the human to confirm approving a Session that holds unsent Drafts or reopened Threads,
+/// which the agent then never receives. Cancel keeps everything, so the Round can still go over.
+fn approve_confirm(k: &Kit, s: &State, tab: &SessionTab) -> Option<El> {
+    let session = &tab.session;
+    let items = tab.actions.discarded_by_approving;
+    if s.confirming_approve.as_ref() != Some(&session.id) || items == 0 {
+        return None;
+    }
+    let (noun, verb) = if items == 1 { ("item", "is") } else { ("items", "are") };
+    let question = format!(
+        "Approve without handing over? {items} unsent {noun} {verb} discarded: the agent only gets the Verdict."
+    );
+    let id = session.id.clone();
+    Some(
+        row()
+            .key("approve-confirm")
+            .w_full()
+            .px(16.0)
+            .py(8.0)
+            .gap(12.0)
+            .items_center()
+            .fill(k.c.layer_02)
+            .child(text(question).font(k.ty.ui).color(k.c.text_base))
+            .child(row().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.confirming_approve = None)
+                    .build(k)
+                    .key("approve-confirm-cancel"),
+            )
+            .child(
+                Button::new("Approve")
+                    .variant(ButtonVariant::Danger)
+                    .on_press(move |s: &mut State| {
+                        s.confirming_approve = None;
+                        s.act(&id, Service::approve);
+                    })
+                    .build(k)
+                    .key("approve-confirm-approve"),
             ),
     )
 }
