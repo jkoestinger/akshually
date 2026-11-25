@@ -92,22 +92,34 @@ impl Service {
     /// does, or why not. Once the Session has ended, nothing is offered.
     fn human_thread(
         &self,
-        ThreadRef { session: id, thread }: &ThreadRef,
+        thread: &ThreadRef,
         offered: impl FnOnce(&ThreadActions) -> Result<(), Error>,
         f: impl FnOnce(&mut Thread),
     ) -> Result<(), Error> {
+        self.with_thread(thread, offered, |threads, at| f(&mut threads[at]))
+    }
+
+    /// Runs `f` on the Session's Threads with the position of `thread`, if its Session offers
+    /// the action there: `offered` says whether it does, or why not. Once the Session has ended,
+    /// nothing is offered. Every action on a Thread the human takes goes through here, so the
+    /// rules (the lock, the Member the Thread is in, the notification) live once.
+    pub(super) fn with_thread<T>(
+        &self,
+        ThreadRef { session: id, thread }: &ThreadRef,
+        offered: impl FnOnce(&ThreadActions) -> Result<(), Error>,
+        f: impl FnOnce(&mut Vec<Thread>, usize) -> T,
+    ) -> Result<T, Error> {
         let mut inner = self.lock();
         let at = inner.position(id)?;
         let session = &mut inner.sessions[at];
-        session.at_member_of(thread, |session| {
+        let result = session.at_member_of(thread, |session| {
             let view = &mut session.view;
             offered(&view.thread_offered(thread)?)?;
-            let found = view.threads.iter_mut().find(|t| &t.id == thread).expect("`thread_offered` found it");
-            f(found);
-            Ok::<(), Error>(())
+            let found = view.threads.iter().position(|t| &t.id == thread).expect("`thread_offered` found it");
+            Ok::<T, Error>(f(&mut view.threads, found))
         })?;
         inner.notify();
-        Ok(())
+        Ok(result)
     }
 
     /// Runs `f` on a Thread a Round brought the agent, in the Session of `source`, with the
