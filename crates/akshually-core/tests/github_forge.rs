@@ -318,6 +318,62 @@ fn fetches_the_changeset_against_the_merge_base_through_every_page_of_files() {
 }
 
 #[test]
+fn fetches_the_changeset_between_two_commits_with_the_files_and_lines_a_pull_requests_has() {
+    let mut h = Harness::new();
+    // The files of the Pull Request's own Changeset, listed by the comparison itself, in pages.
+    let compare = |files: &str| {
+        let mut body: serde_json::Value = serde_json::from_str(&fixture("compare.json")).unwrap();
+        body["files"] = serde_json::from_str(files).unwrap();
+        body.to_string()
+    };
+    let page2 = format!("{}/repos/acme/web/compare/base1...head3?per_page=100&page=2", h.server.url());
+    h.server
+        .mock("GET", "/repos/acme/web/compare/base1...head3")
+        .match_query(Matcher::Exact("per_page=100".into()))
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .with_header("link", &format!("<{page2}>; rel=\"next\", <{page2}>; rel=\"last\""))
+        .with_body(compare(&fixture("files-1.json")))
+        .create();
+    h.server
+        .mock("GET", "/repos/acme/web/compare/base1...head3")
+        .match_query(Matcher::Exact("per_page=100&page=2".into()))
+        .with_body(compare(&fixture("files-2.json")))
+        .create();
+    let reads = [
+        h.contents("src/a.rs", "mb1", "fn a() {}\n"),
+        h.contents("src/a.rs", "head3", "fn a2() {}\n"),
+        h.contents("docs/new.md", "head3", "# New\n"),
+        h.contents("old.txt", "mb1", "bye\n"),
+        h.contents("src/b.rs", "mb1", "fn b() {}\n"),
+        h.contents("lib/b.rs", "head3", "fn b() {}\n"),
+    ];
+
+    let changeset = h.github().changeset_between("acme/web", "base1", "head3").unwrap();
+
+    reads.iter().for_each(Mock::assert);
+    assert_eq!(changeset.base, "mb1");
+    let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| {
+        let hunks = hunks.iter().map(|&(old_start, old_lines, new_start, new_lines)| Hunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+        });
+        FileChange { hunks: Some(hunks.collect()), ..FileChange::text(path, old, new) }
+    };
+    assert_eq!(
+        changeset.files,
+        vec![
+            change("docs/new.md", None, Some("# New\n"), &[(0, 0, 1, 1)]),
+            change("lib/b.rs", None, Some("fn b() {}\n"), &[]),
+            change("old.txt", Some("bye\n"), None, &[(1, 1, 0, 0)]),
+            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n"), &[(1, 1, 1, 1)]),
+            change("src/b.rs", Some("fn b() {}\n"), None, &[]),
+        ]
+    );
+}
+
+#[test]
 fn file_contents_are_fetched_in_parallel_and_kept_in_path_order() {
     let paths: Vec<String> = (0..16).map(|n| format!("src/f{n:02}.rs")).collect();
     let listed: Vec<String> =

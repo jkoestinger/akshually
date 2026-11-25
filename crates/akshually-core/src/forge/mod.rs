@@ -36,6 +36,14 @@ pub trait ForgeAdapter: Send + Sync {
     /// against the merge-base (what the Forge's own diff shows).
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError>;
 
+    /// The Changeset between two commits of `repo` (`owner/repo`): what `head` changes against
+    /// `base`, as a Pull Request's Changeset has it. The Stack Changeset is this, from the
+    /// bottom member's base to the top member's head. `Unsupported` for a Forge with no way to
+    /// ask. Blocks on the network.
+    fn changeset_between(&self, _repo: &str, _base: &str, _head: &str) -> Result<Changeset, ForgeError> {
+        Err(ForgeError::Unsupported { host: self.host().to_owned(), what: "compare two commits" })
+    }
+
     /// The Threads already on the Pull Request, from anyone.
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError>;
 

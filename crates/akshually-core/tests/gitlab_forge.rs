@@ -282,6 +282,62 @@ impl Harness {
 }
 
 #[test]
+fn fetches_the_changeset_between_two_commits_with_the_files_and_lines_a_merge_requests_has() {
+    let mut h = Harness::new();
+    let mut diffs: Vec<Value> = serde_json::from_str(&fixture("diffs-1.json")).unwrap();
+    diffs.extend(serde_json::from_str::<Vec<Value>>(&fixture("diffs-2.json")).unwrap());
+    let compare = h
+        .server
+        .mock("GET", "/projects/platform%2Finfra/repository/compare")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("from".into(), "mb1".into()),
+            Matcher::UrlEncoded("to".into(), "head3".into()),
+            Matcher::UrlEncoded("straight".into(), "true".into()),
+        ]))
+        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+        .with_body(json!({ "commit": { "id": "head3" }, "diffs": diffs }).to_string())
+        .create();
+    let reads = [
+        h.raw("src/a.rs", "mb1", b"fn a() {}\n"),
+        h.raw("src/a.rs", "head3", b"fn a2() {}\n"),
+        h.raw("docs/new.md", "head3", b"# New\n"),
+        h.raw("old.txt", "mb1", b"bye\n"),
+        h.raw("src/b.rs", "mb1", b"fn b() {}\n"),
+        h.raw("lib/b.rs", "head3", b"fn b() {}\n"),
+    ];
+
+    let changeset = h.gitlab().changeset_between("platform/infra", "mb1", "head3").unwrap();
+
+    compare.assert();
+    reads.iter().for_each(Mock::assert);
+    assert_eq!(changeset.base, "mb1");
+    let change = |path, old, new, hunks: &[(u32, u32, u32, u32)]| FileChange {
+        hunks: Some(
+            hunks
+                .iter()
+                .map(|&(old_start, old_lines, new_start, new_lines)| Hunk {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                })
+                .collect(),
+        ),
+        ..FileChange::text(path, old, new)
+    };
+    assert_eq!(
+        changeset.files,
+        vec![
+            change("docs/new.md", None, Some("# New\n"), &[(0, 0, 1, 1)]),
+            change("lib/b.rs", None, Some("fn b() {}\n"), &[]),
+            change("old.txt", Some("bye\n"), None, &[(1, 1, 0, 0)]),
+            change("src/a.rs", Some("fn a() {}\n"), Some("fn a2() {}\n"), &[(1, 1, 1, 1)]),
+            change("src/b.rs", Some("fn b() {}\n"), None, &[]),
+        ]
+    );
+}
+
+#[test]
 fn fetches_the_changeset_against_the_merge_base_through_every_page_of_diffs() {
     let mut h = Harness::new();
     let pages = [h.diffs("1", "2", &fixture("diffs-1.json")), h.diffs("2", "", &fixture("diffs-2.json"))];

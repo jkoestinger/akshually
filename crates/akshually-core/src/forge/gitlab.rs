@@ -159,9 +159,42 @@ impl GitLab {
         }
     }
 
+    /// The Changeset of `listed` files of the project `repo`, from `base` to `head`, with their
+    /// contents on both sides read from the Forge.
+    fn diffs_changeset(&self, repo: &str, listed: Vec<Diff>, base: &str, head: &str) -> Result<Changeset, ForgeError> {
+        // Like the local Source, renames are a deletion plus an addition. GitLab takes line
+        // comments only on the lines its diff shows, so each file keeps the diff's hunks (none
+        // for a diff GitLab collapsed or found too large).
+        let mut fetches = Vec::new();
+        for diff in listed {
+            let hunks = Some(Hunk::parse_patch(&diff.diff));
+            let fetch = |path: &String, old: Option<&String>, new: Option<&String>| FileFetch {
+                path: path.clone(),
+                old: old.cloned(),
+                new: new.cloned(),
+                hunks: hunks.clone(),
+            };
+            let (old, new) = (&diff.old_path, &diff.new_path);
+            if diff.new_file {
+                fetches.push(fetch(new, None, Some(new)));
+            } else if diff.deleted_file {
+                fetches.push(fetch(old, Some(old), None));
+            } else if diff.renamed_file {
+                fetches.push(fetch(old, Some(old), None));
+                fetches.push(fetch(new, None, Some(new)));
+            } else {
+                fetches.push(fetch(new, Some(old), Some(new)));
+            }
+        }
+        fetches.sort_by(|a, b| a.path.cmp(&b.path));
+        let files =
+            fetch_files(&fetches, |path, side| self.file(repo, path, if side == Side::Old { base } else { head }))?;
+        Ok(Changeset { base: base.to_owned(), files })
+    }
+
     /// A file's contents at `sha`.
-    fn file(&self, pr: &PullRequestRef, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
-        let mut url = self.client.endpoint(&["projects", &pr.repo, "repository", "files", path, "raw"]);
+    fn file(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, ForgeError> {
+        let mut url = self.client.endpoint(&["projects", repo, "repository", "files", path, "raw"]);
         url.query_pairs_mut().append_pair("ref", sha);
         self.client.file(self.client.agent().get(url.as_str()))
     }
@@ -410,37 +443,20 @@ impl ForgeAdapter for GitLab {
     }
 
     fn changeset(&self, pr: &PullRequest) -> Result<Changeset, ForgeError> {
-        let id = &pr.id;
-        let listed = self.diffs(id)?;
-        // Like the local Source, renames are a deletion plus an addition. GitLab takes line
-        // comments only on the lines its diff shows, so each file keeps the diff's hunks (none
-        // for a diff GitLab collapsed or found too large).
-        let mut fetches = Vec::new();
-        for diff in listed {
-            let hunks = Some(Hunk::parse_patch(&diff.diff));
-            let fetch = |path: &String, old: Option<&String>, new: Option<&String>| FileFetch {
-                path: path.clone(),
-                old: old.cloned(),
-                new: new.cloned(),
-                hunks: hunks.clone(),
-            };
-            let (old, new) = (&diff.old_path, &diff.new_path);
-            if diff.new_file {
-                fetches.push(fetch(new, None, Some(new)));
-            } else if diff.deleted_file {
-                fetches.push(fetch(old, Some(old), None));
-            } else if diff.renamed_file {
-                fetches.push(fetch(old, Some(old), None));
-                fetches.push(fetch(new, None, Some(new)));
-            } else {
-                fetches.push(fetch(new, Some(old), Some(new)));
-            }
+        let listed = self.diffs(&pr.id)?;
+        self.diffs_changeset(&pr.id.repo, listed, &pr.base_sha, &pr.head_sha)
+    }
+
+    fn changeset_between(&self, repo: &str, base: &str, head: &str) -> Result<Changeset, ForgeError> {
+        #[derive(Deserialize)]
+        struct Comparison {
+            diffs: Vec<Diff>,
         }
-        fetches.sort_by(|a, b| a.path.cmp(&b.path));
-        let files = fetch_files(&fetches, |path, side| {
-            self.file(id, path, if side == Side::Old { &pr.base_sha } else { &pr.head_sha })
-        })?;
-        Ok(Changeset { base: pr.base_sha.clone(), files })
+        let mut url = self.client.endpoint(&["projects", repo, "repository", "compare"]);
+        // Straight, so the old side is `base` itself, which is the merge-base of the bottom member.
+        url.query_pairs_mut().append_pair("from", base).append_pair("to", head).append_pair("straight", "true");
+        let comparison: Comparison = self.get_json(&url)?;
+        self.diffs_changeset(repo, comparison.diffs, base, head)
     }
 
     fn threads(&self, pr: &PullRequest) -> Result<Vec<RemoteThread>, ForgeError> {
