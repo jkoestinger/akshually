@@ -13,6 +13,10 @@ pub struct SessionActions {
     /// The Verdict, or what stands in for it; `None` when neither applies: a Pull Request takes
     /// its Verdict at Publish, a co-review of local work has none, and an ended Session is done.
     pub verdict: Option<VerdictAction>,
+    /// How many unsent Comments and reopened Threads approving now would discard (the count
+    /// `to_hand_over` gives), so the human confirms first; 0 where `verdict` isn't
+    /// `VerdictAction::Approve` or there's nothing unsent. The service still approves either way.
+    pub discarded_by_approving: usize,
     /// How the human ends the Session.
     pub end: EndAction,
     /// Handing the next Round over; `None` while the Session has no agent to hand it to.
@@ -97,7 +101,8 @@ impl SessionView {
             HandOver { items, offered: items > 0 && yours && !ended }
         });
         let threads = self.threads.iter().map(|t| thread_actions(t, ended)).collect();
-        SessionActions { verdict, end, hand_over, threads }
+        let discarded_by_approving = if verdict == Some(VerdictAction::Approve) { self.to_hand_over() } else { 0 };
+        SessionActions { verdict, discarded_by_approving, end, hand_over, threads }
     }
 
     // Why the service refuses an action `actions()` doesn't offer, next to the table so the
