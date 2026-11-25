@@ -58,6 +58,8 @@ impl Target {
 const BUNDLE: &str = "Akshually.app";
 /// The name releases from before the rename give the bundle in their zip.
 const OLD_BUNDLE: &str = "akshually.app";
+/// The binary's path inside a bundle.
+const BUNDLE_BINARY: &str = "Contents/MacOS/akshually";
 
 /// What an update replaces: the binary itself, or the macOS bundle it is inside.
 enum Install {
@@ -67,9 +69,14 @@ enum Install {
 
 impl Install {
     /// The install `exe` (a real path, symlinks resolved) belongs to: the `.app` bundle when it
-    /// is a bundle's `Contents/MacOS` binary, else the binary. The bundle's name doesn't matter.
+    /// is a bundle's `Contents/MacOS` binary, else the binary. The bundle may have any name, but
+    /// it is a directory with the `.app` extension.
     fn containing(exe: &Path) -> Install {
-        let bundle = exe.parent().filter(|d| d.ends_with("Contents/MacOS")).and_then(|d| d.parent()?.parent());
+        let bundle = exe
+            .parent()
+            .filter(|d| d.ends_with("Contents/MacOS"))
+            .and_then(|d| d.parent()?.parent())
+            .filter(|app| app.extension().is_some_and(|ext| ext == "app"));
         match bundle {
             Some(app) => Install::Bundle(app.to_owned()),
             None => Install::Binary(exe.to_owned()),
@@ -98,7 +105,7 @@ impl Install {
 pub fn installed_exe(exe: &Path) -> PathBuf {
     match Install::containing(exe) {
         Install::Binary(exe) => exe,
-        Install::Bundle(app) => app.with_file_name(BUNDLE).join("Contents/MacOS/akshually"),
+        Install::Bundle(app) => app.with_file_name(BUNDLE).join(BUNDLE_BINARY),
     }
 }
 
@@ -205,7 +212,7 @@ impl Updater {
                 let Some(new) = [BUNDLE, OLD_BUNDLE]
                     .into_iter()
                     .map(|bundle| unpacked.join(bundle))
-                    .find(|new| new.join("Contents/MacOS/akshually").is_file())
+                    .find(|new| new.join(BUNDLE_BINARY).is_file())
                 else {
                     return Err(UpdateError::Unpack { name, message: format!("it holds no {BUNDLE}") });
                 };
@@ -243,7 +250,7 @@ impl Updater {
         if !target.starts_with(from) {
             return;
         }
-        let new_target = to.join("Contents/MacOS/akshually");
+        let new_target = to.join(BUNDLE_BINARY);
         let tmp = link.with_file_name(".akshually.new");
         let _ = fs::remove_file(&tmp);
         let result = std::os::unix::fs::symlink(&new_target, &tmp).and_then(|()| fs::rename(&tmp, link));
