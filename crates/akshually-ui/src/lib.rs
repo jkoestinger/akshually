@@ -41,9 +41,14 @@ const PUBLISH_LIST_MAX_HEIGHT: f32 = 320.0;
 const PUBLISH_LIST_MIN_HEIGHT: f32 = 120.0;
 /// The height of everything in the window around the Publish dialog's list of Drafts, which gets
 /// the rest: the dialog's header, Verdicts, Feedback note and buttons with a two-line summary
-/// (271, measured in `--scene publish-many`), the summary grown to its eight lines (105), a line
-/// of error (20), and a 16-pixel margin above and below the dialog (32).
-const PUBLISH_DIALOG_CHROME: f32 = 428.0;
+/// (271, measured in `--scene publish-many`, the line under the title on one line), the line
+/// wrapped to three (40, `--scene publish-long` in a narrow window; #102), the summary grown to
+/// its eight lines (105), a line of error (20), and a 16-pixel margin above and below the
+/// dialog (32).
+const PUBLISH_DIALOG_CHROME: f32 = 468.0;
+/// How far the Publish dialog's line moves up into the header's bottom padding (16), to sit the
+/// 4 points under the title that `Dialog::description` keeps (#102).
+const PUBLISH_LINE_RAISE: f32 = -12.0;
 /// How opaque a discarded Draft's card is in the Publish dialog, muted next to what goes out.
 const DISCARDED_OPACITY: f32 = 0.6;
 /// The tab bar's height in points: it is the window's title bar on macOS.
@@ -95,6 +100,7 @@ pub fn run(service: Arc<Service>, rune_args: Vec<String>) -> Result<(), String> 
             ("publish", scene_publish),
             ("publish-gitlab", scene_publish_gitlab),
             ("publish-many", scene_publish_many),
+            ("publish-long", scene_publish_long),
             ("co-review", scene_co_review),
             ("rendered", scene_rendered),
             ("update", scene_update),
@@ -1181,7 +1187,14 @@ fn publish_dialog(k: &Kit, s: &State, window_height: Option<f32>, layer: &mut Ve
     let Some(publish) = &s.publish else { return };
     let Some(tab) = s.tabs.iter().find(|t| t.session.id == publish.session) else { return };
     let Some(pr) = tab.session.pull_request() else { return };
-    let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0);
+    // Workaround for a Rune bug (#102): at the pinned revision `Dialog::description` lays its text
+    // out on one line in a title column that can't shrink, so a long line runs out of the dialog
+    // and pushes the close button off the panel. The line is shown here, wrapped, in the style
+    // `Dialog` gives it, until the Rune bump (#107) lets it go back to `Dialog::description`
+    // (which also gives the dialog its accessibility description).
+    let line = format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference());
+    let mut body = col().w_full().gap(12.0).px(16.0).pb(16.0).mt(PUBLISH_LINE_RAISE);
+    body = body.child(text(line).font(k.ty.ui.lh(20.0)).color(k.c.text_muted).wrap());
     if let Some(plan) = &publish.plan {
         let mut list = col().key("publish-drafts").w_full().gap(8.0);
         for (thread, kept) in plan.kept.iter().map(|t| (t, true)).chain(plan.discarded.iter().map(|t| (t, false))) {
@@ -1269,7 +1282,6 @@ fn publish_dialog(k: &Kit, s: &State, window_height: Option<f32>, layer: &mut Ve
             ),
     );
     Dialog::new("publish", "Publish review")
-        .description(format!("Sent to {} as one review on {}, under your name.", pr.id.host, pr.reference()))
         .open(true)
         .width(620.0)
         .fit()
@@ -2474,6 +2486,21 @@ fn scene_publish_many(s: &mut State) {
     for n in 10..30 {
         plan.kept.push(sample_thread(&format!("T{n}"), n..=n, "Another Draft, so the list outgrows the window.", None));
     }
+}
+
+/// `--scene publish-long`: the Publish dialog of `--scene publish`, on a Pull Request whose host
+/// and repository are long enough for the dialog's line to outgrow it.
+fn scene_publish_long(s: &mut State) {
+    scene_publish(s);
+    let Some(tab) = s.tabs.first() else { return };
+    let mut session = tab.session.clone();
+    let Source::PullRequest(pr) = &mut session.source else { return };
+    pr.id = PullRequestRef {
+        host: "github.enterprise.engineering.example-corporation.com".into(),
+        repo: "platform-engineering/kubernetes-cluster-configuration-and-deployment-manifests".into(),
+        number: 4821,
+    };
+    s.apply(scene_window(vec![session], None));
 }
 
 /// `--scene co-review`: a Pull Request an agent co-reviews, with its Drafts not kept yet (one
