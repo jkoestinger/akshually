@@ -48,6 +48,21 @@ fn type_text(rt: &mut Runtime<State>, text: &str) {
     }
 }
 
+/// The texts drawn inside the element keyed `key`, in tree order; empty when nothing has the key.
+fn texts_within(rt: &Runtime<State>, key: &str) -> Vec<String> {
+    let elements = rt.elements();
+    let inside = |mut at: usize| loop {
+        if elements[at].key.as_deref() == Some(key) {
+            return true;
+        }
+        match elements[at].parent {
+            Some(parent) => at = parent,
+            None => return false,
+        }
+    };
+    (0..elements.len()).filter(|&at| inside(at)).filter_map(|at| elements[at].text.clone()).collect()
+}
+
 /// The window's height, in points.
 const WINDOW_HEIGHT: f32 = 800.0;
 
@@ -261,6 +276,72 @@ fn n_and_p_typed_in_a_composer_are_text_and_move_nothing() {
 
     assert_eq!(lines_in_view(&rt), before, "a key moved the diff while the composer had focus");
     assert!(rt.find("composer").is_some(), "the composer closed");
+}
+
+/// Clicks the element keyed `key` with the pointer, which focuses it, then builds the next frame.
+fn click(rt: &mut Runtime<State>, key: &str) {
+    let (x, y) = rt.find(key).unwrap_or_else(|| panic!("nothing to click at `{key}`"));
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(0.0);
+}
+
+#[test]
+fn n_and_p_still_move_after_a_button_was_clicked() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    click(&mut rt, "next-thread");
+    assert_eq!(lines_in_view(&rt), [5], "the down chevron didn't go to the first Thread");
+
+    type_text(&mut rt, "n");
+
+    assert_eq!(lines_in_view(&rt), [50], "`n` did nothing while the clicked button had focus");
+}
+
+#[test]
+fn n_and_p_typed_in_a_reply_composer_are_text_and_move_nothing() {
+    let repo = repo_with_a_long_change();
+    let service = Arc::new(Service::new());
+    let pending = service.review(ReviewRequest::new(repo.path())).unwrap();
+    let id = pending.session().clone();
+    // On the first old line, which the diff shows at its top, where its Reopen button can be pressed.
+    service.comment(&id, Anchor::lines(Side::Old, "a.txt", 1..=1), "Why?").unwrap();
+    for line in THREAD_LINES {
+        service.comment(&id, Anchor::lines(Side::New, "a.txt", line..=line), "Why?").unwrap();
+    }
+    service.hand_over_round(&id).unwrap();
+    assert!(pending.wait_timeout(Duration::from_secs(5)).is_some(), "the Round wasn't handed over");
+    // The Round is answered, so it is the human's Turn.
+    for thread in ["T1", "T2", "T3", "T4"] {
+        service.reply(repo.path(), &ThreadId::new(thread), "Answered.").unwrap();
+    }
+    service.resolve(repo.path(), &ThreadId::new("T1")).unwrap();
+    service.show(&id, ChangesetView::Full).unwrap();
+    let mut rt = window(&service);
+    press(&mut rt, "reopen-T1");
+    deliver_window(&mut rt, &service);
+    press(&mut rt, "reply-T1");
+    assert!(rt.find("reply-composer").is_some(), "the reply composer didn't open");
+    let before = lines_in_view(&rt);
+
+    type_text(&mut rt, "npn");
+
+    assert_eq!(lines_in_view(&rt), before, "a key moved the diff while the reply composer had focus");
+    assert!(rt.find("reply-composer").is_some(), "the reply composer closed");
+}
+
+#[test]
+fn n_and_p_typed_in_the_search_field_are_text_and_move_nothing() {
+    let repo = repo_with_a_long_change();
+    let (_service, _id, mut rt) = review_with_three_threads(&repo);
+    rt.key(KeyEvent { key: Key::Command('f'), mods: Mods { cmd: true, ctrl: !cfg!(target_os = "macos"), ..Mods::default() } });
+    rt.frame(0.0);
+    assert!(rt.find("search-field").is_some(), "Ctrl+F didn't open the search field");
+
+    // No line says "pnew", but every one says "new": the keys didn't reach the field if it matches.
+    type_text(&mut rt, "pnew");
+
+    assert_eq!(texts_within(&rt, "search-count").join(""), "No matches", "`p` or `n` didn't reach the search field");
 }
 
 /// A repository whose `README.md` and `a.txt` both changed, `a.txt` over a hundred lines.

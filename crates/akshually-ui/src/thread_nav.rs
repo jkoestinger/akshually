@@ -123,7 +123,7 @@ impl State {
 }
 
 /// The diff's keys for the displayed Session, with `n` and `p` among them. Not under a Rendered
-/// view, which covers the diff, nor while a text field has focus.
+/// view, which covers the diff. A text field with focus takes a text key before this sees it.
 pub(crate) fn on_diff_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let Some(tab) = s.displayed_tab_mut().filter(|t| t.rendered.is_none()) else { return false };
     if tab.diff.key(ev, tx) {
@@ -133,7 +133,7 @@ pub(crate) fn on_diff_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     let plain = !ev.mods.cmd && !ev.mods.ctrl && !ev.mods.alt;
     let forward = match &ev.key {
-        _ if tx.focused().is_some() || !plain => return false,
+        _ if !plain => return false,
         rune::Key::Text(t) if t == "n" => true,
         rune::Key::Text(t) if t == "p" => false,
         _ => return false,
