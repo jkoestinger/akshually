@@ -232,22 +232,51 @@ fn the_bar_follows_the_scroll_in_the_side_by_side_layout_too() {
     assert_eq!(at_end[1] + at_end[3], top + height - INSET);
 }
 
+/// Where the thumb should sit for how far the shown diff has scrolled.
+fn thumb_top_for_the_scroll(rt: &Runtime<State>) -> f32 {
+    let [_, top, _, height] = viewport(rt);
+    let len = thumb(rt).expect("a scroll bar")[3];
+    let (scrollable, travel) = (rect(rt, "rows")[3] - height, height - 2.0 * INSET - len);
+    top + INSET + travel * scrolled(rt) / scrollable
+}
+
 #[test]
-fn two_open_sessions_each_show_their_own_position() {
+fn each_session_shows_the_thumb_for_the_position_its_diff_is_at_after_switching_tabs() {
     let (first, second) = (repo_with_changed_lines(400), repo_with_changed_lines(400));
     let service = Arc::new(Service::new());
     let (first_id, second_id) = (open(&service, &first), open(&service, &second));
     let mut rt = window(&service);
     deliver_window(&mut rt, &service);
     open_tab(&mut rt, &first_id);
-    scroll_to(&mut rt, &first_id, 1_000_000.0);
-    let first_end = thumb(&rt).unwrap()[1];
+    scroll_to(&mut rt, &first_id, 5_000.0);
+    let first_thumb = thumb(&rt).unwrap()[1];
 
     open_tab(&mut rt, &second_id);
     let second_start = thumb(&rt).unwrap()[1];
-    scroll_to(&mut rt, &second_id, 5_000.0);
+    scroll_to(&mut rt, &second_id, 9_000.0);
     let second_scrolled = thumb(&rt).unwrap()[1];
+    press(&mut rt, "t-inbox");
+    open_tab(&mut rt, &first_id);
 
-    assert!(second_start < second_scrolled, "the second Session's thumb didn't follow its own scroll");
-    assert!(second_scrolled < first_end, "the second Session's thumb shows the first one's position");
+    assert!(first_thumb > second_start, "the first Session's scroll didn't move its thumb");
+    assert!(second_scrolled > first_thumb, "the second Session's thumb isn't at its own, later position");
+    assert!(
+        (thumb(&rt).unwrap()[1] - thumb_top_for_the_scroll(&rt)).abs() <= 1.0,
+        "the thumb isn't where the first Session's diff really is after the Inbox and back"
+    );
+}
+
+#[test]
+fn the_bar_shows_with_the_sticky_file_header_over_the_diff() {
+    let repo = repo_with_changed_lines(400);
+    let service = Arc::new(Service::new());
+    let id = open(&service, &repo);
+    let mut rt = window(&service);
+    deliver_window(&mut rt, &service);
+    open_tab(&mut rt, &id);
+
+    scroll_to(&mut rt, &id, 5_000.0);
+
+    assert!(rt.find("sticky").is_some(), "the file header isn't stuck at the top of the scrolled diff");
+    assert!(thumb(&rt).is_some(), "the sticky file header took the scroll bar away");
 }

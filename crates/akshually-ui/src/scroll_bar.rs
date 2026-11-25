@@ -38,8 +38,6 @@ struct Thumb {
     /// `travel` points scrolls the whole `scrollable` height.
     scrollable: f32,
     travel: f32,
-    /// The content's current scroll offset.
-    offset: f32,
 }
 
 impl Thumb {
@@ -57,7 +55,7 @@ impl Thumb {
         let travel = track - len;
         let offset = (viewport_y - rows[1]).clamp(0.0, scrollable);
         let top = (INSET + travel * offset / scrollable).round();
-        Some(Thumb { viewport_width, top, len, scrollable, travel, offset: offset.round() })
+        Some(Thumb { viewport_width, top, len, scrollable, travel })
     }
 }
 
@@ -69,7 +67,7 @@ pub(crate) fn overlay(k: &Kit, cx: &mut Cx<State>, diff_key: &str) -> Option<El>
     let viewport = cx.window_layout(&scroll)?;
     // Whole points, so the view rebuilds when the thumb moves a pixel, not on every scrolled frame.
     let thumb = cx.window_layout_with(&format!("{scroll}/rows"), move |rows| Thumb::of(viewport, rows))??;
-    let Thumb { viewport_width, top, len, scrollable, travel, offset } = thumb;
+    let Thumb { viewport_width, top, len, scrollable, travel } = thumb;
     let drag_scroll = scroll.clone();
     Some(
         el().key("diff-scroll-thumb")
@@ -81,7 +79,9 @@ pub(crate) fn overlay(k: &Kit, cx: &mut Cx<State>, diff_key: &str) -> Option<El>
             .hover(k.c.text_weak)
             .on_drag_any(move |d, tx: &mut Tx| {
                 if d.phase == Phase::Down {
-                    d.data = offset;
+                    // The offset the thumb, drawn at whole points, stands for: grabbing it
+                    // doesn't jump the diff.
+                    d.data = if travel > 0.0 { (top - INSET) * scrollable / travel } else { 0.0 };
                 }
                 if travel > 0.0 && d.phase != Phase::Up {
                     let y = d.data + d.dy * scrollable / travel;
