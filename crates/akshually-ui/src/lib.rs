@@ -235,7 +235,15 @@ impl SessionTab {
         diff.set_mode(diff_mode(layout));
         show_files(&mut diff, &session);
         let actions = session.actions();
-        let mut tab = SessionTab { session, actions, diff, expanded: Vec::new(), choosing_view: false, rendered: None, search: search::Search::new() };
+        let mut tab = SessionTab {
+            session,
+            actions,
+            diff,
+            expanded: Vec::new(),
+            choosing_view: false,
+            rendered: None,
+            search: search::Search::new(),
+        };
         tab.annotate(None);
         tab
     }

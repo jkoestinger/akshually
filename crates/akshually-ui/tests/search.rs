@@ -30,7 +30,6 @@ fn review(repo: &TestRepo) -> (Arc<Service>, SessionId, Runtime<State>) {
 }
 
 /// Presses the element keyed `key` as an assistive client would.
-#[allow(dead_code)]
 fn press(rt: &mut Runtime<State>, key: &str) {
     assert!(rt.accessibility_action(key, Action::Click, None), "nothing to press at `{key}`");
     rt.frame(0.0);
@@ -102,9 +101,8 @@ fn repo_with_two_needles() -> TestRepo {
     let repo = TestRepo::new();
     let old: String = (1..=100).map(|i| format!("old {i}\n")).collect();
     repo.write("a.txt", &old).commit_all("base");
-    let new: String = (1..=100)
-        .map(|i| if i == 5 || i == 95 { format!("new needle {i}\n") } else { format!("new {i}\n") })
-        .collect();
+    let new: String =
+        (1..=100).map(|i| if i == 5 || i == 95 { format!("new needle {i}\n") } else { format!("new {i}\n") }).collect();
     repo.write("a.txt", &new);
     repo
 }
@@ -369,6 +367,105 @@ fn each_tab_has_its_own_query_and_keeps_it_when_switched_away_and_back() {
     assert_eq!(count(&rt), "1 of 2", "the query was lost when switching tabs");
 }
 
+/// A repository whose `README.md` and `lib.rs` both changed, and both say "paragraph", the
+/// README in markup: a heading, a link and bold text.
+fn repo_with_a_readme_and_code() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("README.md", "# One\n\nGone paragraph.\n").write("lib.rs", "// paragraph one\n").commit_all("base");
+    repo.write("README.md", "# Two\n\nA **bold** paragraph, and [another paragraph](https://example.com/paragraph).\n");
+    repo.write("lib.rs", "// paragraph two\n");
+    repo
+}
+
+#[test]
+fn with_a_rendered_view_open_only_its_files_rendered_text_is_searched() {
+    let repo = repo_with_a_readme_and_code();
+    let (_service, _id, mut rt) = review(&repo);
+    find_chord(&mut rt);
+    type_text(&mut rt, "paragraph");
+    assert_eq!(count(&rt), "1 of 6", "the diff has three in the README's new line, one in its old, two in lib.rs");
+
+    press(&mut rt, "rendered-README.md");
+
+    assert_eq!(count(&rt), "1 of 2", "the link's address or another file was searched");
+}
+
+#[test]
+fn markup_that_isnt_rendered_is_not_searched() {
+    let repo = repo_with_a_readme_and_code();
+    let (_service, _id, mut rt) = review(&repo);
+    press(&mut rt, "rendered-README.md");
+    find_chord(&mut rt);
+
+    type_text(&mut rt, "**");
+
+    assert_eq!(count(&rt), "No matches", "the heading or emphasis markers were searched");
+}
+
+#[test]
+fn the_rendered_view_highlights_its_matches_and_the_current_one_distinctly() {
+    let repo = repo_with_a_readme_and_code();
+    let (_service, _id, mut rt) = review(&repo);
+    press(&mut rt, "rendered-README.md");
+    find_chord(&mut rt);
+
+    type_text(&mut rt, "paragraph");
+
+    assert!(rt.find("search-current").is_some(), "no match is highlighted as the current one");
+    assert!(rt.find("search-match-1").is_some(), "the other match isn't highlighted");
+    let first = rt.find("search-current").unwrap();
+    press_enter(&mut rt);
+    let second = rt.find("search-current").unwrap();
+    assert_ne!(first, second, "the current highlight didn't move to the next match");
+}
+
+#[test]
+fn the_rendered_view_scrolls_to_the_current_match() {
+    let repo = TestRepo::new();
+    repo.write("README.md", "# One\n").commit_all("base");
+    let long: String =
+        (1..=120).map(|i| if i == 110 { "A needle.\n\n".to_owned() } else { format!("Paragraph {i}.\n\n") }).collect();
+    repo.write("README.md", &long);
+    let (_service, _id, mut rt) = review(&repo);
+    press(&mut rt, "rendered-README.md");
+    find_chord(&mut rt);
+
+    type_text(&mut rt, "needle");
+    for _ in 0..60 {
+        rt.frame(1.0 / 60.0);
+    }
+
+    let (_, y) = rt.find("search-current").expect("the match isn't highlighted");
+    assert!((0.0..WINDOW_HEIGHT).contains(&y), "the Rendered view didn't scroll to the match, which is at y={y}");
+}
+
+#[test]
+fn closing_the_rendered_view_searches_the_diff_again() {
+    let repo = repo_with_a_readme_and_code();
+    let (_service, _id, mut rt) = review(&repo);
+    press(&mut rt, "rendered-README.md");
+    find_chord(&mut rt);
+    type_text(&mut rt, "paragraph");
+    assert_eq!(count(&rt), "1 of 2");
+
+    press(&mut rt, "rendered-close");
+
+    assert_eq!(count(&rt), "1 of 6", "the search stayed on the Rendered view");
+}
+
+#[test]
+fn escape_in_the_rendered_views_search_field_closes_the_search_and_keeps_the_view() {
+    let repo = repo_with_a_readme_and_code();
+    let (_service, _id, mut rt) = review(&repo);
+    press(&mut rt, "rendered-README.md");
+    find_chord(&mut rt);
+
+    press_escape(&mut rt);
+
+    assert!(rt.find("search-field").is_none(), "Escape left the search field open");
+    assert!(rt.find("rendered-view").is_some(), "Escape closed the Rendered view as well");
+}
+
 #[test]
 fn after_the_changeset_reloads_the_matches_reflect_the_new_changeset() {
     let repo = repo_with_two_needles();
@@ -376,7 +473,8 @@ fn after_the_changeset_reloads_the_matches_reflect_the_new_changeset() {
     find_chord(&mut rt);
     type_text(&mut rt, "needle");
     assert_eq!(count(&rt), "1 of 2");
-    let new: String = (1..=100).map(|i| if i == 5 { "new needle 5\n".to_owned() } else { format!("new {i}\n") }).collect();
+    let new: String =
+        (1..=100).map(|i| if i == 5 { "new needle 5\n".to_owned() } else { format!("new {i}\n") }).collect();
     repo.write("a.txt", &new);
 
     service.reload(&id).unwrap();

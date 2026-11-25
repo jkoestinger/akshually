@@ -9,7 +9,7 @@ use rune_kit::{Button, ButtonVariant, Highlight, IconButton, IconButtonVariant, 
 
 use akshually_core::{DiffLayout, FileChange, SessionId};
 
-use crate::{SessionTab, State, theme};
+use crate::{SessionTab, State, search, theme};
 
 /// The margin around the Rendered view, between it and the window's edges, in points: it is
 /// nearly as large as the window, with the diff still showing round it.
@@ -68,26 +68,35 @@ pub(crate) fn rendered_view(k: &Kit, dark: bool, layout: DiffLayout, tab: &Sessi
         let lines = diff.into_iter().flat_map(|d| &d.hunks).flat_map(|h| &h.lines);
         lines.filter(|l| l.kind == kind).filter_map(|l| l.number(side)).collect()
     };
-    let column = |key: &str, text: &str, tint: Option<(&str, Color, Vec<u32>)>| {
-        let mut markdown = Markdown::new(text).selectable(true);
+    let found = search::matches(tab, layout);
+    let current = search::current(tab, &found);
+    let column = |at: usize, key: &str, text: &str, tint: Option<(&str, Color, Vec<u32>)>| {
+        let mut items = Vec::new();
         if let Some((name, colour, lines)) = tint {
             let ranges = line_ranges(text, &lines).into_iter().enumerate();
-            markdown = markdown.highlights(
-                ranges.map(|(i, range)| (range, Highlight::new().bg(colour).key(format!("rendered-{name}-{i}")))),
+            items.extend(
+                ranges.map(|(i, range)| (vec![range], Highlight::new().bg(colour).key(format!("rendered-{name}-{i}")))),
             );
         }
+        items.extend(search::highlights(&found, current, at));
+        let markdown = Markdown::new(text).selectable(true).highlights(items);
         col().key(key).grow(1.0).min_w(0.0).child(markdown.build(k))
     };
     let mut removed_note = None;
     let columns = match (change.old.as_deref(), change.new.as_deref()) {
-        (None, Some(new)) => vec![column("rendered-new", new, None)],
-        (Some(old), None) => vec![column("rendered-old", old, None)],
+        (None, Some(new)) => vec![column(0, "rendered-new", new, None)],
+        (Some(old), None) => vec![column(0, "rendered-old", old, None)],
         (Some(old), Some(new)) => {
-            let new = column("rendered-new", new, Some(("added", added, changed(LineKind::Added, diff::Side::New))));
+            let at = match layout {
+                DiffLayout::SideBySide => 1,
+                DiffLayout::Stacked => 0,
+            };
+            let tint = Some(("added", added, changed(LineKind::Added, diff::Side::New)));
+            let new = column(at, "rendered-new", new, tint);
             match layout {
                 DiffLayout::SideBySide => {
                     let tint = ("removed", removed, changed(LineKind::Removed, diff::Side::Old));
-                    vec![column("rendered-old", old, Some(tint)), new]
+                    vec![column(0, "rendered-old", old, Some(tint)), new]
                 }
                 DiffLayout::Stacked => {
                     removed_note = match changed(LineKind::Removed, diff::Side::Old).len() {
@@ -122,6 +131,7 @@ pub(crate) fn rendered_view(k: &Kit, dark: bool, layout: DiffLayout, tab: &Sessi
         .children(open.map(|n| text(n).font(k.ty.small).color(k.c.text_muted).key("rendered-threads")))
         .children(removed_note.map(|n| text(n).font(k.ty.small).color(k.c.text_muted).key("rendered-removed-note")))
         .child(row().grow(1.0))
+        .children(search::field(k, tab, &found))
         .child(close);
     let body = col()
         .key("rendered-scroll")

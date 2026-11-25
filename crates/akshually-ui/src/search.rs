@@ -94,7 +94,11 @@ pub(crate) fn current(tab: &SessionTab, found: &[Match]) -> Option<usize> {
 
 /// The highlights of the matches in the `column`th column of the Rendered view, the current one
 /// distinct.
-pub(crate) fn highlights(found: &[Match], current: Option<usize>, column: usize) -> Vec<(Vec<Range<usize>>, Highlight)> {
+pub(crate) fn highlights(
+    found: &[Match],
+    current: Option<usize>,
+    column: usize,
+) -> Vec<(Vec<Range<usize>>, Highlight)> {
     let in_column = found.iter().enumerate().filter(|(_, m)| m.place == Place::Column(column));
     in_column
         .map(|(i, m)| {
@@ -107,8 +111,8 @@ pub(crate) fn highlights(found: &[Match], current: Option<usize>, column: usize)
         .collect()
 }
 
-/// The text of each column the Rendered view of `path` shows, in the order it shows them.
-pub(crate) fn rendered_columns<'a>(change: &'a FileChange, layout: DiffLayout) -> Vec<&'a str> {
+/// The text of each column the Rendered view of `change` shows, in the order it shows them.
+fn rendered_columns(change: &FileChange, layout: DiffLayout) -> Vec<&str> {
     match (change.old.as_deref(), change.new.as_deref()) {
         (None, Some(new)) => vec![new],
         (Some(old), None) => vec![old],
@@ -235,7 +239,8 @@ pub(crate) fn field(k: &Kit, tab: &SessionTab, found: &[Match]) -> Option<rune::
     if !tab.search.open {
         return None;
     }
-    let (edit_id, change_id, key_id, close_id) = (tab.session.id.clone(), tab.session.id.clone(), tab.session.id.clone(), tab.session.id.clone());
+    let (edit_id, change_id, key_id, close_id) =
+        (tab.session.id.clone(), tab.session.id.clone(), tab.session.id.clone(), tab.session.id.clone());
     let input = TextInput::new(&tab.search.query)
         .placeholder("Search the code…")
         .width(Some(FIELD_WIDTH))
@@ -254,7 +259,9 @@ pub(crate) fn field(k: &Kit, tab: &SessionTab, found: &[Match]) -> Option<rune::
         .label("Close search")
         .build(k)
         .key("search-close")
-        .on_press(move |s: &mut State| drop(s.close_search(&close_id)));
+        .on_press(move |s: &mut State| {
+            s.close_search(&close_id);
+        });
     Some(
         row()
             .gap(12.0)
