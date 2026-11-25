@@ -1,7 +1,9 @@
 //! The Inbox: the open Pull Requests, across every Forge host, where the human is a requested
 //! reviewer or an assignee, leaving out those already approved and those the human gave a Verdict
 //! on since their review was last requested, unless they have a Session open on them. Refreshed
-//! on a timer and on demand, deciding afresh each time; a new review request marks it.
+//! on a timer and on demand, deciding afresh each time; a new review request marks it. A Stack
+//! with a Pull Request in it is shown whole, as one group, including the members that don't
+//! qualify on their own.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -136,18 +138,22 @@ impl Inbox {
             InboxRow { item: item.clone(), state, qualifies, stack }
         };
         let mut rows = Vec::new();
-        let mut shown = Vec::new();
         for item in &self.items {
-            if shown.contains(&item.id) {
-                continue;
-            }
             let Some(group) = self.groups.iter().find(|g| g.contains(&item.id)) else {
                 rows.push(row(item, None));
                 continue;
             };
+            // The group takes the place of its most recently updated member that qualifies, or of
+            // one a Session keeps listed when none does.
+            let in_group = |qualifying: bool| {
+                let qualifies = |i: &InboxItem| !qualifying || !(i.approved || i.verdict_given);
+                self.items.iter().find(|i| group.contains(&i.id) && qualifies(i))
+            };
+            if in_group(true).or_else(|| in_group(false)).map(|i| &i.id) != Some(&item.id) {
+                continue;
+            }
             let members: Vec<_> = group.iter().filter_map(|id| self.listed(id)).collect();
             for (position, member) in members.iter().enumerate() {
-                shown.push(member.id.clone());
                 rows.push(row(member, Some(InboxStack { position, size: members.len() })));
             }
         }
@@ -180,9 +186,11 @@ impl Service {
         inner.inbox.view(&inner.sessions)
     }
 
-    /// Asks every Forge host for its Inbox; blocks on them. A host that fails keeps its rows
+    /// Asks every Forge host for its Inbox, then for the Stack of each Pull Request it lists
+    /// (the way a Session does); blocks on them. A host that fails keeps its rows and groups
     /// from before, and its error shows until a refresh succeeds; one that isn't set up is
-    /// skipped. A review request that wasn't listed before marks the Inbox, unless the human
+    /// skipped. A host whose Stack lookup fails shows its rows ungrouped, and that error shows
+    /// too. A review request that wasn't listed before marks the Inbox, unless the human
     /// opened it and the Window displays it.
     pub fn refresh_inbox(&self) {
         // Not holding the lock: the Forges may take a while.
@@ -191,7 +199,9 @@ impl Service {
         let mut errors = Vec::new();
         let mut hosts = Vec::new();
         // The hosts that answered, whose Stacks can be looked up.
-        let mut answering = Vec::new();
+        let mut answering: Vec<&dyn ForgeAdapter> = Vec::new();
+        // What a host that failed keeps from before besides its rows: its groups.
+        let mut carried = Grouped::default();
         let inner = self.lock();
         let before = inner.inbox.items.clone();
         for (forge, result) in fetched {
@@ -199,13 +209,16 @@ impl Service {
                 Ok(None) => {}
                 Ok(Some(found)) => {
                     hosts.push(forge.host().to_owned());
-                    answering.push(forge);
+                    answering.push(forge.as_ref());
                     items.extend(found);
                 }
                 Err(error) => {
                     hosts.push(forge.host().to_owned());
                     errors.push(error.to_string());
                     items.extend(before.iter().filter(|i| forge.recognise(&i.url).is_some()).cloned());
+                    let of_host = |pr: &PullRequestRef| pr.host == forge.host();
+                    carried.groups.extend(inner.inbox.groups.iter().filter(|g| g.iter().all(of_host)).cloned());
+                    carried.others.extend(inner.inbox.others.iter().filter(|i| of_host(&i.id)).cloned());
                 }
             }
         }
@@ -232,8 +245,10 @@ impl Service {
         drop(inner);
 
         // Not holding the lock: the Forges may take a while.
-        let grouped = group_stacks(&answering, &items, &done, &sessions);
-        errors.extend(grouped.errors);
+        let mut grouped = group_stacks(&answering, &items, &done, &sessions);
+        errors.extend(std::mem::take(&mut grouped.errors));
+        grouped.groups.extend(carried.groups);
+        grouped.others.extend(carried.others);
         let mut inner = self.lock();
 
         let requested = |items: &[InboxItem], pr: &PullRequestRef| {
@@ -287,7 +302,7 @@ struct Grouped {
 ///
 /// A host whose lookup fails leaves its rows ungrouped, and reports the failure once.
 fn group_stacks(
-    answering: &[&Box<dyn ForgeAdapter>],
+    answering: &[&dyn ForgeAdapter],
     items: &[InboxItem],
     done: &[InboxItem],
     sessions: &[(SessionId, Vec<PullRequestRef>)],
@@ -303,7 +318,7 @@ fn group_stacks(
         if failed.contains(&forge.host()) {
             continue;
         }
-        let stack = match stack_of(forge.as_ref(), &item.id, sessions) {
+        let stack = match stack_of(*forge, &item.id, sessions) {
             Ok(stack) => stack,
             Err(error) => {
                 grouped.errors.push(error.to_string());
@@ -324,6 +339,9 @@ fn group_stacks(
         }
         grouped.groups.push(stack.into_iter().map(|p| p.id).collect());
     }
+    // A host that failed part-way shows all its rows ungrouped.
+    grouped.groups.retain(|g| g.iter().all(|pr| !failed.contains(&pr.host.as_str())));
+    grouped.others.retain(|i| !failed.contains(&i.id.host.as_str()));
     grouped
 }
 

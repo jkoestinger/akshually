@@ -25,6 +25,8 @@ struct World {
     open: Vec<Pr>,
     /// The Stack lookup fails.
     lookup_fails: bool,
+    /// The Forge fails to list the Inbox.
+    inbox_fails: bool,
 }
 
 #[derive(Clone, Default)]
@@ -154,6 +156,9 @@ impl ForgeAdapter for FakeForge {
 
     fn inbox(&self) -> Result<Option<Vec<InboxItem>>, ForgeError> {
         let world = self.world.lock().unwrap();
+        if world.inbox_fails {
+            return Err(ForgeError::Http { host: "forge.test".into(), message: "inbox down".into() });
+        }
         let item = |p: &Pr| {
             Some(InboxItem {
                 id: pr_ref(p.number),
@@ -172,8 +177,10 @@ impl ForgeAdapter for FakeForge {
     }
 }
 
-/// The Inbox's rows as `(number, position in its Stack and the Stack's size, qualifies)`.
-fn shape(svc: &Service) -> Vec<(u64, Option<(usize, usize)>, bool)> {
+/// A row as `(number, position in its Stack and the Stack's size, qualifies)`.
+type Shape = (u64, Option<(usize, usize)>, bool);
+
+fn shape(svc: &Service) -> Vec<Shape> {
     let place = |r: &InboxRow| r.stack.as_ref().map(|s| (s.position, s.size));
     svc.inbox().rows.iter().map(|r| (r.item.id.number, place(r), r.qualifies)).collect()
 }
@@ -325,4 +332,34 @@ fn a_failed_stack_lookup_leaves_the_rows_ungrouped_and_reports_the_error() {
     assert_eq!(shape(&svc), [(3, None, true), (1, None, true)]);
     assert_eq!(view.errors.len(), 1, "{:?}", view.errors);
     assert!(view.errors[0].contains("lookup down"), "{:?}", view.errors);
+}
+
+#[test]
+fn a_group_takes_the_place_of_its_newest_qualifying_member_not_of_one_a_session_keeps_listed() {
+    let forge = FakeForge::stack_of_three();
+    forge.open(5, "e", "main");
+    forge.verdict_given(1, 900).request(2, 200).request(5, 500);
+    let svc = forge.service();
+    svc.refresh_inbox();
+    svc.open_pull_request(&url(2)).unwrap();
+
+    svc.refresh_inbox();
+
+    // #1 stays listed for the Session on its Stack, and is the newest, but doesn't qualify.
+    assert_eq!(numbers(&svc), [5, 1, 2, 3]);
+}
+
+#[test]
+fn a_host_that_fails_to_list_keeps_its_groups_from_before() {
+    let forge = FakeForge::stack_of_three();
+    forge.request(3, 300);
+    let svc = forge.service();
+    svc.refresh_inbox();
+    forge.world.lock().unwrap().inbox_fails = true;
+
+    svc.refresh_inbox();
+
+    let view = svc.inbox();
+    assert_eq!(shape(&svc), [(1, Some((0, 3)), false), (2, Some((1, 3)), false), (3, Some((2, 3)), true)]);
+    assert!(view.errors[0].contains("inbox down"), "{:?}", view.errors);
 }
