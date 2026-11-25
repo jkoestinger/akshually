@@ -228,6 +228,9 @@ struct SessionTab {
     /// Outdated and Resolved Threads the human expanded; the others show as one collapsed line.
     /// The UI's own, so it's lost on restart.
     expanded: Vec<ThreadId>,
+    /// The General Threads section is folded to its header row. The UI's own, so it's lost on
+    /// restart and every Session opens with it expanded.
+    general_folded: bool,
     /// The header's Changeset view dropdown is open. Kept per Session, so it doesn't show open
     /// in another tab.
     choosing_view: bool,
@@ -250,6 +253,7 @@ impl SessionTab {
             actions,
             diff,
             expanded: Vec::new(),
+            general_folded: false,
             choosing_view: false,
             rendered: None,
             search: search::Search::new(),
@@ -411,6 +415,14 @@ impl State {
                         }
                     }
                     tab.actions = session.actions();
+                    // A new General Thread, or a new Comment in one, unfolds the section.
+                    let before = general_comment_counts(&tab.session);
+                    if general_comment_counts(&session)
+                        .iter()
+                        .any(|(id, n)| before.iter().all(|(b, m)| b != id || m < n))
+                    {
+                        tab.general_folded = false;
+                    }
                     // A reopened Thread leaves `expanded`, so it comes back collapsed if it's
                     // resolved again (#69).
                     tab.expanded.retain(|id| session.threads.iter().any(|t| &t.id == id && collapses(t)));
@@ -669,7 +681,20 @@ impl State {
         self.composer = Some(Composer { session: tab.session.id.clone(), anchor, at, error, fallback });
         self.composer_text = TextEdit::new("");
         self.composer_text.focused = true;
+        self.unfold_general_for_composer();
         self.annotate();
+    }
+
+    /// Unfolds the General Threads section when the composer writes into it.
+    fn unfold_general_for_composer(&mut self) {
+        let Some(composer) = &self.composer else { return };
+        if composer.at.is_some() {
+            return;
+        }
+        let session = composer.session.clone();
+        if let Some(tab) = self.tab_mut(&session) {
+            tab.general_folded = false;
+        }
     }
 
     fn close_composer(&mut self) {
@@ -701,6 +726,7 @@ impl State {
         composer.error = None;
         // The press on "Comment on the file" took focus off the text area.
         self.composer_text.focused = true;
+        self.unfold_general_for_composer();
         self.annotate();
     }
 
@@ -759,6 +785,12 @@ impl State {
             }
             None => tab.expanded.push(thread.thread.clone()),
         }
+    }
+
+    /// Folds the General Threads section of `session`'s tab to its header row, or unfolds it.
+    fn toggle_general_folded(&mut self, session: &SessionId) {
+        let Some(tab) = self.tab_mut(session) else { return };
+        tab.general_folded = !tab.general_folded;
     }
 
     /// The Session whose tab in the strip is keyed `tab`; `None` for the Inbox's.
@@ -1697,12 +1729,32 @@ fn session_diff(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
 /// The Threads on the Review as a whole and on whole files, which have no line in the diff,
 /// and the composer when it's writing one.
 fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
-    // Outdated File Threads show with the other Outdated Threads instead.
-    let general = |t: &Thread| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. });
-    let threads: Vec<&Thread> = tab.session.threads.iter().filter(|t| general(t)).collect();
+    let threads = general_thread_list(&tab.session);
     let composing = s.composer.as_ref().is_some_and(|c| c.session == tab.session.id && c.at.is_none());
     if threads.is_empty() && !composing {
         return col();
+    }
+    // The composer is in the section, so it stays open while the human writes in it.
+    let folded = tab.general_folded && !composing;
+    let session = tab.session.id.clone();
+    let header = row()
+        .key("general-header")
+        .w_full()
+        .px(16.0)
+        .py(4.0)
+        .gap(8.0)
+        .items_center()
+        .child(text(format!("General Threads · {}", threads.len())).font(k.ty.small).color(k.c.text_faint))
+        .child(row().grow(1.0))
+        .child(
+            Button::new(if folded { "Show" } else { "Hide" })
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut State| s.toggle_general_folded(&session))
+                .build(k)
+                .key("general-toggle"),
+        );
+    if folded {
+        return col().w_full().child(header);
     }
     let mut list = col().key("general-threads").w_full().px(16.0).py(8.0).gap(8.0);
     for thread in threads {
@@ -1711,7 +1763,21 @@ fn general_threads(k: &Kit, s: &State, tab: &SessionTab, agent: Color) -> El {
     if composing {
         list = list.child(composer(k, s));
     }
-    col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list)
+    col()
+        .w_full()
+        .child(header)
+        .child(col().key("general-scroll").w_full().max_h(320.0).scroll(ScrollSpec { stick_bottom: false }).child(list))
+}
+
+/// The Threads of `session` that show in the General Threads section.
+fn general_thread_list(session: &SessionView) -> Vec<&Thread> {
+    // Outdated File Threads show with the other Outdated Threads instead.
+    session.threads.iter().filter(|t| !t.outdated && !matches!(t.anchor, Anchor::Lines { .. })).collect()
+}
+
+/// How many Comments each General Thread of `session` holds.
+fn general_comment_counts(session: &SessionView) -> Vec<(&ThreadId, usize)> {
+    general_thread_list(session).into_iter().map(|t| (&t.id, t.comments.len())).collect()
 }
 
 /// What shows under a line of the displayed Session's diff: the composer, or the Thread `a` names.
